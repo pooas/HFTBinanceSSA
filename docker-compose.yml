@@ -1,0 +1,49 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: hft_clickhouse
+    ports:
+      - "8123:8123" 
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_PASSWORD=hft123    # <-- فقط این خط باید بماند
+    networks:
+      - hft-net
+
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: hft_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - hft-net
+
+  java-app:
+    build:
+      context: ./java-app
+      dockerfile: Dockerfile
+    container_name: hft_java_producer
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - hft-net
+
+networks:
+  hft-net:
+    driver: bridge
