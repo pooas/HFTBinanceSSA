@@ -4,7 +4,6 @@
 set -e
 
 echo "➡️ Stopping and cleaning up previous containers..."
-# اگر پوشه از قبل وجود داشته باشد، کانتینرها و والیوم‌های آن را متوقف و پاک می‌کند
 if [ -d "HFTBinanceSSA" ]; then
   cd HFTBinanceSSA
   sudo docker compose down -v || true
@@ -17,15 +16,36 @@ git clone https://pooas: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@github.com/pooa
 
 cd HFTBinanceSSA
 
-# حل مشکل خوانده نشدن پلاگین گرافانا
-if [ -d "grafana-plugins" ]; then
-    echo "➡️ Fixing permissions for Grafana offline plugins..."
-    # تغییر مالکیت پوشه به یوزر گرافانا (شناسه 472)
-    sudo chown -R 472:472 grafana-plugins
-    sudo chmod -R 775 grafana-plugins
-fi
+# ==========================================
+# بخش جدید: نصب آفلاین و مستقیم پلاگین کلیک‌هاوس
+# ==========================================
+echo "➡️ Setting up ClickHouse plugin directly (bypassing Git)..."
+mkdir -p grafana-plugins
+cd grafana-plugins
 
-# نصب پیش‌نیازها و داکر (اگر نصب نباشند انجام می‌شود)
+# پاک کردن نسخه احتمالی قبلی که با گیت آمده است
+sudo rm -rf grafana-clickhouse-datasource
+
+# نصب پیش‌نیازهای دانلود
+sudo apt update -y
+sudo apt install -y unzip wget
+
+# دانلود مستقیم نسخه Linux AMD64 از گیت‌هاب گرافانا
+sudo wget https://github.com/grafana/clickhouse-datasource/releases/download/v4.3.1/grafana-clickhouse-datasource-4.3.1.linux_amd64.zip
+
+# اکسترکت کردن فایل
+sudo unzip grafana-clickhouse-datasource-4.3.1.linux_amd64.zip -d grafana-clickhouse-datasource
+
+# تنظیم مالکیت پوشه برای یوزر گرافانا (شناسه ۴۷۲)
+sudo chown -R 472:472 grafana-clickhouse-datasource
+
+# پاک کردن فایل زیپ اضافه
+sudo rm grafana-clickhouse-datasource-4.3.1.linux_amd64.zip
+
+# بازگشت به پوشه اصلی پروژه
+cd ..
+# ==========================================
+
 echo "➡️ Checking and configuring Docker..."
 sudo apt update -y
 sudo apt install -y ca-certificates curl
@@ -47,8 +67,7 @@ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin d
 sudo systemctl enable docker
 sudo systemctl start docker
 
-# استارت کردن پروژه
 echo "➡️ Running docker compose..."
 sudo docker compose up -d
 
-echo "✅ Deployment completed successfully! Grafana should now load the plugin."
+echo "✅ Deployment completed successfully! Grafana and ClickHouse are ready."
