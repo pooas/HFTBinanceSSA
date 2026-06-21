@@ -7,7 +7,7 @@ datasources:
     isDefault: true
     jsonData:
       # تنظیمات دقیق و استاندارد پلاگین رسمی
-      host: clickhouse
+      host: hft_clickhouse
       port: 8123
       protocol: http
       defaultDatabase: default
