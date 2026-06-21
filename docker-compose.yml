@@ -22,11 +22,12 @@ services:
     ports:
       - "3001:3000"
     environment:
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      #- GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana-plugins:/var/lib/grafana/plugins
     depends_on:
       clickhouse:
         condition: service_healthy
