@@ -22,6 +22,12 @@ services:
     container_name: hft_grafana
     ports:
       - "3000:3000"
+      - "8123:8123"
+    volumes:
+      # اجرای خودکار کدهای SQL در اولین باری که دیتابیس ساخته می‌شود
+      - ./ch-init/init.sql:/docker-entrypoint-initdb.d/init.sql
+      # ذخیره همیشگی داده‌های شما روی هارد
+      - clickhouse_data:/var/lib/clickhouse
     environment:
       #- GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
       - GF_AUTH_ANONYMOUS_ENABLED=true
@@ -34,6 +40,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
       - ./grafana-plugins:/var/lib/grafana/plugins
+      
     depends_on:
       clickhouse:
         condition: service_healthy
