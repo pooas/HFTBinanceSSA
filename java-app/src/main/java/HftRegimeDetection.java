@@ -440,3 +440,4 @@ public class HftRegimeDetection {
         new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking(); 
         Thread.currentThread().join();
     }
+}
