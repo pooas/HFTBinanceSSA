@@ -16,6 +16,7 @@ git clone https://pooas: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@github.com/pooa
 
 cd HFTBinanceSSA
 
+git pull
 # ==========================================
 # بخش جدید: نصب آفلاین و مستقیم پلاگین کلیک‌هاوس
 # ==========================================
@@ -66,6 +67,8 @@ sudo apt update -y
 sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 sudo systemctl enable docker
 sudo systemctl start docker
+
+
 
 echo "➡️ Running docker compose..."
 sudo docker compose up -d --build

@@ -347,18 +347,28 @@ public class HftRegimeDetection {
 
         public ClickHouseBatchHandler() {
             try {
-                // 🌟 اصلاح هوشمند برای داکر: جایگزینی localhost با نام سرویس
+                // 🌟 اصلاح هوشمند برای داکر: گرفتن آدرس، یوزر و پسورد از متغیرهای محیطی
                 String host = System.getenv("CLICKHOUSE_HOST");
                 if (host == null || host.trim().isEmpty()) {
-                    host = "clickhouse"; // این نامِ کانتینر دیتابیس در فایل داکر کامپوز شماست
+                    host = "clickhouse"; 
+                }
+                
+                String user = System.getenv("CLICKHOUSE_USER");
+                if (user == null || user.trim().isEmpty()) {
+                    user = "default";
+                }
+                
+                String password = System.getenv("CLICKHOUSE_PASSWORD");
+                if (password == null) {
+                    password = ""; // رمز دیفالت (خالی)
                 }
                 
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
-                this.connection = DriverManager.getConnection(url, "default", "");
+                this.connection = DriverManager.getConnection(url, user, password);
                 
                 String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
-                System.out.println("✅ ClickHouse Connection Established Successfully on host: " + host);
+                System.out.println("✅ ClickHouse Connection Established Successfully on host: " + host + " with user: " + user);
             } catch (SQLException e) {
                 System.err.println("\n🔴 CRITICAL: ClickHouse Connection Failed: " + e.getMessage());
                 System.exit(1); 

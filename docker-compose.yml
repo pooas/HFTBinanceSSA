@@ -47,6 +47,10 @@ services:
       context: ./java-app
       dockerfile: Dockerfile
     container_name: hft_java_producer
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=hft123
     depends_on:
       clickhouse:
         condition: service_healthy
