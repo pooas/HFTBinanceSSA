@@ -347,12 +347,18 @@ public class HftRegimeDetection {
 
         public ClickHouseBatchHandler() {
             try {
-                String url = "jdbc:ch://localhost:8123/default?compress=0";
+                // 🌟 اصلاح هوشمند برای داکر: جایگزینی localhost با نام سرویس
+                String host = System.getenv("CLICKHOUSE_HOST");
+                if (host == null || host.trim().isEmpty()) {
+                    host = "clickhouse"; // این نامِ کانتینر دیتابیس در فایل داکر کامپوز شماست
+                }
+                
+                String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, "default", "");
                 
                 String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
-                System.out.println("✅ ClickHouse Connection Established Successfully!");
+                System.out.println("✅ ClickHouse Connection Established Successfully on host: " + host);
             } catch (SQLException e) {
                 System.err.println("\n🔴 CRITICAL: ClickHouse Connection Failed: " + e.getMessage());
                 System.exit(1); 
@@ -434,4 +440,3 @@ public class HftRegimeDetection {
         new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking(); 
         Thread.currentThread().join();
     }
-}

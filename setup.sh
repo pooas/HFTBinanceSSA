@@ -68,6 +68,6 @@ sudo systemctl enable docker
 sudo systemctl start docker
 
 echo "➡️ Running docker compose..."
-sudo docker compose up -d
+sudo docker compose up -d --build
 
 echo "✅ Deployment completed successfully! Grafana and ClickHouse are ready."
