@@ -28,6 +28,12 @@ public class HftRegimeDetection {
         public double lambda;
         public boolean isFrozen;
         public int regime;
+        
+        // 🌟 بازگرداندن متغیرهای شفاف‌ساز به مدل برای استریم در دیتابیس
+        public double pc0;         
+        public double evr;         
+        public double bandUpper;   
+        public double bandLower;   
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -52,11 +58,8 @@ public class HftRegimeDetection {
         private int currentTau = 2;
         private int currentM = 3;
 
-        // متغیر حافظه رژیم بازار (1: Bullish, -1: Bearish)
         private int currentMarketRegime = 1;
-        // متغیری برای جلوگیری از حرکت رو به عقبِ خطِ فاصله در روندهای قوی (Trailing Logic)
         private double lastLogicalDistanceLine = 0.0;
-        // متغیر هموارساز برای فاصله داینامیک تا خطوط دچار پرش‌های لحظه‌ای نشوند
         private double smoothedDistance = 0.0;
 
         public static class ChaosMath {
@@ -151,110 +154,121 @@ public class HftRegimeDetection {
                     data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                 }
                 
-                // 1. محاسبه میانگین قیمت‌ها (جهت جلوگیری از ارور صفر شدن EVR)
+                // 1. Mean-Centering
                 double mean = 0.0;
-                for (int i = 0; i < N_ssa; i++) {
-                    mean += data[i];
-                }
+                for (int i = 0; i < N_ssa; i++) mean += data[i];
                 mean /= N_ssa;
 
-                // 2. Mean-Centering
-                for (int i = 0; i < N_ssa; i++) {
-                    data[i] -= mean;
-                }
+                for (int i = 0; i < N_ssa; i++) data[i] -= mean;
 
                 SimpleMatrix X = new SimpleMatrix(L, K);
-                double frobeniusSq = 0.0;
-                
                 for (int j = 0; j < K; j++) {
                     for (int i = 0; i < L; i++) {
-                        double val = data[j + i];
-                        X.set(i, j, val);
-                        frobeniusSq += val * val; 
+                        X.set(i, j, data[j + i]);
                     }
                 }
                 
-                double pc0, evr, gapFactor, sigma0;
+                double pc0, evr, gapFactor, noiseStdDev;
 
-                if (frobeniusSq < 1e-10) {
+                SimpleSVD<SimpleMatrix> svd = X.svd();
+                SimpleMatrix U = svd.getU();
+                SimpleMatrix V = svd.getV();
+                SimpleMatrix W = svd.getW();
+                
+                int numSingularValues = Math.min(L, K);
+                double maxSigma = -1.0;
+                int maxIndex = 0;
+                double sumSigmaSq = 0.0;
+                
+                double[] sigmas = new double[numSingularValues];
+                for (int c = 0; c < numSingularValues; c++) {
+                    double s = Math.abs(W.get(c, c));
+                    sigmas[c] = s;
+                    sumSigmaSq += (s * s);
+                    
+                    if (s > maxSigma) {
+                        maxSigma = s;
+                        maxIndex = c;
+                    }
+                }
+                
+                if (sumSigmaSq < 1e-10) {
                     pc0 = mean;
                     evr = 1.0; 
                     gapFactor = 0.0;
-                    sigma0 = 0.0;
+                    noiseStdDev = 0.0;
                 } else {
-                    SimpleSVD<SimpleMatrix> svd = X.svd();
-                    SimpleMatrix U = svd.getU();
-                    SimpleMatrix V = svd.getV();
-                    SimpleMatrix W = svd.getW();
-                    
-                    int numSingularValues = Math.min(L, K);
-                    double maxSigma = -1.0;
-                    int maxIndex = 0;
-                    
-                    for (int c = 0; c < numSingularValues; c++) {
-                        double s = Math.abs(W.get(c, c));
-                        if (s > maxSigma) {
-                            maxSigma = s;
-                            maxIndex = c;
-                        }
-                    }
-                    
-                    sigma0 = maxSigma;
+                    double sigma0 = maxSigma;
                     
                     double sigma1 = 0.0;
                     for (int c = 0; c < numSingularValues; c++) {
-                        if (c != maxIndex) {
-                            double s = Math.abs(W.get(c, c));
-                            if (s > sigma1) sigma1 = s;
+                        if (c != maxIndex && sigmas[c] > sigma1) {
+                            sigma1 = sigmas[c];
                         }
                     }
                     
+                    // استخراج نقطه نهایی ترند
                     pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
-                    evr = (sigma0 * sigma0) / frobeniusSq;
+                    
+                    // محاسبه قطعی EVR از طریق انرژی ویژه (عدد بین 0.0 تا 1.0)
+                    evr = (sigma0 * sigma0) / sumSigmaSq;
                     
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
                     gapFactor = 1.0 / Math.max(1.0, gapRatio);
+                    
+                    // =======================================================
+                    // 🔥 فرمول جدید و قطعی واریانس پسماند (Eigen-Spectrum Residuals)
+                    // =======================================================
+                    // این فرمول به جای اینکه شیب ترند را به عنوان نویز بسنجد، دقیقاً 
+                    // انرژی باقی‌مانده از ماتریس SVD (که معرف خالصِ نویز است) را محاسبه می‌کند.
+                    double residualVarianceSq = sumSigmaSq - (sigma0 * sigma0);
+                    if (residualVarianceSq < 0) residualVarianceSq = 0;
+                    noiseStdDev = Math.sqrt(residualVarianceSq / (L * K));
                 }
 
-                double noiseVariance = 0.0;
-                for (int i = 0; i < N_ssa; i++) {
-                    double originalData = data[i] + mean;
-                    double diff = originalData - pc0;
-                    noiseVariance += diff * diff;
-                }
-                double noiseStdDev = Math.sqrt(noiseVariance / N_ssa);
-
-                double alpha = 3.0; 
-                double beta = 1.0;  
+                // ==========================================
+                // لایه فاصله داینامیک هوشمند
+                // ==========================================
+                double alpha = 4.0; 
+                double beta = 2.0;  
                 
                 double rawMultiplier = 1.0 + alpha * (1.0 - evr) + beta * gapFactor;
-                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 4.0));
+                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                smoothedDistance = 0.1 * rawDistance + 0.9 * smoothedDistance;
+                // هموارسازی سنگین‌تر مرزها برای خنثی کردن اسپایک‌ها
+                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
+                event.pc0 = pc0;
+                event.evr = evr;
+                event.bandUpper = pc0 + smoothedDistance;
+                event.bandLower = pc0 - smoothedDistance;
+
+                // ==========================================
+                // ماشین تغییر رژیم (Trailing Support/Resistance)
+                // ==========================================
                 double currentLineVal;
 
-                if (currentMarketRegime == 1) { 
-                    double proposedSupport = pc0 - smoothedDistance;
+                if (currentMarketRegime == 1) { // روند صعودی
+                    double proposedSupport = event.bandLower;
                     
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < pc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
                     if (event.price < currentLineVal) {
                         currentMarketRegime = -1; 
-                        currentLineVal = pc0 + smoothedDistance; 
+                        currentLineVal = event.bandUpper; 
                     }
-                } else { 
-                    double proposedResistance = pc0 + smoothedDistance;
+                } else { // روند نزولی
+                    double proposedResistance = event.bandUpper;
                     
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > pc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
                     if (event.price > currentLineVal) {
                         currentMarketRegime = 1; 
-                        currentLineVal = pc0 - smoothedDistance; 
+                        currentLineVal = event.bandLower; 
                     }
                 }
 
@@ -263,11 +277,15 @@ public class HftRegimeDetection {
                 event.regime = currentMarketRegime;
                 
             } else {
+                event.pc0 = event.price;
+                event.evr = 0.0;
+                event.bandUpper = event.price;
+                event.bandLower = event.price;
                 event.ssaTrend = event.price;
                 event.regime = currentMarketRegime;
             }
 
-            // --- بخش محاسبه لیاپانوف ---
+            // --- محاسبه لیاپانوف ---
             ssaTrendBuffer[ssaHead] = event.ssaTrend;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
@@ -318,8 +336,8 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://localhost:8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, "default", "");
                 
-                // بازگشت به ۷ ستون اصلی و بدون دردسر
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                // 🌟 استفاده مجدد از کوئری 12 ستونه برای ذخیره سازی EVR در دیتابیس
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully!");
             } catch (SQLException e) {
@@ -339,6 +357,11 @@ public class HftRegimeDetection {
                 statement.setDouble(5, event.ssaTrend);
                 statement.setDouble(6, event.lambda);
                 statement.setInt(7, event.isFrozen ? 1 : 0);
+                statement.setInt(8, event.regime);
+                statement.setDouble(9, event.bandUpper);
+                statement.setDouble(10, event.bandLower);
+                statement.setDouble(11, event.pc0);
+                statement.setDouble(12, event.evr);
                 
                 statement.addBatch();
                 currentBatchSize++;
@@ -398,5 +421,3 @@ public class HftRegimeDetection {
         Thread.currentThread().join();
     }
 }
-
-//stable version 
