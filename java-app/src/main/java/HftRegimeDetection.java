@@ -16,7 +16,6 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.util.Properties;
 
 public class HftRegimeDetection {
 
@@ -28,10 +27,13 @@ public class HftRegimeDetection {
         public long ingressNanoTime;
         public double lambda;
         public boolean isFrozen;
-        public double bandUpper;
-        public double bandLower;
-        // اضافه شدن فیلد رژیم بازار به دیتابیس (1 = صعودی، -1 = نزولی)
-        public int regime; 
+        
+        // 🌟 فیلدهای جدید برای شفافیت کامل ۴ لایه معماری
+        public double pc0;         // لایه 1: ترند پایه
+        public double evr;         // لایه 2: قدرت روند (Eigen-Spectrum)
+        public double bandUpper;   // لایه 3 و 4: حریم بالای نویز
+        public double bandLower;   // لایه 3 و 4: حریم پایین نویز
+        public int regime;         // لایه 5: وضعیت رژیم
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -56,13 +58,11 @@ public class HftRegimeDetection {
         private int currentTau = 2;
         private int currentM = 3;
 
-        // 🌟 متغیر حافظه رژیم بازار (1: Bullish, -1: Bearish)
         private int currentMarketRegime = 1;
-        // متغیری برای جلوگیری از حرکت رو به عقبِ خطِ فاصله در روندهای قوی (Trailing Logic)
         private double lastLogicalDistanceLine = 0.0;
+        private double smoothedDistance = 0.0;
 
         public static class ChaosMath {
-            // ... (دقیقاً همان کدهای قبلی calculateAMI و calculateFNN بدون تغییر) ...
             public static int calculateAMI(double[] data, int maxTau, int bins) {
                 int n = data.length;
                 double[] ami = new double[maxTau + 1];
@@ -162,45 +162,103 @@ public class HftRegimeDetection {
                 SimpleSVD<SimpleMatrix> svd = X.svd();
                 SimpleMatrix U = svd.getU();
                 SimpleMatrix V = svd.getV();
+                SimpleMatrix W = svd.getW();
                 
-                // 1. استخراج ترند مرکزی بسیار نرم (PC0)
-                double pc0 = svd.getW().get(0, 0) * (U.get(L - 1, 0) * V.get(K - 1, 0));
+                // ==========================================
+                // لایه 1: استخراج ترند پایه (PC0)
+                // ==========================================
+                double sigma0 = W.get(0, 0);
+                double pc0 = sigma0 * (U.get(L - 1, 0) * V.get(K - 1, 0));
 
-                // 2. محاسبه واریانس نویز (فاصله قیمت تا ترند مرکزی) بر اساس مقالات
+                // ==========================================
+                // لایه 2: استخراج Eigen-Spectrum و EVR
+                // ==========================================
+                int numSingularValues = Math.min(L, K);
+                double sumSigmaSq = 0.0;
+                double sigma1 = numSingularValues > 1 ? W.get(1, 1) : 0.0;
+
+                for (int c = 0; c < numSingularValues; c++) {
+                    double s = W.get(c, c);
+                    sumSigmaSq += (s * s);
+                }
+
+                // درصد واریانس (قدرت ترند)
+                double evr = (sigma0 * sigma0) / Math.max(sumSigmaSq, 1e-9);
+                
+                // شکاف ویژه: سیگما 0 تقسیم بر سیگما 1 (مقدار بزرگتر مساوی 1 است)
+                // هرچه این عدد بزرگتر باشد یعنی ترند از نویز جداتر است.
+                double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
+
+                // تبدیل گپ به یک فاکتور بین 0 تا 1 (هرچه گپ بیشتر، فاکتور کمتر)
+                double gapFactor = 1.0 / Math.max(1.0, gapRatio);
+
+                // ==========================================
+                // لایه 3: محاسبه واریانس نویز ذاتی
+                // ==========================================
                 double noiseVariance = 0.0;
                 for (int i = 0; i < N_ssa; i++) {
                     double diff = data[i] - pc0;
                     noiseVariance += diff * diff;
                 }
                 double noiseStdDev = Math.sqrt(noiseVariance / N_ssa);
+
+                // ==========================================
+                // لایه 4: فاصله داینامیک هوشمند
+                // ==========================================
+                double alpha = 4.0; // تاثیر EVR در باد کردن باند
+                double beta = 2.0;  // تاثیر Eigen-Gap در باد کردن باند
                 
-                // 3. ایجاد فاصله منطقی (انرژی پسماند با ضریب 2 برای جلوگیری کامل از Whipsaw)
-                double logicalDistance = noiseStdDev * 2.0; 
+                // فرمول نهایی داینامیک: اگر ترند قوی باشد (evr -> 1, gapFactor -> 0)، ضریب به 1.0 می‌چسبد.
+                double rawMultiplier = 1.0 + alpha * (1.0 - evr) + beta * gapFactor;
+                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
+
+                double rawDistance = noiseStdDev * mMultiplier; 
+                if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
+                // هموارسازی سنگین‌تر برای جلوگیری از نوسان مرزها
+                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
+
+                // ثبت باندها برای نمایش در گرافانا
+                event.pc0 = pc0;
+                event.evr = evr;
+                event.bandUpper = pc0 + smoothedDistance;
+                event.bandLower = pc0 - smoothedDistance;
+
+                // ==========================================
+                // لایه 5: ماشین تغییر رژیم (Trailing Support/Resistance)
+                // ==========================================
                 double currentLineVal;
 
-                // 4. ماشین وضعیت تغییر رژیم (Change-Point Regime Machine)
-                if (currentMarketRegime == 1) { // رژیم صعودی فعلی
-                    currentLineVal = pc0 - logicalDistance; // خط در نقش حمایت (پایین قیمت)
+                if (currentMarketRegime == 1) { // روند صعودی
+                    double proposedSupport = event.bandLower;
                     
-                    // تشخیص تغییر رژیم به نزولی: شکست قطعی حمایت
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < pc0) ? 
+                                     Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
+                    
                     if (event.price < currentLineVal) {
-                        currentMarketRegime = -1; // تغییر رژیم!
-                        currentLineVal = pc0 + logicalDistance; // پرش خط به بالا (مقاومت)
+                        currentMarketRegime = -1; // تغییر به نزولی
+                        currentLineVal = event.bandUpper; 
                     }
-                } else { // رژیم نزولی فعلی
-                    currentLineVal = pc0 + logicalDistance; // خط در نقش مقاومت (بالای قیمت)
+                } else { // روند نزولی
+                    double proposedResistance = event.bandUpper;
                     
-                    // تشخیص تغییر رژیم به صعودی: شکست قطعی مقاومت
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > pc0) ? 
+                                     Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
+                    
                     if (event.price > currentLineVal) {
-                        currentMarketRegime = 1; // تغییر رژیم!
-                        currentLineVal = pc0 - logicalDistance; // پرش خط به پایین (حمایت)
+                        currentMarketRegime = 1; // تغییر به صعودی
+                        currentLineVal = event.bandLower; 
                     }
                 }
 
+                lastLogicalDistanceLine = currentLineVal;
                 event.ssaTrend = currentLineVal;
                 event.regime = currentMarketRegime;
                 
             } else {
+                event.pc0 = event.price;
+                event.evr = 0.0;
+                event.bandUpper = event.price;
+                event.bandLower = event.price;
                 event.ssaTrend = event.price;
                 event.regime = currentMarketRegime;
             }
@@ -253,32 +311,13 @@ public class HftRegimeDetection {
 
         public ClickHouseBatchHandler() {
             try {
-                String url = "jdbc:ch://clickhouse:8123/default";
+                String url = "jdbc:ch://localhost:8123/default?compress=0";
+                this.connection = DriverManager.getConnection(url, "default", "");
                 
-                // استفاده از Properties برای ارسال امن مشخصات
-                Properties properties = new Properties();
-                properties.setProperty("user", "default");
-                properties.setProperty("password", "hft123");
-                properties.setProperty("compress", "0");
-
-                this.connection = DriverManager.getConnection(url, properties);
-
-                String createTableSQL = "CREATE TABLE IF NOT EXISTS hft_market_data (" +
-                        "timestamp DateTime64(3), " +
-                        "sequence UInt64, " +
-                        "price Float64, " +
-                        "volume Float64, " +
-                        "ssa_trend Float64, " +
-                        "lambda Float64, " +
-                        "is_frozen UInt8, " +
-                        "regime Int8" +
-                        ") ENGINE = MergeTree() ORDER BY (timestamp, sequence)";
-                this.connection.createStatement().execute(createTableSQL);
-
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+                // 🌟 دیتابیس آپدیت شد تا تمام 4 لایه را ذخیره کند
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully!");
-                
             } catch (SQLException e) {
                 System.err.println("🔴 CRITICAL: ClickHouse Connection Failed: " + e.getMessage());
                 System.exit(1); 
@@ -296,7 +335,12 @@ public class HftRegimeDetection {
                 statement.setDouble(5, event.ssaTrend);
                 statement.setDouble(6, event.lambda);
                 statement.setInt(7, event.isFrozen ? 1 : 0);
-                statement.setInt(8, event.regime); // ثبت رژیم در دیتابیس
+                statement.setInt(8, event.regime);
+                statement.setDouble(9, event.bandUpper);
+                statement.setDouble(10, event.bandLower);
+                statement.setDouble(11, event.pc0);
+                statement.setDouble(12, event.evr);
+                
                 statement.addBatch();
                 currentBatchSize++;
                 if (currentBatchSize >= batchSizeThreshold || endOfBatch) flush();
@@ -341,11 +385,7 @@ public class HftRegimeDetection {
                 } finally {
                     ringBuffer.publish(sequence); 
                 }
-            } catch (Exception e) {
-                // چاپ خطاهای پنهان
-                System.err.println("\n🔴 Error parsing or inserting tick: " + e.getMessage());
-                e.printStackTrace();
-            }
+            } catch (Exception e) {}
         }
         @Override public void onClose(int code, String reason, boolean remote) {}
         @Override public void onError(Exception ex) {}
