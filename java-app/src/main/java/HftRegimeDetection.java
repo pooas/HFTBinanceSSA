@@ -27,13 +27,7 @@ public class HftRegimeDetection {
         public long ingressNanoTime;
         public double lambda;
         public boolean isFrozen;
-        
-        // 🌟 فیلدهای جدید برای شفافیت کامل ۴ لایه معماری
-        public double pc0;         // لایه 1: ترند پایه
-        public double evr;         // لایه 2: قدرت روند (Eigen-Spectrum) به درصد
-        public double bandUpper;   // لایه 3 و 4: حریم بالای نویز
-        public double bandLower;   // لایه 3 و 4: حریم پایین نویز
-        public int regime;         // لایه 5: وضعیت رژیم
+        public int regime;
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -58,8 +52,11 @@ public class HftRegimeDetection {
         private int currentTau = 2;
         private int currentM = 3;
 
+        // متغیر حافظه رژیم بازار (1: Bullish, -1: Bearish)
         private int currentMarketRegime = 1;
+        // متغیری برای جلوگیری از حرکت رو به عقبِ خطِ فاصله در روندهای قوی (Trailing Logic)
         private double lastLogicalDistanceLine = 0.0;
+        // متغیر هموارساز برای فاصله داینامیک تا خطوط دچار پرش‌های لحظه‌ای نشوند
         private double smoothedDistance = 0.0;
 
         public static class ChaosMath {
@@ -154,7 +151,7 @@ public class HftRegimeDetection {
                     data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                 }
                 
-                // 1. محاسبه میانگین قیمت‌ها
+                // 1. محاسبه میانگین قیمت‌ها (جهت جلوگیری از ارور صفر شدن EVR)
                 double mean = 0.0;
                 for (int i = 0; i < N_ssa; i++) {
                     mean += data[i];
@@ -173,16 +170,15 @@ public class HftRegimeDetection {
                     for (int i = 0; i < L; i++) {
                         double val = data[j + i];
                         X.set(i, j, val);
-                        frobeniusSq += val * val; // محاسبه کل واریانس به دقیق‌ترین شکل ممکن ریاضی
+                        frobeniusSq += val * val; 
                     }
                 }
                 
                 double pc0, evr, gapFactor, sigma0;
 
-                // محافظت در برابر بازارهایی که برای چند میلی‌ثانیه فریز می‌شوند (بدون نوسان قیمت)
                 if (frobeniusSq < 1e-10) {
                     pc0 = mean;
-                    evr = 100.0; // وقتی قیمت کاملا خطی است، یعنی 100٪ ترند است
+                    evr = 1.0; 
                     gapFactor = 0.0;
                     sigma0 = 0.0;
                 } else {
@@ -214,17 +210,12 @@ public class HftRegimeDetection {
                     }
                     
                     pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
-                    
-                    // محاسبه EVR به صورت درصد (۰ تا ۱۰۰) برای جلوگیری از خطای ذخیره‌سازی اینتیجر در کلیک‌هاوس
-                    evr = ((sigma0 * sigma0) / frobeniusSq) * 100.0;
+                    evr = (sigma0 * sigma0) / frobeniusSq;
                     
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
                     gapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
-                // ==========================================
-                // لایه 3: محاسبه واریانس نویز ذاتی
-                // ==========================================
                 double noiseVariance = 0.0;
                 for (int i = 0; i < N_ssa; i++) {
                     double originalData = data[i] + mean;
@@ -233,49 +224,37 @@ public class HftRegimeDetection {
                 }
                 double noiseStdDev = Math.sqrt(noiseVariance / N_ssa);
 
-                // ==========================================
-                // لایه 4: فاصله داینامیک هوشمند
-                // ==========================================
-                double evrRatio = Math.min(evr / 100.0, 1.0); // مقیاس دوباره به 0 تا 1 برای ضریب
-                double alpha = 4.0; // تاثیر EVR در باد کردن باند
-                double beta = 2.0;  // تاثیر Eigen-Gap در باد کردن باند
+                double alpha = 3.0; 
+                double beta = 1.0;  
                 
-                double rawMultiplier = 1.0 + alpha * (1.0 - evrRatio) + beta * gapFactor;
-                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
+                double rawMultiplier = 1.0 + alpha * (1.0 - evr) + beta * gapFactor;
+                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 4.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
+                smoothedDistance = 0.1 * rawDistance + 0.9 * smoothedDistance;
 
-                event.pc0 = pc0;
-                event.evr = evr;
-                event.bandUpper = pc0 + smoothedDistance;
-                event.bandLower = pc0 - smoothedDistance;
-
-                // ==========================================
-                // لایه 5: ماشین تغییر رژیم (Trailing Support/Resistance)
-                // ==========================================
                 double currentLineVal;
 
-                if (currentMarketRegime == 1) { // روند صعودی
-                    double proposedSupport = event.bandLower;
+                if (currentMarketRegime == 1) { 
+                    double proposedSupport = pc0 - smoothedDistance;
                     
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < pc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
                     if (event.price < currentLineVal) {
-                        currentMarketRegime = -1; // تغییر به نزولی
-                        currentLineVal = event.bandUpper; 
+                        currentMarketRegime = -1; 
+                        currentLineVal = pc0 + smoothedDistance; 
                     }
-                } else { // روند نزولی
-                    double proposedResistance = event.bandUpper;
+                } else { 
+                    double proposedResistance = pc0 + smoothedDistance;
                     
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > pc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
                     if (event.price > currentLineVal) {
-                        currentMarketRegime = 1; // تغییر به صعودی
-                        currentLineVal = event.bandLower; 
+                        currentMarketRegime = 1; 
+                        currentLineVal = pc0 - smoothedDistance; 
                     }
                 }
 
@@ -284,10 +263,6 @@ public class HftRegimeDetection {
                 event.regime = currentMarketRegime;
                 
             } else {
-                event.pc0 = event.price;
-                event.evr = 0.0;
-                event.bandUpper = event.price;
-                event.bandLower = event.price;
                 event.ssaTrend = event.price;
                 event.regime = currentMarketRegime;
             }
@@ -343,7 +318,8 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://localhost:8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, "default", "");
                 
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                // بازگشت به ۷ ستون اصلی و بدون دردسر
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen) VALUES (?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully!");
             } catch (SQLException e) {
@@ -363,11 +339,6 @@ public class HftRegimeDetection {
                 statement.setDouble(5, event.ssaTrend);
                 statement.setDouble(6, event.lambda);
                 statement.setInt(7, event.isFrozen ? 1 : 0);
-                statement.setInt(8, event.regime);
-                statement.setDouble(9, event.bandUpper);
-                statement.setDouble(10, event.bandLower);
-                statement.setDouble(11, event.pc0);
-                statement.setDouble(12, event.evr);
                 
                 statement.addBatch();
                 currentBatchSize++;
