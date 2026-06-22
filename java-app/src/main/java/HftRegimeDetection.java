@@ -30,7 +30,7 @@ public class HftRegimeDetection {
         
         // 🌟 فیلدهای جدید برای شفافیت کامل ۴ لایه معماری
         public double pc0;         // لایه 1: ترند پایه
-        public double evr;         // لایه 2: قدرت روند (Eigen-Spectrum)
+        public double evr;         // لایه 2: قدرت روند (Eigen-Spectrum) به درصد
         public double bandUpper;   // لایه 3 و 4: حریم بالای نویز
         public double bandLower;   // لایه 3 و 4: حریم پایین نویز
         public int regime;         // لایه 5: وضعیت رژیم
@@ -154,9 +154,6 @@ public class HftRegimeDetection {
                     data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                 }
                 
-                // ==========================================
-                // لایه 1 و 2: استخراج مقادیر ویژه و ترند (با تصحیح ریاضیاتی Mean-Centering)
-                // ==========================================
                 // 1. محاسبه میانگین قیمت‌ها
                 double mean = 0.0;
                 for (int i = 0; i < N_ssa; i++) {
@@ -164,65 +161,72 @@ public class HftRegimeDetection {
                 }
                 mean /= N_ssa;
 
-                // 2. Mean-Centering (حذف میانگین برای اینکه SVD فقط نوسانات و ترند رو ببینه، نه افست قیمت رو)
+                // 2. Mean-Centering
                 for (int i = 0; i < N_ssa; i++) {
                     data[i] -= mean;
                 }
 
                 SimpleMatrix X = new SimpleMatrix(L, K);
+                double frobeniusSq = 0.0;
+                
                 for (int j = 0; j < K; j++) {
-                    for (int i = 0; i < L; i++) X.set(i, j, data[j + i]);
+                    for (int i = 0; i < L; i++) {
+                        double val = data[j + i];
+                        X.set(i, j, val);
+                        frobeniusSq += val * val; // محاسبه کل واریانس به دقیق‌ترین شکل ممکن ریاضی
+                    }
                 }
                 
-                SimpleSVD<SimpleMatrix> svd = X.svd();
-                SimpleMatrix U = svd.getU();
-                SimpleMatrix V = svd.getV();
-                SimpleMatrix W = svd.getW();
-                
-                int numSingularValues = Math.min(L, K);
-                double[] sigmas = new double[numSingularValues];
-                double sumSigmaSq = 0.0;
-                
-                int maxIndex = 0;
-                double maxSigma = -1.0;
+                double pc0, evr, gapFactor, sigma0;
 
-                // 3. جستجوی دستی بزرگترین مقدار ویژه (جلوگیری از باگ سورت نبودن کتابخانه EJML)
-                for (int c = 0; c < numSingularValues; c++) {
-                    double s = Math.abs(W.get(c, c));
-                    sigmas[c] = s;
-                    sumSigmaSq += (s * s);
+                // محافظت در برابر بازارهایی که برای چند میلی‌ثانیه فریز می‌شوند (بدون نوسان قیمت)
+                if (frobeniusSq < 1e-10) {
+                    pc0 = mean;
+                    evr = 100.0; // وقتی قیمت کاملا خطی است، یعنی 100٪ ترند است
+                    gapFactor = 0.0;
+                    sigma0 = 0.0;
+                } else {
+                    SimpleSVD<SimpleMatrix> svd = X.svd();
+                    SimpleMatrix U = svd.getU();
+                    SimpleMatrix V = svd.getV();
+                    SimpleMatrix W = svd.getW();
                     
-                    if (s > maxSigma) {
-                        maxSigma = s;
-                        maxIndex = c;
+                    int numSingularValues = Math.min(L, K);
+                    double maxSigma = -1.0;
+                    int maxIndex = 0;
+                    
+                    for (int c = 0; c < numSingularValues; c++) {
+                        double s = Math.abs(W.get(c, c));
+                        if (s > maxSigma) {
+                            maxSigma = s;
+                            maxIndex = c;
+                        }
                     }
-                }
-
-                double sigma0 = maxSigma;
-                
-                // 4. پیدا کردن دومین مقدار بزرگ برای محاسبه Eigen-Gap
-                double sigma1 = 0.0;
-                for (int c = 0; c < numSingularValues; c++) {
-                    if (c != maxIndex && sigmas[c] > sigma1) {
-                        sigma1 = sigmas[c];
+                    
+                    sigma0 = maxSigma;
+                    
+                    double sigma1 = 0.0;
+                    for (int c = 0; c < numSingularValues; c++) {
+                        if (c != maxIndex) {
+                            double s = Math.abs(W.get(c, c));
+                            if (s > sigma1) sigma1 = s;
+                        }
                     }
+                    
+                    pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
+                    
+                    // محاسبه EVR به صورت درصد (۰ تا ۱۰۰) برای جلوگیری از خطای ذخیره‌سازی اینتیجر در کلیک‌هاوس
+                    evr = ((sigma0 * sigma0) / frobeniusSq) * 100.0;
+                    
+                    double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
+                    gapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
-
-                // 5. بازسازی ترند پایه + برگرداندن میانگین به آن
-                double pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
-
-                // 6. درصد واریانس (EVR) - اکنون عدد واقعی قدرت روند را تولید می‌کند
-                double evr = (sigma0 * sigma0) / Math.max(sumSigmaSq, 1e-9);
-                
-                double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
-                double gapFactor = 1.0 / Math.max(1.0, gapRatio);
 
                 // ==========================================
                 // لایه 3: محاسبه واریانس نویز ذاتی
                 // ==========================================
                 double noiseVariance = 0.0;
                 for (int i = 0; i < N_ssa; i++) {
-                    // چون دیتا رو mean-center کردیم، باید اول به حالت اولیه برگرده
                     double originalData = data[i] + mean;
                     double diff = originalData - pc0;
                     noiseVariance += diff * diff;
@@ -232,10 +236,11 @@ public class HftRegimeDetection {
                 // ==========================================
                 // لایه 4: فاصله داینامیک هوشمند
                 // ==========================================
+                double evrRatio = Math.min(evr / 100.0, 1.0); // مقیاس دوباره به 0 تا 1 برای ضریب
                 double alpha = 4.0; // تاثیر EVR در باد کردن باند
                 double beta = 2.0;  // تاثیر Eigen-Gap در باد کردن باند
                 
-                double rawMultiplier = 1.0 + alpha * (1.0 - evr) + beta * gapFactor;
+                double rawMultiplier = 1.0 + alpha * (1.0 - evrRatio) + beta * gapFactor;
                 double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
