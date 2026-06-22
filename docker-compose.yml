@@ -17,8 +17,8 @@ services:
       retries: 5
 
   grafana:
-    #image: grafana/grafana-oss:latest
-    image: grafana/grafana:latest
+    image: grafana/grafana-oss:latest
+    #image: grafana/grafana:latest
     container_name: hft_grafana
     ports:
       - "3000:3000"
@@ -28,12 +28,9 @@ services:
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=500ms
       - GF_DASHBOARDS_AUTO_REFRESH_INTERVALS=500ms,1s,2s,5s,10s,30s
-<<<<<<< HEAD
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
-      - GF_PLUGINS_ALLOW_UNSIGNED_PLUGINS=grafana-clickhouse-datasource
-      
-=======
->>>>>>> 3e61e59 (Enable grafana to refresh 500 micro second)
+      #- GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      #- GF_PLUGINS_ALLOW_UNSIGNED_PLUGINS=grafana-clickhouse-datasource
+      #- GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
       - ./grafana-plugins:/var/lib/grafana/plugins
