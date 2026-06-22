@@ -154,6 +154,21 @@ public class HftRegimeDetection {
                     data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                 }
                 
+                // ==========================================
+                // لایه 1 و 2: استخراج مقادیر ویژه و ترند (با تصحیح ریاضیاتی Mean-Centering)
+                // ==========================================
+                // 1. محاسبه میانگین قیمت‌ها
+                double mean = 0.0;
+                for (int i = 0; i < N_ssa; i++) {
+                    mean += data[i];
+                }
+                mean /= N_ssa;
+
+                // 2. Mean-Centering (حذف میانگین برای اینکه SVD فقط نوسانات و ترند رو ببینه، نه افست قیمت رو)
+                for (int i = 0; i < N_ssa; i++) {
+                    data[i] -= mean;
+                }
+
                 SimpleMatrix X = new SimpleMatrix(L, K);
                 for (int j = 0; j < K; j++) {
                     for (int i = 0; i < L; i++) X.set(i, j, data[j + i]);
@@ -164,32 +179,42 @@ public class HftRegimeDetection {
                 SimpleMatrix V = svd.getV();
                 SimpleMatrix W = svd.getW();
                 
-                // ==========================================
-                // لایه 1: استخراج ترند پایه (PC0)
-                // ==========================================
-                double sigma0 = W.get(0, 0);
-                double pc0 = sigma0 * (U.get(L - 1, 0) * V.get(K - 1, 0));
-
-                // ==========================================
-                // لایه 2: استخراج Eigen-Spectrum و EVR
-                // ==========================================
                 int numSingularValues = Math.min(L, K);
+                double[] sigmas = new double[numSingularValues];
                 double sumSigmaSq = 0.0;
-                double sigma1 = numSingularValues > 1 ? W.get(1, 1) : 0.0;
+                
+                int maxIndex = 0;
+                double maxSigma = -1.0;
 
+                // 3. جستجوی دستی بزرگترین مقدار ویژه (جلوگیری از باگ سورت نبودن کتابخانه EJML)
                 for (int c = 0; c < numSingularValues; c++) {
-                    double s = W.get(c, c);
+                    double s = Math.abs(W.get(c, c));
+                    sigmas[c] = s;
                     sumSigmaSq += (s * s);
+                    
+                    if (s > maxSigma) {
+                        maxSigma = s;
+                        maxIndex = c;
+                    }
                 }
 
-                // درصد واریانس (قدرت ترند)
+                double sigma0 = maxSigma;
+                
+                // 4. پیدا کردن دومین مقدار بزرگ برای محاسبه Eigen-Gap
+                double sigma1 = 0.0;
+                for (int c = 0; c < numSingularValues; c++) {
+                    if (c != maxIndex && sigmas[c] > sigma1) {
+                        sigma1 = sigmas[c];
+                    }
+                }
+
+                // 5. بازسازی ترند پایه + برگرداندن میانگین به آن
+                double pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
+
+                // 6. درصد واریانس (EVR) - اکنون عدد واقعی قدرت روند را تولید می‌کند
                 double evr = (sigma0 * sigma0) / Math.max(sumSigmaSq, 1e-9);
                 
-                // شکاف ویژه: سیگما 0 تقسیم بر سیگما 1 (مقدار بزرگتر مساوی 1 است)
-                // هرچه این عدد بزرگتر باشد یعنی ترند از نویز جداتر است.
                 double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
-
-                // تبدیل گپ به یک فاکتور بین 0 تا 1 (هرچه گپ بیشتر، فاکتور کمتر)
                 double gapFactor = 1.0 / Math.max(1.0, gapRatio);
 
                 // ==========================================
@@ -197,7 +222,9 @@ public class HftRegimeDetection {
                 // ==========================================
                 double noiseVariance = 0.0;
                 for (int i = 0; i < N_ssa; i++) {
-                    double diff = data[i] - pc0;
+                    // چون دیتا رو mean-center کردیم، باید اول به حالت اولیه برگرده
+                    double originalData = data[i] + mean;
+                    double diff = originalData - pc0;
                     noiseVariance += diff * diff;
                 }
                 double noiseStdDev = Math.sqrt(noiseVariance / N_ssa);
@@ -208,16 +235,13 @@ public class HftRegimeDetection {
                 double alpha = 4.0; // تاثیر EVR در باد کردن باند
                 double beta = 2.0;  // تاثیر Eigen-Gap در باد کردن باند
                 
-                // فرمول نهایی داینامیک: اگر ترند قوی باشد (evr -> 1, gapFactor -> 0)، ضریب به 1.0 می‌چسبد.
                 double rawMultiplier = 1.0 + alpha * (1.0 - evr) + beta * gapFactor;
                 double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                // هموارسازی سنگین‌تر برای جلوگیری از نوسان مرزها
                 smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
-                // ثبت باندها برای نمایش در گرافانا
                 event.pc0 = pc0;
                 event.evr = evr;
                 event.bandUpper = pc0 + smoothedDistance;
@@ -314,7 +338,6 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://localhost:8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, "default", "");
                 
-                // 🌟 دیتابیس آپدیت شد تا تمام 4 لایه را ذخیره کند
                 String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully!");
