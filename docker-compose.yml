@@ -6,10 +6,13 @@ services:
       - "8123:8123" 
       - "9000:9000"
     environment:
-      - CLICKHOUSE_PASSWORD=hft123    # <-- فقط این خط باید بماند
+      - CLICKHOUSE_PASSWORD=hft123
+    volumes:
+      # این ولوم‌ها باید اینجا (زیر کلیک‌هاوس) باشند، نه گرافانا!
+      - ./ch-init/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - clickhouse_data:/var/lib/clickhouse
     networks:
       - hft-net
-
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s
@@ -18,29 +21,20 @@ services:
 
   grafana:
     image: grafana/grafana-oss:latest
-    #image: grafana/grafana:latest
     container_name: hft_grafana
     ports:
       - "3000:3000"
-      - "8123:8123"
+      # پورت 8123 از اینجا حذف شد تا با کلیک‌هاوس تداخل نکند
     volumes:
-      # اجرای خودکار کدهای SQL در اولین باری که دیتابیس ساخته می‌شود
-      - ./ch-init/init.sql:/docker-entrypoint-initdb.d/init.sql
-      # ذخیره همیشگی داده‌های شما روی هارد
-      - clickhouse_data:/var/lib/clickhouse
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana  # اضافه شدن ولوم برای ذخیره تنظیمات خود گرافانا
     environment:
-      #- GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      # از آنجایی که سرور آلمان/ژاپن است، تحریم نیستید و پلاگین راحت و خودکار دانلود می‌شود
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=500ms
       - GF_DASHBOARDS_AUTO_REFRESH_INTERVALS=500ms,1s,2s,5s,10s,30s
-      #- GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
-      #- GF_PLUGINS_ALLOW_UNSIGNED_PLUGINS=grafana-clickhouse-datasource
-      #- GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana-plugins:/var/lib/grafana/plugins
-      
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -61,3 +55,8 @@ services:
 networks:
   hft-net:
     driver: bridge
+
+# تعریف نام ولوم‌ها در انتهای فایل الزامی است
+volumes:
+  clickhouse_data:
+  grafana_data:
