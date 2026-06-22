@@ -398,3 +398,5 @@ public class HftRegimeDetection {
         Thread.currentThread().join();
     }
 }
+
+//stable version 
