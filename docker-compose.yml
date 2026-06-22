@@ -33,6 +33,7 @@ services:
       - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_PLUGINS_ALLOW_UNSIGNED_PLUGINS=grafana-clickhouse-datasource
       - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=500ms
       - GF_DASHBOARDS_AUTO_REFRESH_INTERVALS=500ms,1s,2s,5s,10s,30s
     depends_on:
