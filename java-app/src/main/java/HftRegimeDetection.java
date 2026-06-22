@@ -49,7 +49,7 @@ public class HftRegimeDetection {
         private int ssaHead = 0;
         private boolean ssaBufferFull = false;
         
-        // 🌟 پیاده‌سازیِ دقیق مقاله: حافظه متحرک برای سنجش نویز واقعی بازار (نه فقط ۸ تیک آخر)
+        // حافظه متحرک برای سنجش نویز واقعی بازار
         private final int RESIDUAL_WINDOW = 100;
         private final double[] residualHistory = new double[RESIDUAL_WINDOW];
         private int residualHead = 0;
@@ -159,7 +159,7 @@ public class HftRegimeDetection {
                     data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                 }
                 
-                // Mean-Centering (بدون شورت‌کات)
+                // Mean-Centering
                 double mean = 0.0;
                 for (int i = 0; i < N_ssa; i++) mean += data[i];
                 mean /= N_ssa;
@@ -170,13 +170,12 @@ public class HftRegimeDetection {
                     for (int i = 0; i < L; i++) {
                         double val = data[j + i] - mean;
                         X.set(i, j, val);
-                        frobeniusSq += val * val; // محاسبه دقیق کل انرژی ماتریس
+                        frobeniusSq += val * val; 
                     }
                 }
                 
                 double pc0, evr, gapFactor;
 
-                // محافظت در برابر فریز شدن لحظه‌ای بازار
                 if (frobeniusSq < 1e-10) {
                     pc0 = mean;
                     evr = 100.0; 
@@ -208,19 +207,13 @@ public class HftRegimeDetection {
                         }
                     }
                     
-                    // استخراج نقطه نهایی ترند
                     pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
-                    
-                    // محاسبه قطعی EVR و ضرب در 100 برای هماهنگی با گرافانا و دیتابیس
                     evr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
                     
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
                     gapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
-                // =======================================================
-                // 🔥 رفع قطعی Whipsaw بر اساس اصول مقاله (Rolling Residuals)
-                // =======================================================
                 double currentResidual = event.price - pc0;
                 residualHistory[residualHead] = currentResidual;
                 residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
@@ -244,10 +237,6 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                // ==========================================
-                // لایه فاصله داینامیک هوشمند
-                // ==========================================
-                // برگرداندن EVR به مقیاس 0 تا 1 فقط برای محاسبه ضریب
                 double evrFactor = Math.min(evr / 100.0, 1.0); 
                 double alpha = 4.0; 
                 double beta = 2.0;  
@@ -265,12 +254,9 @@ public class HftRegimeDetection {
                 event.bandUpper = pc0 + smoothedDistance;
                 event.bandLower = pc0 - smoothedDistance;
 
-                // ==========================================
-                // ماشین تغییر رژیم (Trailing Support/Resistance)
-                // ==========================================
                 double currentLineVal;
 
-                if (currentMarketRegime == 1) { // روند صعودی
+                if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
                     
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < pc0) ? 
@@ -280,7 +266,7 @@ public class HftRegimeDetection {
                         currentMarketRegime = -1; 
                         currentLineVal = event.bandUpper; 
                     }
-                } else { // روند نزولی
+                } else { 
                     double proposedResistance = event.bandUpper;
                     
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > pc0) ? 
@@ -295,6 +281,14 @@ public class HftRegimeDetection {
                 lastLogicalDistanceLine = currentLineVal;
                 event.ssaTrend = currentLineVal;
                 event.regime = currentMarketRegime;
+                
+                // ===================================================================
+                // 🚀 ابزار دیباگ قدرتمند: چاپ محاسبات در ترمینال هر 500 تیک
+                // ===================================================================
+                if (sequence % 500 == 0) {
+                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | PC0: %.2f | EVR: %.2f%% | BandWidth: %.2f\n", 
+                                      sequence, event.price, event.pc0, event.evr, (event.bandUpper - event.bandLower));
+                }
                 
             } else {
                 event.pc0 = event.price;
@@ -360,7 +354,7 @@ public class HftRegimeDetection {
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully!");
             } catch (SQLException e) {
-                System.err.println("🔴 CRITICAL: ClickHouse Connection Failed: " + e.getMessage());
+                System.err.println("\n🔴 CRITICAL: ClickHouse Connection Failed: " + e.getMessage());
                 System.exit(1); 
             }
         }
@@ -386,7 +380,7 @@ public class HftRegimeDetection {
                 currentBatchSize++;
                 if (currentBatchSize >= batchSizeThreshold || endOfBatch) flush();
             } catch (SQLException e) {
-                System.err.println("⚠️ Error inserting tick: " + e.getMessage());
+                System.err.println("\n⚠️ Error formatting tick: " + e.getMessage());
             }
         }
 
@@ -396,7 +390,8 @@ public class HftRegimeDetection {
                 statement.executeBatch(); 
                 currentBatchSize = 0;
             } catch (SQLException e) {
-                System.err.println("🔴 Failed to flush batch: " + e.getMessage());
+                System.err.println("\n🔴 Failed to flush batch to ClickHouse: " + e.getMessage());
+                System.err.println("👉 دلیل: جدول دیتابیس با این 12 ستون هم‌خوانی ندارد. جدول را DROP کرده و دوباره بسازید.");
                 currentBatchSize = 0; 
             }
         }
