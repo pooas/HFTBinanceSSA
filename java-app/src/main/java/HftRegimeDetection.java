@@ -29,7 +29,6 @@ public class HftRegimeDetection {
         public boolean isFrozen;
         public int regime;
         
-        // 🌟 بازگرداندن متغیرهای شفاف‌ساز به مدل برای استریم در دیتابیس
         public double pc0;         
         public double evr;         
         public double bandUpper;   
@@ -50,6 +49,12 @@ public class HftRegimeDetection {
         private int ssaHead = 0;
         private boolean ssaBufferFull = false;
         
+        // 🌟 پیاده‌سازیِ دقیق مقاله: حافظه متحرک برای سنجش نویز واقعی بازار (نه فقط ۸ تیک آخر)
+        private final int RESIDUAL_WINDOW = 100;
+        private final double[] residualHistory = new double[RESIDUAL_WINDOW];
+        private int residualHead = 0;
+        private boolean residualFull = false;
+
         private double currentLambda = 0.0;
         private boolean currentRegimeShiftAlert = false;
         private final double[] lambdaHistory = new double[20];
@@ -154,51 +159,47 @@ public class HftRegimeDetection {
                     data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                 }
                 
-                // 1. Mean-Centering
+                // Mean-Centering (بدون شورت‌کات)
                 double mean = 0.0;
                 for (int i = 0; i < N_ssa; i++) mean += data[i];
                 mean /= N_ssa;
 
-                for (int i = 0; i < N_ssa; i++) data[i] -= mean;
-
+                double frobeniusSq = 0.0;
                 SimpleMatrix X = new SimpleMatrix(L, K);
                 for (int j = 0; j < K; j++) {
                     for (int i = 0; i < L; i++) {
-                        X.set(i, j, data[j + i]);
+                        double val = data[j + i] - mean;
+                        X.set(i, j, val);
+                        frobeniusSq += val * val; // محاسبه دقیق کل انرژی ماتریس
                     }
                 }
                 
-                double pc0, evr, gapFactor, noiseStdDev;
+                double pc0, evr, gapFactor;
 
-                SimpleSVD<SimpleMatrix> svd = X.svd();
-                SimpleMatrix U = svd.getU();
-                SimpleMatrix V = svd.getV();
-                SimpleMatrix W = svd.getW();
-                
-                int numSingularValues = Math.min(L, K);
-                double maxSigma = -1.0;
-                int maxIndex = 0;
-                double sumSigmaSq = 0.0;
-                
-                double[] sigmas = new double[numSingularValues];
-                for (int c = 0; c < numSingularValues; c++) {
-                    double s = Math.abs(W.get(c, c));
-                    sigmas[c] = s;
-                    sumSigmaSq += (s * s);
-                    
-                    if (s > maxSigma) {
-                        maxSigma = s;
-                        maxIndex = c;
-                    }
-                }
-                
-                if (sumSigmaSq < 1e-10) {
+                // محافظت در برابر فریز شدن لحظه‌ای بازار
+                if (frobeniusSq < 1e-10) {
                     pc0 = mean;
-                    evr = 1.0; 
+                    evr = 100.0; 
                     gapFactor = 0.0;
-                    noiseStdDev = 0.0;
                 } else {
-                    double sigma0 = maxSigma;
+                    SimpleSVD<SimpleMatrix> svd = X.svd();
+                    SimpleMatrix U = svd.getU();
+                    SimpleMatrix V = svd.getV();
+                    SimpleMatrix W = svd.getW();
+                    
+                    int numSingularValues = Math.min(L, K);
+                    double sigma0 = -1.0;
+                    int maxIndex = 0;
+                    
+                    double[] sigmas = new double[numSingularValues];
+                    for (int c = 0; c < numSingularValues; c++) {
+                        double s = Math.abs(W.get(c, c));
+                        sigmas[c] = s;
+                        if (s > sigma0) {
+                            sigma0 = s;
+                            maxIndex = c;
+                        }
+                    }
                     
                     double sigma1 = 0.0;
                     for (int c = 0; c < numSingularValues; c++) {
@@ -210,34 +211,53 @@ public class HftRegimeDetection {
                     // استخراج نقطه نهایی ترند
                     pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
                     
-                    // محاسبه قطعی EVR از طریق انرژی ویژه (عدد بین 0.0 تا 1.0)
-                    evr = (sigma0 * sigma0) / sumSigmaSq;
+                    // محاسبه قطعی EVR و ضرب در 100 برای هماهنگی با گرافانا و دیتابیس
+                    evr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
                     
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
                     gapFactor = 1.0 / Math.max(1.0, gapRatio);
-                    
-                    // =======================================================
-                    // 🔥 فرمول جدید و قطعی واریانس پسماند (Eigen-Spectrum Residuals)
-                    // =======================================================
-                    // این فرمول به جای اینکه شیب ترند را به عنوان نویز بسنجد، دقیقاً 
-                    // انرژی باقی‌مانده از ماتریس SVD (که معرف خالصِ نویز است) را محاسبه می‌کند.
-                    double residualVarianceSq = sumSigmaSq - (sigma0 * sigma0);
-                    if (residualVarianceSq < 0) residualVarianceSq = 0;
-                    noiseStdDev = Math.sqrt(residualVarianceSq / (L * K));
+                }
+
+                // =======================================================
+                // 🔥 رفع قطعی Whipsaw بر اساس اصول مقاله (Rolling Residuals)
+                // =======================================================
+                double currentResidual = event.price - pc0;
+                residualHistory[residualHead] = currentResidual;
+                residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
+                if (residualHead == 0) residualFull = true;
+
+                double noiseStdDev = 0.0;
+                int activeResCount = residualFull ? RESIDUAL_WINDOW : residualHead;
+                
+                if (activeResCount > 1) {
+                    double resMean = 0;
+                    for (int i = 0; i < activeResCount; i++) resMean += residualHistory[i];
+                    resMean /= activeResCount;
+
+                    double resVar = 0;
+                    for (int i = 0; i < activeResCount; i++) {
+                        double diff = residualHistory[i] - resMean;
+                        resVar += diff * diff;
+                    }
+                    noiseStdDev = Math.sqrt(resVar / (activeResCount - 1));
+                } else if (activeResCount == 1) {
+                    noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
                 // ==========================================
                 // لایه فاصله داینامیک هوشمند
                 // ==========================================
+                // برگرداندن EVR به مقیاس 0 تا 1 فقط برای محاسبه ضریب
+                double evrFactor = Math.min(evr / 100.0, 1.0); 
                 double alpha = 4.0; 
                 double beta = 2.0;  
                 
-                double rawMultiplier = 1.0 + alpha * (1.0 - evr) + beta * gapFactor;
+                double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * gapFactor;
                 double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                // هموارسازی سنگین‌تر مرزها برای خنثی کردن اسپایک‌ها
+                
                 smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
                 event.pc0 = pc0;
@@ -336,7 +356,6 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://localhost:8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, "default", "");
                 
-                // 🌟 استفاده مجدد از کوئری 12 ستونه برای ذخیره سازی EVR در دیتابیس
                 String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully!");
