@@ -32,11 +32,7 @@ public class HftRegimeDetection {
         public double pc0;         
         public double evr;         
         public double bandUpper;   
-        public double bandLower;
-        
-        // 🌟 فیلدهای جدید برای استخراج در گرافانا
-        public double vress;
-        public double eigenGap;
+        public double bandLower;   
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -71,7 +67,7 @@ public class HftRegimeDetection {
         private double lastLogicalDistanceLine = 0.0;
         private double smoothedDistance = 0.0;
 
-        // متغیرهای جدید برای هموارسازی نمایی (EMA)
+        // 🌟 متغیرهای جدید برای هموارسازی نمایی (EMA)
         private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
         private double emaGapFactor = 0.0;
@@ -218,10 +214,10 @@ public class HftRegimeDetection {
                     
                     rawPc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
                     
-                    // محاسبه خام EVR 
+                    // محاسبه خام EVR (در HFT نوسان 40-60 درصد طبیعی است)
                     rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
                     
-                    // محاسبه Eigen-Gap 
+                    // محاسبه Eigen-Gap (فاصله قدرت ترند از دومین چرخه بزرگ)
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
                     rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
@@ -229,8 +225,8 @@ public class HftRegimeDetection {
                 // =======================================================
                 // 🌟 اعمال فیلتر هموارساز (EMA) روی ترند و شاخص‌ها
                 // =======================================================
-                double alphaPc0 = 0.15;      
-                double alphaMetrics = 0.05;  
+                double alphaPc0 = 0.15;      // هموارسازی خط زرد (خنثی کردن حالت پله‌ای)
+                double alphaMetrics = 0.05;  // هموارسازی شدیدتر روی EVR و Gap برای ثبات کامل
                 
                 if (emaPc0 == 0.0) {
                     emaPc0 = rawPc0;
@@ -284,10 +280,6 @@ public class HftRegimeDetection {
                 event.evr = emaEvr;
                 event.bandUpper = emaPc0 + smoothedDistance;
                 event.bandLower = emaPc0 - smoothedDistance;
-                
-                // مقداردهی برای دیتابیس
-                event.vress = noiseStdDev;
-                event.eigenGap = emaGapFactor;
 
                 double currentLineVal;
 
@@ -322,8 +314,8 @@ public class HftRegimeDetection {
                 // 🚀 ابزار دیباگ قدرتمند: چاپ محاسبات در ترمینال هر 500 تیک
                 // ===================================================================
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | PC0: %.2f | EVR: %.2f%% | Gap: %.2f | Vres: %.2f\n", 
-                                      sequence, event.price, event.pc0, event.evr, event.eigenGap, event.vress);
+                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | PC0: %.2f | EVR: %.2f%% | BandWidth: %.2f\n", 
+                                      sequence, event.price, event.pc0, event.evr, (event.bandUpper - event.bandLower));
                 }
                 
             } else {
@@ -333,8 +325,6 @@ public class HftRegimeDetection {
                 event.bandLower = event.price;
                 event.ssaTrend = event.price;
                 event.regime = currentMarketRegime;
-                event.vress = 0.0;
-                event.eigenGap = 0.0;
             }
 
             // --- محاسبه لیاپانوف ---
@@ -385,6 +375,7 @@ public class HftRegimeDetection {
 
         public ClickHouseBatchHandler() {
             try {
+                // 🌟 اصلاح هوشمند برای داکر: گرفتن آدرس، یوزر و پسورد از متغیرهای محیطی
                 String host = System.getenv("CLICKHOUSE_HOST");
                 if (host == null || host.trim().isEmpty()) {
                     host = "clickhouse"; 
@@ -397,14 +388,13 @@ public class HftRegimeDetection {
                 
                 String password = System.getenv("CLICKHOUSE_PASSWORD");
                 if (password == null) {
-                    password = ""; 
+                    password = ""; // رمز دیفالت (خالی)
                 }
                 
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                // 🌟 دیتابیس 14 ستونه شد
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully on host: " + host + " with user: " + user);
             } catch (SQLException e) {
@@ -429,8 +419,6 @@ public class HftRegimeDetection {
                 statement.setDouble(10, event.bandLower);
                 statement.setDouble(11, event.pc0);
                 statement.setDouble(12, event.evr);
-                statement.setDouble(13, event.vress);
-                statement.setDouble(14, event.eigenGap);
                 
                 statement.addBatch();
                 currentBatchSize++;
@@ -447,7 +435,7 @@ public class HftRegimeDetection {
                 currentBatchSize = 0;
             } catch (SQLException e) {
                 System.err.println("\n🔴 Failed to flush batch to ClickHouse: " + e.getMessage());
-                System.err.println("👉 دلیل: جدول دیتابیس آپدیت نشده است. حتماً ALTER TABLE را ران کنید.");
+                System.err.println("👉 دلیل: جدول دیتابیس با این 12 ستون هم‌خوانی ندارد. جدول را DROP کرده و دوباره بسازید.");
                 currentBatchSize = 0; 
             }
         }
@@ -455,14 +443,9 @@ public class HftRegimeDetection {
 
     public static class BinanceProducer extends WebSocketClient {
         private final RingBuffer<TickEvent> ringBuffer;
-        
         public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
-            super(serverUri); 
-            this.ringBuffer = ringBuffer;
-            // 🌟 غیرفعال کردن تایم‌اوت پینگ/پونگ برای جلوگیری از ارور 1006 بایننس
-            this.setConnectionLostTimeout(0); 
+            super(serverUri); this.ringBuffer = ringBuffer;
         }
-        
         @Override
         public void onOpen(ServerHandshake handshakedata) { 
             System.out.println("🟢 Connected to Binance High-Frequency Stream!"); 
@@ -473,6 +456,7 @@ public class HftRegimeDetection {
             try {
                 JsonObject json = JsonParser.parseString(message).getAsJsonObject();
                 
+                // 🌟 دیباگر هوشمند: اگر بایننس چیزی غیر از قیمت فرستاد چاپش کن!
                 if (!json.has("p")) {
                     System.out.println("\n⚠️ Unknown Message from Binance: " + message);
                     return; 
@@ -491,6 +475,7 @@ public class HftRegimeDetection {
                     ringBuffer.publish(sequence); 
                 }
             } catch (Throwable e) {
+                // 🌟 جلوگیری از خفگی خطاها: هر اروری رخ داد چاپش کن
                 System.err.println("\n🔴 Parsing Error: " + e.getMessage());
                 e.printStackTrace();
             }
@@ -498,21 +483,15 @@ public class HftRegimeDetection {
         
         @Override 
         public void onClose(int code, String reason, boolean remote) {
+            // 🌟 اگر بایننس اتصال را قطع کرد دلیل آن را چاپ کن
             System.err.printf("\n🔴 WebSocket Closed by %s! Reason: %s (Code: %d)\n", (remote ? "Binance" : "Local"), reason, code);
-            
-            // 🌟 سیستم اتصال مجدد خودکار (Auto-Reconnect) در صورت قطعی
-            System.out.println("🔄 Attempting to reconnect in 5 seconds...");
-            try {
-                Thread.sleep(5000); // 5 ثانیه صبر
-                this.reconnect();   // تلاش مجدد برای اتصال
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
         }
         
         @Override 
         public void onError(Exception ex) {
+            // 🌟 خطاهای شبکه را چاپ کن
             System.err.println("\n🔴 WebSocket Fatal Error: " + ex.getMessage());
+            ex.printStackTrace();
         }
     }
 
