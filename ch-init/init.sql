@@ -1,5 +1,6 @@
--- فایل init.sql
-CREATE TABLE IF NOT EXISTS default.hft_market_data (
+DROP TABLE IF EXISTS default.hft_market_data;
+
+CREATE TABLE default.hft_market_data (
     timestamp DateTime64(3),
     sequence UInt64,
     price Float64,
@@ -11,6 +12,8 @@ CREATE TABLE IF NOT EXISTS default.hft_market_data (
     band_upper Float64,
     band_lower Float64,
     pc0 Float64,
-    evr Float64
+    evr Float64,
+    vress Float64,        -- ستون جدید اضافه شد
+    eigen_gap Float64     -- ستون جدید اضافه شد
 ) ENGINE = MergeTree()
 ORDER BY (timestamp, sequence);
