@@ -67,6 +67,11 @@ public class HftRegimeDetection {
         private double lastLogicalDistanceLine = 0.0;
         private double smoothedDistance = 0.0;
 
+        // 🌟 متغیرهای جدید برای هموارسازی نمایی (EMA)
+        private double emaPc0 = 0.0;
+        private double emaEvr = 0.0;
+        private double emaGapFactor = 0.0;
+
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
                 int n = data.length;
@@ -174,12 +179,12 @@ public class HftRegimeDetection {
                     }
                 }
                 
-                double pc0, evr, gapFactor;
+                double rawPc0, rawEvr, rawGapFactor;
 
                 if (frobeniusSq < 1e-10) {
-                    pc0 = mean;
-                    evr = 100.0; 
-                    gapFactor = 0.0;
+                    rawPc0 = mean;
+                    rawEvr = 100.0; 
+                    rawGapFactor = 0.0;
                 } else {
                     SimpleSVD<SimpleMatrix> svd = X.svd();
                     SimpleMatrix U = svd.getU();
@@ -207,14 +212,34 @@ public class HftRegimeDetection {
                         }
                     }
                     
-                    pc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
-                    evr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
+                    rawPc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
                     
+                    // محاسبه خام EVR (در HFT نوسان 40-60 درصد طبیعی است)
+                    rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
+                    
+                    // محاسبه Eigen-Gap (فاصله قدرت ترند از دومین چرخه بزرگ)
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
-                    gapFactor = 1.0 / Math.max(1.0, gapRatio);
+                    rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
-                double currentResidual = event.price - pc0;
+                // =======================================================
+                // 🌟 اعمال فیلتر هموارساز (EMA) روی ترند و شاخص‌ها
+                // =======================================================
+                double alphaPc0 = 0.15;      // هموارسازی خط زرد (خنثی کردن حالت پله‌ای)
+                double alphaMetrics = 0.05;  // هموارسازی شدیدتر روی EVR و Gap برای ثبات کامل
+                
+                if (emaPc0 == 0.0) {
+                    emaPc0 = rawPc0;
+                    emaEvr = rawEvr;
+                    emaGapFactor = rawGapFactor;
+                } else {
+                    emaPc0 = alphaPc0 * rawPc0 + (1.0 - alphaPc0) * emaPc0;
+                    emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
+                    emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
+                }
+
+                // نویز بر اساس فاصله قیمت از ترند هموار شده (EMA) محاسبه می‌شود
+                double currentResidual = event.price - emaPc0;
                 residualHistory[residualHead] = currentResidual;
                 residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
                 if (residualHead == 0) residualFull = true;
@@ -237,11 +262,13 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                double evrFactor = Math.min(evr / 100.0, 1.0); 
+                // استفاده از مقادیر هموارشده (EMA) برای محاسبات فاصله
+                double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
                 double alpha = 4.0; 
                 double beta = 2.0;  
                 
-                double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * gapFactor;
+                // فرمول D(t): وقتی ترند قوی و پایدار است فاصله کم، وقتی رنج است فاصله زیاد می‌شود
+                double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
                 double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
@@ -249,17 +276,18 @@ public class HftRegimeDetection {
                 
                 smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
-                event.pc0 = pc0;
-                event.evr = evr;
-                event.bandUpper = pc0 + smoothedDistance;
-                event.bandLower = pc0 - smoothedDistance;
+                event.pc0 = emaPc0;
+                event.evr = emaEvr;
+                event.bandUpper = emaPc0 + smoothedDistance;
+                event.bandLower = emaPc0 - smoothedDistance;
 
                 double currentLineVal;
 
                 if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
                     
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < pc0) ? 
+                    // استفاده از emaPc0 به عنوان محور منطقی
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
                     if (event.price < currentLineVal) {
@@ -269,7 +297,7 @@ public class HftRegimeDetection {
                 } else { 
                     double proposedResistance = event.bandUpper;
                     
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > pc0) ? 
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
                     if (event.price > currentLineVal) {
@@ -419,12 +447,21 @@ public class HftRegimeDetection {
             super(serverUri); this.ringBuffer = ringBuffer;
         }
         @Override
-        public void onOpen(ServerHandshake handshakedata) { System.out.println("🟢 Connected to Binance High-Frequency Stream!"); }
+        public void onOpen(ServerHandshake handshakedata) { 
+            System.out.println("🟢 Connected to Binance High-Frequency Stream!"); 
+        }
+        
         @Override
         public void onMessage(String message) {
             try {
                 JsonObject json = JsonParser.parseString(message).getAsJsonObject();
-                if (!json.has("p")) return; 
+                
+                // 🌟 دیباگر هوشمند: اگر بایننس چیزی غیر از قیمت فرستاد چاپش کن!
+                if (!json.has("p")) {
+                    System.out.println("\n⚠️ Unknown Message from Binance: " + message);
+                    return; 
+                }
+                
                 System.out.print("."); System.out.flush();
                 
                 long sequence = ringBuffer.next();
@@ -437,10 +474,25 @@ public class HftRegimeDetection {
                 } finally {
                     ringBuffer.publish(sequence); 
                 }
-            } catch (Exception e) {}
+            } catch (Throwable e) {
+                // 🌟 جلوگیری از خفگی خطاها: هر اروری رخ داد چاپش کن
+                System.err.println("\n🔴 Parsing Error: " + e.getMessage());
+                e.printStackTrace();
+            }
         }
-        @Override public void onClose(int code, String reason, boolean remote) {}
-        @Override public void onError(Exception ex) {}
+        
+        @Override 
+        public void onClose(int code, String reason, boolean remote) {
+            // 🌟 اگر بایننس اتصال را قطع کرد دلیل آن را چاپ کن
+            System.err.printf("\n🔴 WebSocket Closed by %s! Reason: %s (Code: %d)\n", (remote ? "Binance" : "Local"), reason, code);
+        }
+        
+        @Override 
+        public void onError(Exception ex) {
+            // 🌟 خطاهای شبکه را چاپ کن
+            System.err.println("\n🔴 WebSocket Fatal Error: " + ex.getMessage());
+            ex.printStackTrace();
+        }
     }
 
     public static void main(String[] args) throws Exception {
