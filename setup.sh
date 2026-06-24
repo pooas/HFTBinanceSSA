@@ -13,7 +13,7 @@ fi
 
 echo "➡️ Cloning the repository (Feature Branch)..."
 # 🌟 اصلاح حیاتی: دانلود مستقیم شاخه‌ای که کدهای C++ در آن قرار دارد
-git clone -b feature/hmm-cpp-integration https://pooas:[YOUR_TOKEN]@github.com/pooas/HFTBinanceSSA.git
+git clone -b feature/hmm-cpp-integration https://pooas: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@github.com/pooas/HFTBinanceSSA.git
 
 cd HFTBinanceSSA
 
