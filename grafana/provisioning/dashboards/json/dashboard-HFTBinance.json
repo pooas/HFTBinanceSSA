@@ -4,19 +4,21 @@
   "metadata": {
     "name": "33a7676e-fdc3-40de-b98a-0c9c63ae6c84",
     "namespace": "default",
-    "uid": "oCUhrWtDHvuHx7iHsICpuEsFHz4hv2PakcXdOMpugCIX",
-    "resourceVersion": "1781958192139019",
-    "generation": 10,
-    "creationTimestamp": "2026-06-17T14:26:51Z",
+    "uid": "36ae9b1f-2c93-4c68-8a61-feab34c65409",
+    "resourceVersion": "1782293901826018",
+    "generation": 1,
+    "creationTimestamp": "2026-06-24T09:38:21Z",
     "labels": {
-      "grafana.app/deprecatedInternalID": "6"
+      "grafana.app/deprecatedInternalID": "2564523056377856"
     },
     "annotations": {
-      "grafana.app/createdBy": "user:celhqz7d2tdkwd",
-      "grafana.app/folder": "",
-      "grafana.app/saved-from-ui": "Grafana v13.0.2 (Homebrew)",
-      "grafana.app/updatedBy": "user:celhqz7d2tdkwd",
-      "grafana.app/updatedTimestamp": "2026-06-20T12:23:12Z"
+      "grafana.app/createdBy": "access-policy:service",
+      "grafana.app/managedBy": "classic-file-provisioning",
+      "grafana.app/managerId": "HFT Dashboards",
+      "grafana.app/sourceChecksum": "00b138105bed29c5c9d3ca436e5f977d",
+      "grafana.app/sourcePath": "/etc/grafana/provisioning/dashboards/json/dashboard-HFTBinance.json",
+      "grafana.app/sourceTimestamp": "1782293830000",
+      "grafana.app/folder": ""
     }
   },
   "spec": {
@@ -24,20 +26,20 @@
       {
         "kind": "AnnotationQuery",
         "spec": {
-          "query": {
-            "kind": "DataQuery",
-            "group": "grafana",
-            "version": "v0",
-            "datasource": {
-              "name": "-- Grafana --"
-            },
-            "spec": {}
-          },
+          "builtIn": true,
           "enable": true,
           "hide": true,
           "iconColor": "rgba(0, 211, 255, 1)",
           "name": "Annotations & Alerts",
-          "builtIn": true
+          "query": {
+            "datasource": {
+              "name": "-- Grafana --"
+            },
+            "group": "grafana",
+            "kind": "DataQuery",
+            "spec": {},
+            "version": "v0"
+          }
         }
       }
     ],
@@ -47,10 +49,6 @@
       "panel-1": {
         "kind": "Panel",
         "spec": {
-          "id": 1,
-          "title": "New panel",
-          "description": "",
-          "links": [],
           "data": {
             "kind": "QueryGroup",
             "spec": {
@@ -58,13 +56,13 @@
                 {
                   "kind": "PanelQuery",
                   "spec": {
+                    "hidden": false,
                     "query": {
-                      "kind": "DataQuery",
-                      "group": "grafana-clickhouse-datasource",
-                      "version": "v0",
                       "datasource": {
-                        "name": "efpeyyeztxhj4f"
+                        "name": "PDEE91DDB90597936"
                       },
+                      "group": "grafana-clickhouse-datasource",
+                      "kind": "DataQuery",
                       "spec": {
                         "editorType": "sql",
                         "format": 0,
@@ -81,54 +79,27 @@
                         "pluginVersion": "4.18.0",
                         "queryType": "timeseries",
                         "rawSql": "SELECT \n    timestamp AS time,\n    -- خط روند اصلی (زرد)\n    ssa_trend,\n    \n    -- قیمت وقتی بالاتر از ترند است (سبز)\n    CASE WHEN price >= ssa_trend THEN price ELSE null END AS price_up,\n    \n    -- قیمت وقتی پایین‌تر از ترند است (قرمز)\n    CASE WHEN price < ssa_trend THEN price ELSE null END AS price_down\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
-                      }
+                      },
+                      "version": "v0"
                     },
-                    "refId": "A",
-                    "hidden": false
+                    "refId": "A"
                   }
                 }
               ],
-              "transformations": [],
-              "queryOptions": {}
+              "queryOptions": {},
+              "transformations": []
             }
           },
+          "description": "",
+          "id": 1,
+          "links": [],
+          "title": "New panel",
           "vizConfig": {
-            "kind": "VizConfig",
             "group": "timeseries",
-            "version": "13.0.2",
+            "kind": "VizConfig",
             "spec": {
-              "options": {
-                "annotations": {
-                  "clustering": -1,
-                  "multiLane": false
-                },
-                "legend": {
-                  "calcs": [],
-                  "displayMode": "list",
-                  "placement": "bottom",
-                  "showLegend": true
-                },
-                "tooltip": {
-                  "hideZeros": false,
-                  "mode": "single",
-                  "sort": "none"
-                }
-              },
               "fieldConfig": {
                 "defaults": {
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": 0,
-                        "color": "green"
-                      },
-                      {
-                        "value": 80,
-                        "color": "red"
-                      }
-                    ]
-                  },
                   "color": {
                     "mode": "palette-classic"
                   },
@@ -165,14 +136,27 @@
                     "thresholdsStyle": {
                       "mode": "off"
                     }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
+                    ]
                   }
                 },
                 "overrides": [
                   {
                     "matcher": {
                       "id": "byName",
-                      "scope": "series",
-                      "options": "ssa_trend"
+                      "options": "ssa_trend",
+                      "scope": "series"
                     },
                     "properties": [
                       {
@@ -191,8 +175,8 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "scope": "series",
-                      "options": "price_up"
+                      "options": "price_up",
+                      "scope": "series"
                     },
                     "properties": [
                       {
@@ -211,8 +195,8 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "scope": "series",
-                      "options": "price_down"
+                      "options": "price_down",
+                      "scope": "series"
                     },
                     "properties": [
                       {
@@ -229,64 +213,7 @@
                     ]
                   }
                 ]
-              }
-            }
-          }
-        }
-      },
-      "panel-2": {
-        "kind": "Panel",
-        "spec": {
-          "id": 2,
-          "title": "New panel",
-          "description": "",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "grafana-clickhouse-datasource",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "efpeyyeztxhj4f"
-                      },
-                      "spec": {
-                        "editorType": "sql",
-                        "format": 1,
-                        "meta": {
-                          "builderOptions": {
-                            "columns": [],
-                            "database": "",
-                            "limit": 1000,
-                            "mode": "list",
-                            "queryType": "table",
-                            "table": ""
-                          }
-                        },
-                        "pluginVersion": "4.18.0",
-                        "queryType": "table",
-                        "rawSql": "SELECT \n    timestamp AS time,\n    lambda,\n    is_frozen\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {}
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "timeseries",
-            "version": "13.0.2",
-            "spec": {
+              },
               "options": {
                 "annotations": {
                   "clustering": -1,
@@ -303,22 +230,66 @@
                   "mode": "single",
                   "sort": "none"
                 }
-              },
+              }
+            },
+            "version": "13.0.2"
+          }
+        }
+      },
+      "panel-2": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "efpeyyeztxhj4f"
+                      },
+                      "group": "grafana-clickhouse-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorType": "sql",
+                        "format": 1,
+                        "meta": {
+                          "builderOptions": {
+                            "columns": [],
+                            "database": "",
+                            "limit": 1000,
+                            "mode": "list",
+                            "queryType": "table",
+                            "table": ""
+                          }
+                        },
+                        "pluginVersion": "4.18.0",
+                        "queryType": "table",
+                        "rawSql": "SELECT \n    timestamp AS time,\n    lambda,\n    is_frozen\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "",
+          "id": 2,
+          "links": [],
+          "title": "New panel",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
               "fieldConfig": {
                 "defaults": {
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": 0,
-                        "color": "green"
-                      },
-                      {
-                        "value": 80,
-                        "color": "red"
-                      }
-                    ]
-                  },
                   "color": {
                     "mode": "palette-classic"
                   },
@@ -355,67 +326,23 @@
                     "thresholdsStyle": {
                       "mode": "off"
                     }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
+                    ]
                   }
                 },
                 "overrides": []
-              }
-            }
-          }
-        }
-      },
-      "panel-3": {
-        "kind": "Panel",
-        "spec": {
-          "id": 3,
-          "title": "Equity Curve-HFT",
-          "description": "",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "grafana-clickhouse-datasource",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "efpeyyeztxhj4f"
-                      },
-                      "spec": {
-                        "editorType": "sql",
-                        "format": 1,
-                        "meta": {
-                          "builderOptions": {
-                            "columns": [],
-                            "database": "",
-                            "limit": 1000,
-                            "mode": "list",
-                            "queryType": "table",
-                            "table": ""
-                          }
-                        },
-                        "pluginVersion": "4.18.0",
-                        "queryType": "table",
-                        "rawSql": "SELECT \n    time,\n    -- سرمایه استراتژی: محاسبه سود مرکب پس از کسر کارمزدهای بایننس\n    1000 * exp(SUM(log(greatest(1 + strat_ret_net, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS strategy_equity,\n    \n    -- سرمایه هولد کردن (بدون کارمزد، فقط برای مقایسه)\n    1000 * exp(SUM(log(greatest(1 + mkt_ret_gross, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS buy_and_hold_equity\nFROM (\n    SELECT \n        time,\n        sequence,\n        mkt_ret_gross,\n        -- کسر کارمزد از سود ناخالص:\n        -- فرمول: بازدهی ناخالص منهای (تعداد تغییر پوزیشن * کارمزد تیکر بایننس 0.0004)\n        (strat_ret_gross - (abs(current_signal - coalesce(prev_signal, 0)) * 0.0004)) AS strat_ret_net\n    FROM (\n        SELECT \n            time,\n            sequence,\n            current_signal,\n            prev_signal,\n            -- بازدهی خالص خودِ بازار در این تیک\n            if(prev_price > 0, (price - prev_price) / prev_price, 0) AS mkt_ret_gross,\n            -- بازدهی ناخالص استراتژی (قبل از کسر کارمزد)\n            if(prev_price > 0, coalesce(prev_signal, 0) * ((price - prev_price) / prev_price), 0) AS strat_ret_gross\n        FROM (\n            SELECT \n                timestamp AS time,\n                sequence,\n                price,\n                -- سیگنال فعلی\n                multiIf(price >= ssa_trend, 1, -1) AS current_signal,\n                -- قیمت و سیگنال در تیک قبلی (Lag)\n                lagInFrame(price) OVER w AS prev_price,\n                lagInFrame(multiIf(price >= ssa_trend, 1, -1)) OVER w AS prev_signal\n            FROM default.hft_market_data\n            WHERE $__timeFilter(timestamp)\n            WINDOW w AS (ORDER BY timestamp ASC, sequence ASC)\n        )\n    )\n)\nORDER BY time ASC, sequence ASC"
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {}
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "timeseries",
-            "version": "13.0.2",
-            "spec": {
+              },
               "options": {
                 "annotations": {
                   "clustering": -1,
@@ -432,22 +359,66 @@
                   "mode": "single",
                   "sort": "none"
                 }
-              },
+              }
+            },
+            "version": "13.0.2"
+          }
+        }
+      },
+      "panel-3": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "PDEE91DDB90597936"
+                      },
+                      "group": "grafana-clickhouse-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorType": "sql",
+                        "format": 1,
+                        "meta": {
+                          "builderOptions": {
+                            "columns": [],
+                            "database": "",
+                            "limit": 1000,
+                            "mode": "list",
+                            "queryType": "table",
+                            "table": ""
+                          }
+                        },
+                        "pluginVersion": "4.18.0",
+                        "queryType": "table",
+                        "rawSql": "SELECT \n    time,\n    -- سرمایه استراتژی: محاسبه سود مرکب پس از کسر کارمزدهای بایننس\n    1000 * exp(SUM(log(greatest(1 + strat_ret_net, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS strategy_equity,\n    \n    -- سرمایه هولد کردن (بدون کارمزد، فقط برای مقایسه)\n    1000 * exp(SUM(log(greatest(1 + mkt_ret_gross, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS buy_and_hold_equity\nFROM (\n    SELECT \n        time,\n        sequence,\n        mkt_ret_gross,\n        -- کسر کارمزد از سود ناخالص:\n        -- فرمول: بازدهی ناخالص منهای (تعداد تغییر پوزیشن * کارمزد تیکر بایننس 0.0004)\n        (strat_ret_gross - (abs(current_signal - coalesce(prev_signal, 0)) * 0.0004)) AS strat_ret_net\n    FROM (\n        SELECT \n            time,\n            sequence,\n            current_signal,\n            prev_signal,\n            -- بازدهی خالص خودِ بازار در این تیک\n            if(prev_price > 0, (price - prev_price) / prev_price, 0) AS mkt_ret_gross,\n            -- بازدهی ناخالص استراتژی (قبل از کسر کارمزد)\n            if(prev_price > 0, coalesce(prev_signal, 0) * ((price - prev_price) / prev_price), 0) AS strat_ret_gross\n        FROM (\n            SELECT \n                timestamp AS time,\n                sequence,\n                price,\n                -- سیگنال فعلی\n                multiIf(price >= ssa_trend, 1, -1) AS current_signal,\n                -- قیمت و سیگنال در تیک قبلی (Lag)\n                lagInFrame(price) OVER w AS prev_price,\n                lagInFrame(multiIf(price >= ssa_trend, 1, -1)) OVER w AS prev_signal\n            FROM default.hft_market_data\n            WHERE $__timeFilter(timestamp)\n            WINDOW w AS (ORDER BY timestamp ASC, sequence ASC)\n        )\n    )\n)\nORDER BY time ASC, sequence ASC"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "",
+          "id": 3,
+          "links": [],
+          "title": "Equity Curve-HFT",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
               "fieldConfig": {
                 "defaults": {
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": 0,
-                        "color": "green"
-                      },
-                      {
-                        "value": 80,
-                        "color": "red"
-                      }
-                    ]
-                  },
                   "color": {
                     "mode": "palette-classic"
                   },
@@ -484,14 +455,27 @@
                     "thresholdsStyle": {
                       "mode": "off"
                     }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
+                    ]
                   }
                 },
                 "overrides": [
                   {
                     "matcher": {
                       "id": "byName",
-                      "scope": "series",
-                      "options": "strategy_equity"
+                      "options": "strategy_equity",
+                      "scope": "series"
                     },
                     "properties": [
                       {
@@ -510,8 +494,8 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "scope": "series",
-                      "options": "buy_and_hold_equity"
+                      "options": "buy_and_hold_equity",
+                      "scope": "series"
                     },
                     "properties": [
                       {
@@ -534,8 +518,284 @@
                     ]
                   }
                 ]
+              },
+              "options": {
+                "annotations": {
+                  "clustering": -1,
+                  "multiLane": false
+                },
+                "legend": {
+                  "calcs": [],
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "single",
+                  "sort": "none"
+                }
               }
+            },
+            "version": "13.0.2"
+          }
+        }
+      },
+      "panel-4": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "PDEE91DDB90597936"
+                      },
+                      "group": "grafana-clickhouse-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorType": "sql",
+                        "format": 1,
+                        "meta": {
+                          "builderOptions": {
+                            "columns": [],
+                            "database": "",
+                            "limit": 1000,
+                            "mode": "list",
+                            "queryType": "table",
+                            "table": ""
+                          }
+                        },
+                        "pluginVersion": "4.18.0",
+                        "queryType": "table",
+                        "rawSql": "SELECT \n    toStartOfInterval(timestamp, INTERVAL 1 second) AS time,\n    avg(vress) AS noise_volatility\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp) AND vress > 0\nGROUP BY time\nORDER BY time ASC"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
             }
+          },
+          "description": "",
+          "id": 4,
+          "links": [],
+          "title": "Vress Analyis",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "barWidthFactor": 0.6,
+                    "drawStyle": "line",
+                    "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "linear",
+                    "lineWidth": 1,
+                    "pointSize": 5,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "auto",
+                    "showValues": false,
+                    "spanNulls": false,
+                    "stacking": {
+                      "group": "A",
+                      "mode": "none"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              },
+              "options": {
+                "annotations": {
+                  "clustering": -1,
+                  "multiLane": false
+                },
+                "legend": {
+                  "calcs": [],
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "single",
+                  "sort": "none"
+                }
+              }
+            },
+            "version": "13.0.2"
+          }
+        }
+      },
+      "panel-5": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "PDEE91DDB90597936"
+                      },
+                      "group": "grafana-clickhouse-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorType": "sql",
+                        "format": 1,
+                        "meta": {
+                          "builderOptions": {
+                            "columns": [],
+                            "database": "",
+                            "limit": 1000,
+                            "mode": "list",
+                            "queryType": "table",
+                            "table": ""
+                          }
+                        },
+                        "pluginVersion": "4.18.0",
+                        "queryType": "table",
+                        "rawSql": "SELECT \n    toStartOfInterval(timestamp, INTERVAL 1 second) AS time,\n    avg(eigen_gap) AS trend_purity_gap\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp) AND eigen_gap > 0\nGROUP BY time\nORDER BY time ASC"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "near the 1 -> Pure tren\nnear 0 -> regim change and sidewave",
+          "id": 5,
+          "links": [],
+          "title": "Eigen-Gap",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "barWidthFactor": 0.6,
+                    "drawStyle": "line",
+                    "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "linear",
+                    "lineWidth": 1,
+                    "pointSize": 5,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "auto",
+                    "showValues": false,
+                    "spanNulls": false,
+                    "stacking": {
+                      "group": "A",
+                      "mode": "none"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              },
+              "options": {
+                "annotations": {
+                  "clustering": -1,
+                  "multiLane": false
+                },
+                "legend": {
+                  "calcs": [],
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "single",
+                  "sort": "none"
+                }
+              }
+            },
+            "version": "13.0.2"
           }
         }
       }
@@ -547,40 +807,66 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-4"
+              },
+              "height": 8,
+              "width": 12,
               "x": 0,
-              "y": 0,
-              "width": 24,
-              "height": 11,
+              "y": 0
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-5"
+              },
+              "height": 8,
+              "width": 12,
+              "x": 12,
+              "y": 0
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-1"
-              }
+              },
+              "height": 11,
+              "width": 24,
+              "x": 0,
+              "y": 8
             }
           },
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 0,
-              "y": 11,
-              "width": 24,
-              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-3"
-              }
+              },
+              "height": 8,
+              "width": 24,
+              "x": 0,
+              "y": 19
             }
           },
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 0,
-              "y": 19,
-              "width": 24,
-              "height": 11,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-2"
-              }
+              },
+              "height": 11,
+              "width": 24,
+              "x": 0,
+              "y": 27
             }
           }
         ]
@@ -591,9 +877,6 @@
     "preload": false,
     "tags": [],
     "timeSettings": {
-      "timezone": "browser",
-      "from": "now-6h",
-      "to": "now",
       "autoRefresh": "5s",
       "autoRefreshIntervals": [
         "5s",
@@ -607,8 +890,11 @@
         "2h",
         "1d"
       ],
+      "fiscalYearStartMonth": 0,
+      "from": "now-6h",
       "hideTimepicker": false,
-      "fiscalYearStartMonth": 0
+      "timezone": "browser",
+      "to": "now"
     },
     "title": "HFT-TickData",
     "variables": []
