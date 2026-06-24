@@ -13,7 +13,8 @@ CREATE TABLE default.hft_market_data (
     band_lower Float64,
     pc0 Float64,
     evr Float64,
-    vress Float64,        -- ستون جدید اضافه شد
-    eigen_gap Float64     -- ستون جدید اضافه شد
+    vress Float64,        -- سنجش نویز باقی‌مانده
+    eigen_gap Float64,    -- خلوص ترند
+    hmm_regime Int8       -- رژیم محاسبه شده توسط C++
 ) ENGINE = MergeTree()
 ORDER BY (timestamp, sequence);

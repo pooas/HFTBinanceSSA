@@ -42,6 +42,17 @@ services:
     networks:
       - hft-net
 
+  # 🌟 سرویس جدید C++ (مغز متفکر HMM)
+  cpp-hmm:
+    build:
+      context: ./Hidden-Markov-Model-MKL
+      dockerfile: Dockerfile
+    container_name: hft_cpp_hmm
+    environment:
+      - ZMQ_PORT=5555  # پورتی که از طریق آن رژیم را به جاوا می‌فرستد
+    networks:
+      - hft-net
+
   java-app:
     build:
       context: ./java-app
@@ -51,9 +62,14 @@ services:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=hft123
+      # 🌟 متغیرهای جدید برای ارتباط جاوا با سوکت C++
+      - ZMQ_HOST=cpp-hmm
+      - ZMQ_PORT=5555
     depends_on:
       clickhouse:
         condition: service_healthy
+      cpp-hmm:
+        condition: service_started
     networks:
       - hft-net
 
