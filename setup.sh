@@ -11,12 +11,12 @@ if [ -d "HFTBinanceSSA" ]; then
   sudo rm -rf HFTBinanceSSA
 fi
 
-echo "➡️ Cloning the repository..."
-git clone https://pooas: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@github.com/pooas/HFTBinanceSSA.git
+echo "➡️ Cloning the repository (Feature Branch)..."
+# 🌟 اصلاح حیاتی: دانلود مستقیم شاخه‌ای که کدهای C++ در آن قرار دارد
+git clone -b feature/hmm-cpp-integration https://pooas:[YOUR_TOKEN]@github.com/pooas/HFTBinanceSSA.git
 
 cd HFTBinanceSSA
 
-git pull
 # ==========================================
 # بخش جدید: نصب آفلاین و مستقیم پلاگین کلیک‌هاوس
 # ==========================================
@@ -24,7 +24,7 @@ echo "➡️ Setting up ClickHouse plugin directly (bypassing Git)..."
 mkdir -p grafana-plugins
 cd grafana-plugins
 
-# پاک کردن نسخه احتمالی قبلی که با گیت آمده است
+# پاک کردن نسخه احتمالی قبلی
 sudo rm -rf grafana-clickhouse-datasource
 
 # نصب پیش‌نیازهای دانلود
@@ -68,9 +68,7 @@ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin d
 sudo systemctl enable docker
 sudo systemctl start docker
 
-
-
 echo "➡️ Running docker compose..."
 sudo docker compose up -d --build
 
-echo "✅ Deployment completed successfully! Grafana and ClickHouse are ready."
+echo "✅ Deployment completed successfully! Grafana, ClickHouse, Java, and C++ HMM are ready."
