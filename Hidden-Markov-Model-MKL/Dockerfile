@@ -1,30 +1,34 @@
-# استفاده از ایمیج رسمی اینتل که شامل ابزارهای OneAPI و MKL است
-FROM intel/oneapi-basekit:devel-ubuntu22.04
+# استفاده از اوبونتو ۲۲.۰۴ به عنوان پایه
+FROM ubuntu:22.04
 
-# جلوگیری از توقف نصب در مراحل تعاملی اوبونتو
+# جلوگیری از درخواست‌های تعاملی در زمان نصب
 ENV DEBIAN_FRONTEND=noninteractive
 
-# نصب پیش‌نیازهای حیاتی: CMake, ZeroMQ و OpenSSL
-# نصب پیش‌نیازهای حیاتی و شبکه‌ای
+# نصب ابزارهای پایه و پیش‌نیازهای اینتل
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
-    libzmq3-dev \
-    libssl-dev \
-    libboost-all-dev \
-    libwebsocketpp-dev \
-    nlohmann-json3-dev \
+    wget \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
-# تعیین پوشه کاری داخل کانتینر
+
+# افزودن مخزن رسمی اینتل برای MKL
+RUN wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB && \
+    apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB && \
+    echo "deb https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
+    apt-get update && \
+    apt-get install -y intel-oneapi-mkl-devel-2024.0
+
+# تنظیم متغیرهای محیطی برای MKL
+ENV LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:$LD_LIBRARY_PATH
+ENV MKLROOT=/opt/intel/oneapi/mkl/latest
+
 WORKDIR /app
+COPY . .
 
-# کپی کردن تمام سورس‌کدهای C++ به داخل کانتینر
-COPY . /app/
-
-# ساخت پوشه build، اجرای CMake و کامپایل کدها با استفاده از تمام هسته‌های پردازشی
-RUN mkdir -p build && cd build && \
+# بیلد پروژه
+RUN mkdir build && cd build && \
     cmake .. && \
-    make -j$(nproc)
+    make
 
-# اجرای فایل کامپایل‌شده نهایی
 CMD ["./build/hmm_engine"]
