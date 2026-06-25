@@ -25,6 +25,9 @@
 #include <mkl_vsl.h>
 #include <omp.h>
 
+#include <xmmintrin.h>
+#include <pmmintrin.h>
+
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -44,9 +47,10 @@
 #define EEMD_OMP_SIMD_REDUCTION(op, var) __pragma(omp simd reduction(op : var))
 #define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2) __pragma(omp simd reduction(op : v1, v2))
 #elif defined(__GNUC__) || defined(__clang__) || defined(__INTEL_LLVM_COMPILER)
-#define EEMD_OMP_SIMD _Pragma("omp simd")
-#define EEMD_OMP_SIMD_REDUCTION(op, var) _Pragma("omp simd reduction(" #op ":" #var ")")
-#define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2) _Pragma("omp simd reduction(" #op ":" #v1 "," #v2 ")")
+#define DO_PRAGMA(x) _Pragma (#x)
+#define EEMD_OMP_SIMD DO_PRAGMA(omp simd)
+#define EEMD_OMP_SIMD_REDUCTION(op, var) DO_PRAGMA(omp simd reduction(op : var))
+#define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2) DO_PRAGMA(omp simd reduction(op : v1, v2))
 #else
 #define EEMD_OMP_SIMD
 #define EEMD_OMP_SIMD_REDUCTION(op, var)
