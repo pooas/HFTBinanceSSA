@@ -10,7 +10,6 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.ejml.simple.SimpleMatrix;
 import org.ejml.simple.SimpleSVD;
-// 🌟 اضافه شدن ایمپورت‌های ZeroMQ
 import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
@@ -23,7 +22,6 @@ import java.sql.SQLException;
 
 public class HftRegimeDetection {
     
-    // 🌟 متغیرهای گلوبال برای نگهداری مقادیر بیزی لایو از سمت C++
     public static volatile int currentHmmRegime = 0; 
     public static volatile double currentProbTrend = 0.0;  
     public static volatile double currentProbCrisis = 0.0; 
@@ -38,7 +36,6 @@ public class HftRegimeDetection {
         public boolean isFrozen;
         public int regime;
         
-        // 🌟 فیلدهای HMM
         public int hmmRegime;
         public double hmmProbTrend;   
         public double hmmProbCrisis;  
@@ -86,6 +83,11 @@ public class HftRegimeDetection {
         private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
         private double emaGapFactor = 0.0;
+
+        // 🌟 متغیرهای جدید برای هموارسازی احتمالات بیزی
+        private double emaProbTrend = 0.0;
+        private double emaProbCrisis = 0.0;
+        private boolean probInitialized = false;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -168,6 +170,17 @@ public class HftRegimeDetection {
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
             priceHistory[head] = event.price;
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
+            
+            // 🌟 1. اعمال فیلتر هموارساز (EMA) روی احتمالات ZMQ برای تک‌تک تیک‌ها
+            if (!probInitialized) {
+                emaProbTrend = currentProbTrend;
+                emaProbCrisis = currentProbCrisis;
+                probInitialized = true;
+            } else {
+                // آلفا 0.005 باعث تبدیل پرش‌های باینری C++ به امواج نرم تنفسی در گرافانا می‌شود
+                emaProbTrend = 0.005 * currentProbTrend + 0.995 * emaProbTrend;
+                emaProbCrisis = 0.005 * currentProbCrisis + 0.995 * emaProbCrisis;
+            }
             
             int L = Math.max(4, (int) Math.round(domCycle / 2.0));
             int N_ssa = L * 2;
@@ -314,10 +327,10 @@ public class HftRegimeDetection {
                 event.ssaTrend = currentLineVal;
                 event.regime = currentMarketRegime;
                 
-                // 🌟 تزریق مقادیر لایو HMM به ایونت دیتابیس
+                // 🌟 تزریق مقادیر لایو و هموارشده‌ی HMM
                 event.hmmRegime = currentHmmRegime;
-                event.hmmProbTrend = currentProbTrend;
-                event.hmmProbCrisis = currentProbCrisis;
+                event.hmmProbTrend = emaProbTrend;
+                event.hmmProbCrisis = emaProbCrisis;
                 
                 if (sequence % 500 == 0) {
                     System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | PC0: %.2f | EVR: %.2f%% | Gap: %.2f | Vres: %.2f | TrendProb: %.1f%%\n", 
@@ -336,8 +349,8 @@ public class HftRegimeDetection {
                 
                 // 🌟 تزریق در زمان Warmup
                 event.hmmRegime = currentHmmRegime;
-                event.hmmProbTrend = currentProbTrend;
-                event.hmmProbCrisis = currentProbCrisis;
+                event.hmmProbTrend = emaProbTrend;
+                event.hmmProbCrisis = emaProbCrisis;
             }
 
             ssaTrendBuffer[ssaHead] = event.ssaTrend;
@@ -405,7 +418,6 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                // 🌟 دیتابیس دقیقاً 17 ستونه شد (ستون‌های بیزی اضافه شدند)
                 String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully on host: " + host + " with user: " + user);
@@ -434,7 +446,6 @@ public class HftRegimeDetection {
                 statement.setDouble(13, event.vress);
                 statement.setDouble(14, event.eigenGap);
                 
-                // 🌟 مقادیر HMM به استیتمنت اضافه شدند
                 statement.setInt(15, event.hmmRegime);
                 statement.setDouble(16, event.hmmProbTrend);
                 statement.setDouble(17, event.hmmProbCrisis);
@@ -454,7 +465,6 @@ public class HftRegimeDetection {
                 currentBatchSize = 0;
             } catch (SQLException e) {
                 System.err.println("\n🔴 Failed to flush batch to ClickHouse: " + e.getMessage());
-                System.err.println("👉 دلیل: جدول دیتابیس آپدیت نشده است. حتماً ALTER TABLE را ران کنید.");
                 currentBatchSize = 0; 
             }
         }
@@ -480,7 +490,6 @@ public class HftRegimeDetection {
                 JsonObject json = JsonParser.parseString(message).getAsJsonObject();
                 
                 if (!json.has("p")) {
-                    System.out.println("\n⚠️ Unknown Message from Binance: " + message);
                     return; 
                 }
                 
@@ -498,7 +507,6 @@ public class HftRegimeDetection {
                 }
             } catch (Throwable e) {
                 System.err.println("\n🔴 Parsing Error: " + e.getMessage());
-                e.printStackTrace();
             }
         }
         
@@ -540,20 +548,30 @@ public class HftRegimeDetection {
                 System.out.println("🔗 ZeroMQ Subscriber listening on " + address);
                 
                 while (!Thread.currentThread().isInterrupted()) {
-                    String topic = subscriber.recvStr();
-                    String contents = subscriber.recvStr();
-                    if (contents != null) {
-                        // فرمت: Regime,Prob_Calm,Prob_Trend,Prob_Crisis
-                        String[] parts = contents.trim().split(",");
-                        if (parts.length == 4) {
-                            currentHmmRegime = Integer.parseInt(parts[0]);
-                            currentProbTrend = Double.parseDouble(parts[2]);
-                            currentProbCrisis = Double.parseDouble(parts[3]);
+                    String contents = null;
+                    try {
+                        String topic = subscriber.recvStr();
+                        contents = subscriber.recvStr();
+                        if (contents != null) {
+                            String[] parts = contents.trim().split(",");
+                            if (parts.length == 4) {
+                                currentHmmRegime = Integer.parseInt(parts[0]);
+                                currentProbTrend = Double.parseDouble(parts[2]);
+                                currentProbCrisis = Double.parseDouble(parts[3]);
+                            } 
+                            // 🌟 سیستم ضد-کِرَش برای مشکل Locale در لینوکس (کاما به جای نقطه)
+                            else if (parts.length == 7) {
+                                currentHmmRegime = Integer.parseInt(parts[0]);
+                                currentProbTrend = Double.parseDouble(parts[3] + "." + parts[4]);
+                                currentProbCrisis = Double.parseDouble(parts[5] + "." + parts[6]);
+                            }
                         }
+                    } catch (Exception ex) {
+                        System.err.println("⚠️ ZMQ Parsing Error on [" + contents + "]: " + ex.getMessage());
                     }
                 }
             } catch (Exception e) {
-                System.err.println("⚠️ ZeroMQ Listener Error: " + e.getMessage());
+                System.err.println("⚠️ ZeroMQ Listener Fatal Error: " + e.getMessage());
             }
         });
         zmqThread.setDaemon(true);
