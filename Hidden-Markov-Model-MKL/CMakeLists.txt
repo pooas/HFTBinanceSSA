@@ -193,7 +193,6 @@ target_link_libraries(hmm_engine
     zmq
     ssl
     crypto
-    boost_system
 )
 # ============================================================================
 # Installation
