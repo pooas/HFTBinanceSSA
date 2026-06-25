@@ -4,7 +4,8 @@ FROM ubuntu:22.04
 # جلوگیری از درخواست‌های تعاملی در زمان نصب
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 🌟 نصب ابزارهای پایه، پیش‌نیازهای اینتل و کتابخانه‌های شبکه (ZMQ, WebSocket, JSON, Boost)
+# 🌟 نصب ابزارهای پایه، پیش‌نیازهای اینتل و کتابخانه‌های شبکه
+# توجه: libboost-all-dev حذف شد و libasio-dev (نسخه مستقل و سبک) جایگزین شد
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -12,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     libzmq3-dev \
     libssl-dev \
-    libboost-all-dev \
+    libasio-dev \
     libwebsocketpp-dev \
     nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
