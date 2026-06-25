@@ -13,10 +13,12 @@ CREATE TABLE default.hft_market_data (
     band_lower Float64,
     pc0 Float64,
     evr Float64,
-    vress Float64,        -- سنجش نویز باقی‌مانده
-    eigen_gap Float64,    -- خلوص ترند
-    hmm_regime Int8,      -- رژیم محاسبه شده توسط C++
-    hmm_prob_trend Float64,  -- احتمال بیزی ترند
-    hmm_prob_crisis Float64  -- احتمال بیزی بحران
+    vress Float64,
+    eigen_gap Float64,
+    hmm_regime Int8,
+    hmm_prob_trend Float64,
+    hmm_prob_crisis Float64
 ) ENGINE = MergeTree()
-ORDER BY (timestamp, sequence);
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (timestamp, sequence)
+SETTINGS index_granularity = 8192;
