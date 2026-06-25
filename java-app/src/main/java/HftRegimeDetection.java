@@ -10,6 +10,10 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.ejml.simple.SimpleMatrix;
 import org.ejml.simple.SimpleSVD;
+// 🌟 اضافه شدن ایمپورت‌های ZeroMQ
+import org.zeromq.SocketType;
+import org.zeromq.ZContext;
+import org.zeromq.ZMQ;
 
 import java.net.URI;
 import java.sql.Connection;
@@ -18,7 +22,12 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 
 public class HftRegimeDetection {
-
+    
+    // 🌟 متغیرهای گلوبال برای نگهداری مقادیر بیزی لایو از سمت C++
+    public static volatile int currentHmmRegime = 0; 
+    public static volatile double currentProbTrend = 0.0;  
+    public static volatile double currentProbCrisis = 0.0; 
+    
     public static class TickEvent {
         public double price;
         public double volume;
@@ -29,12 +38,16 @@ public class HftRegimeDetection {
         public boolean isFrozen;
         public int regime;
         
+        // 🌟 فیلدهای HMM
+        public int hmmRegime;
+        public double hmmProbTrend;   
+        public double hmmProbCrisis;  
+        
         public double pc0;         
         public double evr;         
         public double bandUpper;   
         public double bandLower;
         
-        // 🌟 فیلدهای جدید برای استخراج در گرافانا
         public double vress;
         public double eigenGap;
     }
@@ -53,7 +66,6 @@ public class HftRegimeDetection {
         private int ssaHead = 0;
         private boolean ssaBufferFull = false;
         
-        // حافظه متحرک برای سنجش نویز واقعی بازار
         private final int RESIDUAL_WINDOW = 100;
         private final double[] residualHistory = new double[RESIDUAL_WINDOW];
         private int residualHead = 0;
@@ -71,7 +83,6 @@ public class HftRegimeDetection {
         private double lastLogicalDistanceLine = 0.0;
         private double smoothedDistance = 0.0;
 
-        // 🌟 متغیرهای جدید برای هموارسازی نمایی (EMA)
         private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
         private double emaGapFactor = 0.0;
@@ -168,7 +179,6 @@ public class HftRegimeDetection {
                     data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                 }
                 
-                // Mean-Centering
                 double mean = 0.0;
                 for (int i = 0; i < N_ssa; i++) mean += data[i];
                 mean /= N_ssa;
@@ -217,20 +227,13 @@ public class HftRegimeDetection {
                     }
                     
                     rawPc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
-                    
-                    // محاسبه خام EVR (در HFT نوسان 40-60 درصد طبیعی است)
                     rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
-                    
-                    // محاسبه Eigen-Gap (فاصله قدرت ترند از دومین چرخه بزرگ)
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
                     rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
-                // =======================================================
-                // 🌟 اعمال فیلتر هموارساز (EMA) روی ترند و شاخص‌ها
-                // =======================================================
-                double alphaPc0 = 0.15;      // هموارسازی خط زرد (خنثی کردن حالت پله‌ای)
-                double alphaMetrics = 0.05;  // هموارسازی شدیدتر روی EVR و Gap برای ثبات کامل
+                double alphaPc0 = 0.15;      
+                double alphaMetrics = 0.05;  
                 
                 if (emaPc0 == 0.0) {
                     emaPc0 = rawPc0;
@@ -242,7 +245,6 @@ public class HftRegimeDetection {
                     emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
                 }
 
-                // نویز بر اساس فاصله قیمت از ترند هموار شده (EMA) محاسبه می‌شود
                 double currentResidual = event.price - emaPc0;
                 residualHistory[residualHead] = currentResidual;
                 residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
@@ -266,12 +268,10 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                // استفاده از مقادیر هموارشده (EMA) برای محاسبات فاصله
                 double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
                 double alpha = 4.0; 
                 double beta = 2.0;  
                 
-                // فرمول D(t): وقتی ترند قوی و پایدار است فاصله کم، وقتی رنج است فاصله زیاد می‌شود
                 double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
                 double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
 
@@ -285,7 +285,6 @@ public class HftRegimeDetection {
                 event.bandUpper = emaPc0 + smoothedDistance;
                 event.bandLower = emaPc0 - smoothedDistance;
                 
-                // مقداردهی برای دیتابیس
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
@@ -293,8 +292,6 @@ public class HftRegimeDetection {
 
                 if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
-                    
-                    // استفاده از emaPc0 به عنوان محور منطقی
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
@@ -304,7 +301,6 @@ public class HftRegimeDetection {
                     }
                 } else { 
                     double proposedResistance = event.bandUpper;
-                    
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
@@ -318,12 +314,14 @@ public class HftRegimeDetection {
                 event.ssaTrend = currentLineVal;
                 event.regime = currentMarketRegime;
                 
-                // ===================================================================
-                // 🚀 ابزار دیباگ قدرتمند: چاپ محاسبات در ترمینال هر 500 تیک
-                // ===================================================================
+                // 🌟 تزریق مقادیر لایو HMM به ایونت دیتابیس
+                event.hmmRegime = currentHmmRegime;
+                event.hmmProbTrend = currentProbTrend;
+                event.hmmProbCrisis = currentProbCrisis;
+                
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | PC0: %.2f | EVR: %.2f%% | Gap: %.2f | Vres: %.2f\n", 
-                                      sequence, event.price, event.pc0, event.evr, event.eigenGap, event.vress);
+                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | PC0: %.2f | EVR: %.2f%% | Gap: %.2f | Vres: %.2f | TrendProb: %.1f%%\n", 
+                                      sequence, event.price, event.pc0, event.evr, event.eigenGap, event.vress, (event.hmmProbTrend * 100.0));
                 }
                 
             } else {
@@ -335,9 +333,13 @@ public class HftRegimeDetection {
                 event.regime = currentMarketRegime;
                 event.vress = 0.0;
                 event.eigenGap = 0.0;
+                
+                // 🌟 تزریق در زمان Warmup
+                event.hmmRegime = currentHmmRegime;
+                event.hmmProbTrend = currentProbTrend;
+                event.hmmProbCrisis = currentProbCrisis;
             }
 
-            // --- محاسبه لیاپانوف ---
             ssaTrendBuffer[ssaHead] = event.ssaTrend;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
@@ -403,8 +405,8 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                // 🌟 دیتابیس 14 ستونه شد
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                // 🌟 دیتابیس دقیقاً 17 ستونه شد (ستون‌های بیزی اضافه شدند)
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
                 System.out.println("✅ ClickHouse Connection Established Successfully on host: " + host + " with user: " + user);
             } catch (SQLException e) {
@@ -431,6 +433,11 @@ public class HftRegimeDetection {
                 statement.setDouble(12, event.evr);
                 statement.setDouble(13, event.vress);
                 statement.setDouble(14, event.eigenGap);
+                
+                // 🌟 مقادیر HMM به استیتمنت اضافه شدند
+                statement.setInt(15, event.hmmRegime);
+                statement.setDouble(16, event.hmmProbTrend);
+                statement.setDouble(17, event.hmmProbCrisis);
                 
                 statement.addBatch();
                 currentBatchSize++;
@@ -459,7 +466,6 @@ public class HftRegimeDetection {
         public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
             super(serverUri); 
             this.ringBuffer = ringBuffer;
-            // 🌟 غیرفعال کردن تایم‌اوت پینگ/پونگ برای جلوگیری از ارور 1006 بایننس
             this.setConnectionLostTimeout(0); 
         }
         
@@ -499,12 +505,10 @@ public class HftRegimeDetection {
         @Override 
         public void onClose(int code, String reason, boolean remote) {
             System.err.printf("\n🔴 WebSocket Closed by %s! Reason: %s (Code: %d)\n", (remote ? "Binance" : "Local"), reason, code);
-            
-            // 🌟 سیستم اتصال مجدد خودکار (Auto-Reconnect) در صورت قطعی
             System.out.println("🔄 Attempting to reconnect in 5 seconds...");
             try {
-                Thread.sleep(5000); // 5 ثانیه صبر
-                this.reconnect();   // تلاش مجدد برای اتصال
+                Thread.sleep(5000); 
+                this.reconnect();   
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
@@ -517,6 +521,45 @@ public class HftRegimeDetection {
     }
 
     public static void main(String[] args) throws Exception {
+        
+        // ==============================================================
+        // 🌟 استارت کردن شنونده ZeroMQ در یک Thread جداگانه
+        // ==============================================================
+        Thread zmqThread = new Thread(() -> {
+            try (ZContext context = new ZContext()) {
+                ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
+                String zmqHost = System.getenv("ZMQ_HOST");
+                if (zmqHost == null || zmqHost.trim().isEmpty()) zmqHost = "localhost";
+                String zmqPort = System.getenv("ZMQ_PORT");
+                if (zmqPort == null || zmqPort.trim().isEmpty()) zmqPort = "5555";
+                
+                String address = "tcp://" + zmqHost + ":" + zmqPort;
+                subscriber.connect(address);
+                subscriber.subscribe("REGIME".getBytes(ZMQ.CHARSET));
+                
+                System.out.println("🔗 ZeroMQ Subscriber listening on " + address);
+                
+                while (!Thread.currentThread().isInterrupted()) {
+                    String topic = subscriber.recvStr();
+                    String contents = subscriber.recvStr();
+                    if (contents != null) {
+                        // فرمت: Regime,Prob_Calm,Prob_Trend,Prob_Crisis
+                        String[] parts = contents.trim().split(",");
+                        if (parts.length == 4) {
+                            currentHmmRegime = Integer.parseInt(parts[0]);
+                            currentProbTrend = Double.parseDouble(parts[2]);
+                            currentProbCrisis = Double.parseDouble(parts[3]);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("⚠️ ZeroMQ Listener Error: " + e.getMessage());
+            }
+        });
+        zmqThread.setDaemon(true);
+        zmqThread.start();
+        // ==============================================================
+
         Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 1024, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new BusySpinWaitStrategy());
         disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
         RingBuffer<TickEvent> ringBuffer = disruptor.start();

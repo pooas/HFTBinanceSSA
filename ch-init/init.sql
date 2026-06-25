@@ -14,7 +14,9 @@ CREATE TABLE default.hft_market_data (
     pc0 Float64,
     evr Float64,
     vress Float64,        -- سنجش نویز باقی‌مانده
-    eigen_gap Float64,    -- خلوص ترند
+    eigen_gap Float64,   -- خلوص ترند
+    hmm_prob_trend Float64,
+    hmm_prob_crisis Float64,   
     hmm_regime Int8       -- رژیم محاسبه شده توسط C++
 ) ENGINE = MergeTree()
 ORDER BY (timestamp, sequence);
