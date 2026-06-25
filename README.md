@@ -7,6 +7,10 @@ token:
 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
 
 
+git fetch --all
+git checkout feature/hmm-cpp-integration
+git pull origin feature/hmm-cpp-integration
+
 
 To Do :
 
