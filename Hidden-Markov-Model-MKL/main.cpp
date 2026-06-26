@@ -217,8 +217,10 @@
  
                  tick_count++;
                  if (tick_count % 10 == 0) {
+                     // 🌟 نمایش تگ های آشنای PRIOR/LIVE به همراه درصد بیز برای تایید آپدیت شدن روی سرور
+                     std::string status_tag = (rv_history.size() < 300) ? "(PRIOR)" : "(LIVE)";
                      std::cout << "[LIVE] Sec: " << current_sec << " | LogRV: " << log_rv 
-                               << " | Regime: " << active_regime 
+                               << " | Regime: " << active_regime << " " << status_tag
                                << " | TrendProb: " << (prob_state[1].load() * 100.0) << "%" << std::endl;
                  }
  
