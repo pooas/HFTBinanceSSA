@@ -1,9 +1,6 @@
 /**
  * HFT Live Engine: Binance WSS -> 1s Realized Variance -> HMM -> ZeroMQ
- * * Architecture:
- * - Thread 1: WebSocket Client (Receives ticks, computes 1s RV, Decodes Regime)
- * - Thread 2: HMM Trainer (Runs Baum-Welch EM in background when enough data is gathered)
- * - ZeroMQ: Publishes "REGIME <0|1|2>" to Port 5555 for Java execution.
+ * Architecture strictly follows "HMM-driven Volatility-Regime Framework"
  */
 
  #include <iostream>
@@ -15,19 +12,13 @@
  #include <cmath>
  #include <atomic>
  
- // 🌟 حذف کامل Boost و استفاده از ASIO مستقل برای حل خطاهای C++17
  #define ASIO_STANDALONE
  #define _WEBSOCKETPP_CPP11_STRICT_
  
- // WebSocket & JSON
  #include <websocketpp/config/asio_client.hpp>
  #include <websocketpp/client.hpp>
  #include <nlohmann/json.hpp>
- 
- // ZeroMQ for IPC
  #include <zmq.hpp>
- 
- // HMM MKL Engine
  #include "hmm_mkl.hpp"
  
  using namespace eemd;
@@ -36,40 +27,27 @@
  typedef websocketpp::client<websocketpp::config::asio_tls_client> wss_client;
  typedef websocketpp::lib::shared_ptr<asio::ssl::context> context_ptr;
  
- // ============================================================================
- // Global States & Memory
- // ============================================================================
- 
- std::vector<double> rv_history; // History of 1-second Log-Realized Variances
+ std::vector<double> rv_history; 
  std::mutex rv_mutex;
  
- std::atomic<int> current_hmm_regime(0);     // 0=Calm, 1=Trend, 2=Crisis
+ std::atomic<int> current_hmm_regime(0);     
  std::atomic<bool> is_model_trained(false);
+ std::atomic<double> prob_state[3] = {1.0, 0.0, 0.0}; // 0: Calm, 1: Trend, 2: Crisis
  
  HMMResult current_model;
  
- // ============================================================================
- // 🌟 Warm Start Initialization (Cold-Start Fix)
- // ============================================================================
  void initialize_warm_start_model() {
-     current_model.mu = {-17.0, -14.0, -11.0};    // تخمین Log-RV برای: آرام، ترند، بحران
-     current_model.sigma = {1.0, 1.0, 1.5};       // واریانسِ هر رژیم
-     
+     current_model.mu = {-27.0, -21.0, -18.0};    // Volatility levels (LogRV)
+     current_model.sigma = {0.05, 1.0, 3.5};      
      current_model.trans = {
-         {0.95, 0.04, 0.01}, // Calm transitions
-         {0.05, 0.90, 0.05}, // Trend transitions
-         {0.02, 0.08, 0.90}  // Crisis transitions
+         {0.95, 0.04, 0.01}, 
+         {0.05, 0.90, 0.05}, 
+         {0.02, 0.08, 0.90}  
      };
-     
-     current_model.pi = {0.8, 0.15, 0.05}; // احتمال حضور در شروع
-     
+     current_model.pi = {0.8, 0.15, 0.05}; 
      is_model_trained = true;
-     std::cout << "[WARM START] Loaded default Crypto Volatility priors. Bot is live immediately!" << std::endl;
+     std::cout << "[WARM START] Loaded default Crypto Volatility priors based on Paper standards." << std::endl;
  }
- 
- // ============================================================================
- // Background Thread: HMM Trainer
- // ============================================================================
  
  void hmm_trainer_thread() {
      while (true) {
@@ -81,18 +59,15 @@
              local_rv = rv_history;
          }
  
-         // We need at least 300 points (5 minutes) to train meaningfully
-         if (local_rv.size() < 300) {
-             continue;
-         }
+         if (local_rv.size() < 300) continue;
  
          std::cout << "\n[TRAINER] Starting Baum-Welch EM calibration on " << local_rv.size() << " samples..." << std::endl;
  
          HMMConfig config;
-         config.n_states = 3;            // 3 Regimes: Calm, Trend, Crisis
+         config.n_states = 3;            
          config.max_iter = 100;
          config.verbose = false;         
-         config.n_threads = 0;           // Use all available P-Cores
+         config.n_threads = 0;           
          config.min_variance = 1e-4;     
          
          GaussianHMM hmm(config);
@@ -113,9 +88,9 @@
  
              double ms = std::chrono::duration<double, std::milli>(end - start).count();
              std::cout << "[TRAINER] Calibration Success in " << ms << " ms." << std::endl;
-             std::cout << "  -> Calm(0)  mu: " << result.mu[0] << ", sig: " << result.sigma[0] << std::endl;
-             std::cout << "  -> Trend(1) mu: " << result.mu[1] << ", sig: " << result.sigma[1] << std::endl;
-             std::cout << "  -> Crisis(2)mu: " << result.mu[2] << ", sig: " << result.sigma[2] << std::endl;
+             std::cout << "  -> Calm(0)  LogVar: " << result.mu[0] << std::endl;
+             std::cout << "  -> Trend(1) LogVar: " << result.mu[1] << std::endl;
+             std::cout << "  -> Crisis(2)LogVar: " << result.mu[2] << std::endl;
              
              std::this_thread::sleep_for(std::chrono::minutes(5));
          } else {
@@ -124,40 +99,55 @@
      }
  }
  
- // ============================================================================
- // Ultra-Low Latency Inference
- // ============================================================================
- 
+ // 🌟 Real-time State Filter (Forward Bayesian Update)
  void decode_current_regime(double latest_log_rv) {
      if (!is_model_trained) return;
- 
      std::lock_guard<std::mutex> lock(rv_mutex);
      
-     double max_log_p = -1e9;
-     int best_k = current_hmm_regime.load();
- 
+     double log_emission[3];
+     double max_log_e = -1e9;
      for (int k = 0; k < 3; k++) {
          double mu = current_model.mu[k];
          double sig = current_model.sigma[k];
-         
          double z = (latest_log_rv - mu) / sig;
-         double log_p = -0.5 * z * z - std::log(sig);
-         
-         if (log_p > max_log_p) {
-             max_log_p = log_p;
-             best_k = k;
-         }
+         log_emission[k] = -0.5 * z * z - std::log(sig);
+         if (log_emission[k] > max_log_e) max_log_e = log_emission[k];
      }
  
+     double p_emission[3];
+     for (int k=0; k<3; k++) p_emission[k] = std::exp(log_emission[k] - max_log_e);
+ 
+     double alpha_new[3];
+     double sum_alpha = 0.0;
+     for (int j = 0; j < 3; j++) {
+         double prior_j = 0.0;
+         for (int i = 0; i < 3; i++) {
+             prior_j += current_model.trans[i][j] * prob_state[i].load();
+         }
+         alpha_new[j] = p_emission[j] * prior_j;
+         sum_alpha += alpha_new[j];
+     }
+ 
+     if (sum_alpha < 1e-12) {
+         for(int j=0; j<3; j++) alpha_new[j] = p_emission[j];
+         sum_alpha = p_emission[0] + p_emission[1] + p_emission[2];
+     }
+ 
+     int best_k = 0;
+     double max_p = -1.0;
+     for(int j=0; j<3; j++) {
+         double final_p = alpha_new[j] / sum_alpha;
+         prob_state[j].store(final_p); 
+         if(final_p > max_p) {
+             max_p = final_p;
+             best_k = j;
+         }
+     }
      current_hmm_regime.store(best_k);
  }
  
- // ============================================================================
- // Main WebSocket & ZMQ Loop
- // ============================================================================
- 
  int main() {
-     std::cout << "🚀 HFT C++ Engine (HMM-MKL + ZMQ) Starting..." << std::endl;
+     std::cout << "🚀 HFT Volatility-Regime Engine Starting..." << std::endl;
  
      initialize_warm_start_model();
  
@@ -165,11 +155,8 @@
      zmq::socket_t zmq_pub(zmq_ctx, zmq::socket_type::pub);
      
      std::string zmq_port = "5555";
-     if (const char* env_p = std::getenv("ZMQ_PORT")) {
-         zmq_port = env_p;
-     }
+     if (const char* env_p = std::getenv("ZMQ_PORT")) zmq_port = env_p;
      zmq_pub.bind("tcp://*:" + zmq_port);
-     std::cout << "📡 ZeroMQ Publisher bound to port " << zmq_port << std::endl;
  
      std::thread trainer(hmm_trainer_thread);
      trainer.detach();
@@ -179,13 +166,9 @@
      c.set_access_channels(websocketpp::log::alevel::none); 
      c.clear_access_channels(websocketpp::log::alevel::all);
  
-     // 🌟 استفاده از asio مستقل (بدون boost) برای هندلر TLS
      c.set_tls_init_handler([](websocketpp::connection_hdl) {
          auto ctx = websocketpp::lib::make_shared<asio::ssl::context>(asio::ssl::context::tlsv12);
-         ctx->set_options(asio::ssl::context::default_workarounds |
-                          asio::ssl::context::no_sslv2 |
-                          asio::ssl::context::no_sslv3 |
-                          asio::ssl::context::single_dh_use);
+         ctx->set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2 | asio::ssl::context::no_sslv3);
          return ctx;
      });
  
@@ -217,50 +200,43 @@
                  {
                      std::lock_guard<std::mutex> lock(rv_mutex);
                      rv_history.push_back(log_rv);
-                     if (rv_history.size() > 14400) {
-                         rv_history.erase(rv_history.begin());
-                     }
+                     if (rv_history.size() > 14400) rv_history.erase(rv_history.begin());
                  }
  
                  decode_current_regime(log_rv);
                  int active_regime = current_hmm_regime.load();
  
-                 zmq::message_t topic("REGIME", 6);
-                 zmq::message_t payload(std::to_string(active_regime).data(), 1);
-                 
-                 zmq_pub.send(topic, zmq::send_flags::sndmore);
+                 // 🌟 Single-Frame Protocol: Resolves Java/C++ ZMQ disconnects
+                 std::string payload_str = "REGIME|" + std::to_string(active_regime) + "," +
+                                           std::to_string(prob_state[0].load()) + "," +
+                                           std::to_string(prob_state[1].load()) + "," +
+                                           std::to_string(prob_state[2].load());
+ 
+                 zmq::message_t payload(payload_str.data(), payload_str.size());
                  zmq_pub.send(payload, zmq::send_flags::none);
  
                  tick_count++;
                  if (tick_count % 10 == 0) {
-                     std::cout << "[LIVE] Sec: " << current_sec 
-                               << " | LogRV: " << log_rv 
+                     std::cout << "[LIVE] Sec: " << current_sec << " | LogRV: " << log_rv 
                                << " | Regime: " << active_regime 
-                               << (rv_history.size() < 300 ? " (PRIOR)" : " (LIVE)") << std::endl;
+                               << " | TrendProb: " << (prob_state[1].load() * 100.0) << "%" << std::endl;
                  }
  
                  current_sec_rv = 0.0;
                  last_sec = current_sec;
              }
- 
-         } catch (...) {
-         }
+         } catch (...) {}
      });
  
      c.set_close_handler([&](websocketpp::connection_hdl hdl) {
-         std::cout << "🔴 WebSocket Closed! You should implement auto-reconnect here." << std::endl;
+         std::cout << "🔴 WebSocket Closed!" << std::endl;
      });
  
      std::string uri = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
      websocketpp::lib::error_code ec;
      wss_client::connection_ptr con = c.get_connection(uri, ec);
-     if (ec) {
-         std::cout << "Connection Init Error: " << ec.message() << std::endl;
-         return -1;
-     }
-     
      c.connect(con);
-     std::cout << "🌐 Connecting to Binance " << uri << " ..." << std::endl;
+     std::cout << "🌐 Connecting to Binance..." << std::endl;
      c.run(); 
  
      return 0;
