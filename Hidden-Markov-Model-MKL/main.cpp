@@ -99,7 +99,7 @@
      }
  }
  
- // 🌟 Real-time State Filter (Forward Bayesian Update)
+ // 🌟 Real-time State Filter (Forward Bayesian Update with Sticky HMM)
  void decode_current_regime(double latest_log_rv) {
      if (!is_model_trained) return;
      std::lock_guard<std::mutex> lock(rv_mutex);
@@ -117,12 +117,36 @@
      double p_emission[3];
      for (int k=0; k<3; k++) p_emission[k] = std::exp(log_emission[k] - max_log_e);
  
+     // ========================================================================
+     // 🌟 راه‌حل دوم: اجبار به چسبندگی (Sticky HMM Transition Regularization)
+     // ایجاد یک ماتریس انتقال که شانس ماندگاری در رژیم فعلی را روی ۹۹٪ قفل می‌کند
+     // ========================================================================
+     double sticky_trans[3][3];
+     for(int i=0; i<3; i++) {
+         double off_diagonal_sum = 0.0;
+         for(int j=0; j<3; j++) {
+             if(i != j) off_diagonal_sum += current_model.trans[i][j];
+         }
+         for(int j=0; j<3; j++) {
+             if (i == j) {
+                 sticky_trans[i][j] = 0.99; // 99% ماندگاری در رژیم فعلی
+             } else {
+                 if (off_diagonal_sum > 0) {
+                     sticky_trans[i][j] = 0.01 * (current_model.trans[i][j] / off_diagonal_sum);
+                 } else {
+                     sticky_trans[i][j] = 0.005;
+                 }
+             }
+         }
+     }
+ 
      double alpha_new[3];
      double sum_alpha = 0.0;
      for (int j = 0; j < 3; j++) {
          double prior_j = 0.0;
          for (int i = 0; i < 3; i++) {
-             prior_j += current_model.trans[i][j] * prob_state[i].load();
+             // استفاده از ماتریس چسبنده به جای ماتریس خام
+             prior_j += sticky_trans[i][j] * prob_state[i].load();
          }
          alpha_new[j] = p_emission[j] * prior_j;
          sum_alpha += alpha_new[j];
@@ -176,6 +200,10 @@
      double current_sec_rv = 0.0;
      double last_price = -1.0;
      long tick_count = 0;
+     
+     // متغیرهای مربوط به راه‌حل اول (هموارسازی)
+     double current_ema_log_rv = 0.0;
+     bool is_ema_initialized = false;
  
      c.set_message_handler([&](websocketpp::connection_hdl hdl, wss_client::message_ptr msg) {
          try {
@@ -197,16 +225,29 @@
              if (current_sec > last_sec) {
                  double log_rv = std::log(current_sec_rv + 1e-12);
  
+                 // ========================================================================
+                 // 🌟 راه‌حل اول: هموارسازی ورودی‌ها (Smoothed RV / Input Feature Engineering)
+                 // خنثی‌سازی اسپایک‌های فریب‌دهنده‌ی ۱ ثانیه‌ای
+                 // ========================================================================
+                 if (!is_ema_initialized) {
+                     current_ema_log_rv = log_rv;
+                     is_ema_initialized = true;
+                 } else {
+                     current_ema_log_rv = 0.1 * log_rv + 0.9 * current_ema_log_rv;
+                 }
+ 
                  {
                      std::lock_guard<std::mutex> lock(rv_mutex);
-                     rv_history.push_back(log_rv);
+                     // مدل روی نوسانات هموار شده (واقعی) آموزش می‌بیند
+                     rv_history.push_back(current_ema_log_rv);
                      if (rv_history.size() > 14400) rv_history.erase(rv_history.begin());
                  }
  
-                 decode_current_regime(log_rv);
+                 // ارسال دیتای هموار شده برای تشخیص رژیم
+                 decode_current_regime(current_ema_log_rv);
                  int active_regime = current_hmm_regime.load();
  
-                 // 🌟 Single-Frame Protocol: Resolves Java/C++ ZMQ disconnects
+                 // 🌟 Single-Frame Protocol
                  std::string payload_str = "REGIME|" + std::to_string(active_regime) + "," +
                                            std::to_string(prob_state[0].load()) + "," +
                                            std::to_string(prob_state[1].load()) + "," +
@@ -217,9 +258,9 @@
  
                  tick_count++;
                  if (tick_count % 10 == 0) {
-                     // 🌟 نمایش تگ های آشنای PRIOR/LIVE به همراه درصد بیز برای تایید آپدیت شدن روی سرور
                      std::string status_tag = (rv_history.size() < 300) ? "(PRIOR)" : "(LIVE)";
-                     std::cout << "[LIVE] Sec: " << current_sec << " | LogRV: " << log_rv 
+                     std::cout << "[LIVE] Sec: " << current_sec << " | RawLogRV: " << log_rv 
+                               << " | EmaLogRV: " << current_ema_log_rv
                                << " | Regime: " << active_regime << " " << status_tag
                                << " | TrendProb: " << (prob_state[1].load() * 100.0) << "%" << std::endl;
                  }
