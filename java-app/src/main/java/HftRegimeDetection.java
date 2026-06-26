@@ -48,7 +48,7 @@ public class HftRegimeDetection {
         public double vress;
         public double eigenGap;
 
-        // 🌟 فیلدهای جدید مربوط به اجرای استراتژی مقاله
+        // فیلدهای جدید مربوط به اجرای استراتژی مقاله
         public double momentumSignal;
         public double regimeWeight;
         public double gatedMomentum;
@@ -95,6 +95,84 @@ public class HftRegimeDetection {
         private double emaProbTrend = 0.0;
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
+
+        // 🌟 بازگرداندن کلاس ChaosMath که به اشتباه حذف شده بود
+        public static class ChaosMath {
+            public static int calculateAMI(double[] data, int maxTau, int bins) {
+                int n = data.length;
+                double[] ami = new double[maxTau + 1];
+                double minVal = Double.MAX_VALUE;
+                double maxVal = -Double.MAX_VALUE;
+                for (double v : data) {
+                    if (v < minVal) minVal = v;
+                    if (v > maxVal) maxVal = v;
+                }
+                if (maxVal - minVal < 1e-6) return 1;
+                for (int tau = 1; tau <= maxTau; tau++) {
+                    int[][] joint = new int[bins][bins];
+                    int[] marg1 = new int[bins];
+                    int[] marg2 = new int[bins];
+                    int validCount = n - tau;
+                    for (int i = 0; i < validCount; i++) {
+                        int b1 = (int) ((data[i] - minVal) / (maxVal - minVal) * (bins - 1));
+                        int b2 = (int) ((data[i + tau] - minVal) / (maxVal - minVal) * (bins - 1));
+                        b1 = Math.max(0, Math.min(bins - 1, b1));
+                        b2 = Math.max(0, Math.min(bins - 1, b2));
+                        joint[b1][b2]++; marg1[b1]++; marg2[b2]++;
+                    }
+                    double mutualInfo = 0.0;
+                    for (int i = 0; i < bins; i++) {
+                        for (int j = 0; j < bins; j++) {
+                            if (joint[i][j] > 0) {
+                                double pxy = (double) joint[i][j] / validCount;
+                                double px = (double) marg1[i] / validCount;
+                                double py = (double) marg2[j] / validCount;
+                                mutualInfo += pxy * Math.log(pxy / (px * py));
+                            }
+                        }
+                    }
+                    ami[tau] = mutualInfo;
+                }
+                for (int tau = 2; tau < maxTau; tau++) {
+                    if (ami[tau] < ami[tau - 1] && ami[tau] < ami[tau + 1]) return tau;
+                }
+                return Math.max(1, maxTau / 2); 
+            }
+
+            public static int calculateFNN(double[] data, int tau, int maxM, double rTol) {
+                int n = data.length;
+                if (n < 50) return 3;
+                for (int m = 1; m <= maxM; m++) {
+                    int falseNeighbors = 0; int totalNeighbors = 0;
+                    int numVectors = n - m * tau;
+                    if (numVectors < 10) return m;
+                    for (int i = 0; i < numVectors; i++) {
+                        double minDistSq = Double.MAX_VALUE; int nearestNeighbor = -1;
+                        for (int j = 0; j < numVectors; j++) {
+                            if (Math.abs(i - j) > tau) { 
+                                double distSq = 0;
+                                for (int d = 0; d < m; d++) {
+                                    double diff = data[i + d * tau] - data[j + d * tau];
+                                    distSq += diff * diff;
+                                }
+                                if (distSq > 1e-12 && distSq < minDistSq) {
+                                    minDistSq = distSq; nearestNeighbor = j;
+                                }
+                            }
+                        }
+                        if (nearestNeighbor != -1) {
+                            double rM = Math.sqrt(minDistSq);
+                            double nextDiff = Math.abs(data[i + m * tau] - data[nearestNeighbor + m * tau]);
+                            double ratio = nextDiff / Math.max(rM, 1e-10);
+                            if (ratio > rTol) falseNeighbors++;
+                            totalNeighbors++;
+                        }
+                    }
+                    if (totalNeighbors > 0 && (double) falseNeighbors / totalNeighbors < 0.05) return m;
+                }
+                return maxM;
+            }
+        }
 
         @Override
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
@@ -256,40 +334,24 @@ public class HftRegimeDetection {
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
                 
-                // =========================================================================
-                // 🌟 پیاده‌سازی منطق مقاله: Trend-following execution logic
-                // =========================================================================
-
-                // 1. Momentum Estimator: فاصله قیمت از هسته ترند (PC0)
+                // پیاده‌سازی منطق مقاله: Trend-following execution logic
                 event.momentumSignal = event.price - event.pc0;
 
-                // 2. Risk Controls: تشخیص بحران (Crisis Cap)
-                double CRISIS_THRESHOLD = 0.40; // اگر احتمال بحران بالای 40% رفت
+                double CRISIS_THRESHOLD = 0.40; 
                 event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
 
-                // 3. Signal Gating: فیلتر کردن سیگنال با آستانه p* = 0.7
                 double TREND_P_STAR = 0.70;
                 double weight = 0.0;
 
                 if (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) {
-                    // Soft-Gating: تبدیل احتمال [0.7 -> 1.0] به وزن [0.0 -> 1.0]
                     weight = Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR));
                 }
                 event.regimeWeight = weight;
-
-                // 4. Signal Construction: سیگنال نهایی (ضرب مومنتوم در وزن رژیم)
                 event.gatedMomentum = event.momentumSignal * event.regimeWeight;
 
-                // 5. Risk Controls: Position Sizing & Dynamic Stop-Loss
-                // حجم پوزیشن (از 0 تا 100 درصد) با احتمال ترند مقیاس‌بندی می‌شود و در زمان بحران صفر است
                 double MAX_POSITION = 1.0; 
                 event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
-
-                // حد ضرر مبتنی بر نوسان: متصل به Sigma_s (با استفاده از نویز بازار Vress)
-                // عرض 3 برابر انحراف معیارِ نویز را به عنوان فاصله استاپ‌لاس در نظر می‌گیریم
                 event.dynamicStopLoss = event.vress * 3.0;
-
-                // =========================================================================
 
                 if (sequence % 500 == 0) {
                     System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | TrendProb: %.1f%% | GateWt: %.2f | PosSize: %.0f%% | StopDist: %.2f\n", 
@@ -309,7 +371,6 @@ public class HftRegimeDetection {
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
                 
-                // مقادیر پیش‌فرض برای اجرای اولیه
                 event.momentumSignal = 0.0;
                 event.regimeWeight = 0.0;
                 event.gatedMomentum = 0.0;
@@ -376,7 +437,6 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                // 🌟 دیتابیس دقیقاً با 23 پارامتر مچ شد
                 String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
             } catch (SQLException e) {
@@ -407,7 +467,6 @@ public class HftRegimeDetection {
                 statement.setDouble(16, event.hmmProbTrend);
                 statement.setDouble(17, event.hmmProbCrisis);
                 
-                // 🌟 مقادیر اجرایی مقاله
                 statement.setDouble(18, event.momentumSignal);
                 statement.setDouble(19, event.regimeWeight);
                 statement.setDouble(20, event.gatedMomentum);
