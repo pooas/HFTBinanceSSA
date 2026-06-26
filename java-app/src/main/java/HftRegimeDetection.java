@@ -47,6 +47,14 @@ public class HftRegimeDetection {
         
         public double vress;
         public double eigenGap;
+
+        // 🌟 فیلدهای جدید مربوط به اجرای استراتژی مقاله
+        public double momentumSignal;
+        public double regimeWeight;
+        public double gatedMomentum;
+        public double positionSize;
+        public double dynamicStopLoss;
+        public int crisisCapActive;
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -84,102 +92,22 @@ public class HftRegimeDetection {
         private double emaEvr = 0.0;
         private double emaGapFactor = 0.0;
 
-        // 🌟 متغیرهای جدید برای هموارسازی احتمالات بیزی
         private double emaProbTrend = 0.0;
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
-
-        public static class ChaosMath {
-            public static int calculateAMI(double[] data, int maxTau, int bins) {
-                int n = data.length;
-                double[] ami = new double[maxTau + 1];
-                double minVal = Double.MAX_VALUE;
-                double maxVal = -Double.MAX_VALUE;
-                for (double v : data) {
-                    if (v < minVal) minVal = v;
-                    if (v > maxVal) maxVal = v;
-                }
-                if (maxVal - minVal < 1e-6) return 1;
-                for (int tau = 1; tau <= maxTau; tau++) {
-                    int[][] joint = new int[bins][bins];
-                    int[] marg1 = new int[bins];
-                    int[] marg2 = new int[bins];
-                    int validCount = n - tau;
-                    for (int i = 0; i < validCount; i++) {
-                        int b1 = (int) ((data[i] - minVal) / (maxVal - minVal) * (bins - 1));
-                        int b2 = (int) ((data[i + tau] - minVal) / (maxVal - minVal) * (bins - 1));
-                        b1 = Math.max(0, Math.min(bins - 1, b1));
-                        b2 = Math.max(0, Math.min(bins - 1, b2));
-                        joint[b1][b2]++; marg1[b1]++; marg2[b2]++;
-                    }
-                    double mutualInfo = 0.0;
-                    for (int i = 0; i < bins; i++) {
-                        for (int j = 0; j < bins; j++) {
-                            if (joint[i][j] > 0) {
-                                double pxy = (double) joint[i][j] / validCount;
-                                double px = (double) marg1[i] / validCount;
-                                double py = (double) marg2[j] / validCount;
-                                mutualInfo += pxy * Math.log(pxy / (px * py));
-                            }
-                        }
-                    }
-                    ami[tau] = mutualInfo;
-                }
-                for (int tau = 2; tau < maxTau; tau++) {
-                    if (ami[tau] < ami[tau - 1] && ami[tau] < ami[tau + 1]) return tau;
-                }
-                return Math.max(1, maxTau / 2); 
-            }
-
-            public static int calculateFNN(double[] data, int tau, int maxM, double rTol) {
-                int n = data.length;
-                if (n < 50) return 3;
-                for (int m = 1; m <= maxM; m++) {
-                    int falseNeighbors = 0; int totalNeighbors = 0;
-                    int numVectors = n - m * tau;
-                    if (numVectors < 10) return m;
-                    for (int i = 0; i < numVectors; i++) {
-                        double minDistSq = Double.MAX_VALUE; int nearestNeighbor = -1;
-                        for (int j = 0; j < numVectors; j++) {
-                            if (Math.abs(i - j) > tau) { 
-                                double distSq = 0;
-                                for (int d = 0; d < m; d++) {
-                                    double diff = data[i + d * tau] - data[j + d * tau];
-                                    distSq += diff * diff;
-                                }
-                                if (distSq > 1e-12 && distSq < minDistSq) {
-                                    minDistSq = distSq; nearestNeighbor = j;
-                                }
-                            }
-                        }
-                        if (nearestNeighbor != -1) {
-                            double rM = Math.sqrt(minDistSq);
-                            double nextDiff = Math.abs(data[i + m * tau] - data[nearestNeighbor + m * tau]);
-                            double ratio = nextDiff / Math.max(rM, 1e-10);
-                            if (ratio > rTol) falseNeighbors++;
-                            totalNeighbors++;
-                        }
-                    }
-                    if (totalNeighbors > 0 && (double) falseNeighbors / totalNeighbors < 0.05) return m;
-                }
-                return maxM;
-            }
-        }
 
         @Override
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
             priceHistory[head] = event.price;
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
             
-            // 🌟 1. اعمال فیلتر هموارساز (EMA) روی احتمالات ZMQ برای تک‌تک تیک‌ها
             if (!probInitialized) {
                 emaProbTrend = currentProbTrend;
                 emaProbCrisis = currentProbCrisis;
                 probInitialized = true;
             } else {
-                // آلفا 0.005 باعث تبدیل پرش‌های باینری C++ به امواج نرم تنفسی در گرافانا می‌شود
-                emaProbTrend = 0.005 * currentProbTrend + 0.995 * emaProbTrend;
-                emaProbCrisis = 0.005 * currentProbCrisis + 0.995 * emaProbCrisis;
+                emaProbTrend = 0.05 * currentProbTrend + 0.95 * emaProbTrend;
+                emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
             }
             
             int L = Math.max(4, (int) Math.round(domCycle / 2.0));
@@ -290,14 +218,12 @@ public class HftRegimeDetection {
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                
                 smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
                 event.pc0 = emaPc0;
                 event.evr = emaEvr;
                 event.bandUpper = emaPc0 + smoothedDistance;
                 event.bandLower = emaPc0 - smoothedDistance;
-                
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
@@ -326,15 +252,48 @@ public class HftRegimeDetection {
                 lastLogicalDistanceLine = currentLineVal;
                 event.ssaTrend = currentLineVal;
                 event.regime = currentMarketRegime;
-                
-                // 🌟 تزریق مقادیر لایو و هموارشده‌ی HMM
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
                 
+                // =========================================================================
+                // 🌟 پیاده‌سازی منطق مقاله: Trend-following execution logic
+                // =========================================================================
+
+                // 1. Momentum Estimator: فاصله قیمت از هسته ترند (PC0)
+                event.momentumSignal = event.price - event.pc0;
+
+                // 2. Risk Controls: تشخیص بحران (Crisis Cap)
+                double CRISIS_THRESHOLD = 0.40; // اگر احتمال بحران بالای 40% رفت
+                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
+
+                // 3. Signal Gating: فیلتر کردن سیگنال با آستانه p* = 0.7
+                double TREND_P_STAR = 0.70;
+                double weight = 0.0;
+
+                if (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) {
+                    // Soft-Gating: تبدیل احتمال [0.7 -> 1.0] به وزن [0.0 -> 1.0]
+                    weight = Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR));
+                }
+                event.regimeWeight = weight;
+
+                // 4. Signal Construction: سیگنال نهایی (ضرب مومنتوم در وزن رژیم)
+                event.gatedMomentum = event.momentumSignal * event.regimeWeight;
+
+                // 5. Risk Controls: Position Sizing & Dynamic Stop-Loss
+                // حجم پوزیشن (از 0 تا 100 درصد) با احتمال ترند مقیاس‌بندی می‌شود و در زمان بحران صفر است
+                double MAX_POSITION = 1.0; 
+                event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
+
+                // حد ضرر مبتنی بر نوسان: متصل به Sigma_s (با استفاده از نویز بازار Vress)
+                // عرض 3 برابر انحراف معیارِ نویز را به عنوان فاصله استاپ‌لاس در نظر می‌گیریم
+                event.dynamicStopLoss = event.vress * 3.0;
+
+                // =========================================================================
+
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | PC0: %.2f | EVR: %.2f%% | Gap: %.2f | Vres: %.2f | TrendProb: %.1f%%\n", 
-                                      sequence, event.price, event.pc0, event.evr, event.eigenGap, event.vress, (event.hmmProbTrend * 100.0));
+                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | TrendProb: %.1f%% | GateWt: %.2f | PosSize: %.0f%% | StopDist: %.2f\n", 
+                                      sequence, event.price, (event.hmmProbTrend * 100.0), event.regimeWeight, (event.positionSize * 100.0), event.dynamicStopLoss);
                 }
                 
             } else {
@@ -346,13 +305,20 @@ public class HftRegimeDetection {
                 event.regime = currentMarketRegime;
                 event.vress = 0.0;
                 event.eigenGap = 0.0;
-                
-                // 🌟 تزریق در زمان Warmup
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
+                
+                // مقادیر پیش‌فرض برای اجرای اولیه
+                event.momentumSignal = 0.0;
+                event.regimeWeight = 0.0;
+                event.gatedMomentum = 0.0;
+                event.positionSize = 0.0;
+                event.dynamicStopLoss = 0.0;
+                event.crisisCapActive = 0;
             }
 
+            // --- محاسبه لیاپانوف ---
             ssaTrendBuffer[ssaHead] = event.ssaTrend;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
@@ -401,28 +367,20 @@ public class HftRegimeDetection {
         public ClickHouseBatchHandler() {
             try {
                 String host = System.getenv("CLICKHOUSE_HOST");
-                if (host == null || host.trim().isEmpty()) {
-                    host = "clickhouse"; 
-                }
-                
+                if (host == null || host.trim().isEmpty()) host = "clickhouse"; 
                 String user = System.getenv("CLICKHOUSE_USER");
-                if (user == null || user.trim().isEmpty()) {
-                    user = "default";
-                }
-                
+                if (user == null || user.trim().isEmpty()) user = "default";
                 String password = System.getenv("CLICKHOUSE_PASSWORD");
-                if (password == null) {
-                    password = ""; 
-                }
+                if (password == null) password = ""; 
                 
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                // 🌟 دیتابیس دقیقاً با 23 پارامتر مچ شد
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
-                System.out.println("✅ ClickHouse Connection Established Successfully on host: " + host + " with user: " + user);
             } catch (SQLException e) {
-                System.err.println("\n🔴 CRITICAL: ClickHouse Connection Failed: " + e.getMessage());
+                System.err.println("\n🔴 CRITICAL: ClickHouse Failed: " + e.getMessage());
                 System.exit(1); 
             }
         }
@@ -445,56 +403,43 @@ public class HftRegimeDetection {
                 statement.setDouble(12, event.evr);
                 statement.setDouble(13, event.vress);
                 statement.setDouble(14, event.eigenGap);
-                
                 statement.setInt(15, event.hmmRegime);
                 statement.setDouble(16, event.hmmProbTrend);
                 statement.setDouble(17, event.hmmProbCrisis);
                 
+                // 🌟 مقادیر اجرایی مقاله
+                statement.setDouble(18, event.momentumSignal);
+                statement.setDouble(19, event.regimeWeight);
+                statement.setDouble(20, event.gatedMomentum);
+                statement.setDouble(21, event.positionSize);
+                statement.setDouble(22, event.dynamicStopLoss);
+                statement.setInt(23, event.crisisCapActive);
+                
                 statement.addBatch();
                 currentBatchSize++;
                 if (currentBatchSize >= batchSizeThreshold || endOfBatch) flush();
-            } catch (SQLException e) {
-                System.err.println("\n⚠️ Error formatting tick: " + e.getMessage());
-            }
+            } catch (SQLException e) {}
         }
 
         private void flush() {
             if (currentBatchSize == 0) return;
-            try {
-                statement.executeBatch(); 
-                currentBatchSize = 0;
-            } catch (SQLException e) {
-                System.err.println("\n🔴 Failed to flush batch to ClickHouse: " + e.getMessage());
-                currentBatchSize = 0; 
-            }
+            try { statement.executeBatch(); currentBatchSize = 0; } 
+            catch (SQLException e) { currentBatchSize = 0; }
         }
     }
 
     public static class BinanceProducer extends WebSocketClient {
         private final RingBuffer<TickEvent> ringBuffer;
-        
         public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
             super(serverUri); 
             this.ringBuffer = ringBuffer;
             this.setConnectionLostTimeout(0); 
         }
-        
-        @Override
-        public void onOpen(ServerHandshake handshakedata) { 
-            System.out.println("🟢 Connected to Binance High-Frequency Stream!"); 
-        }
-        
-        @Override
-        public void onMessage(String message) {
+        @Override public void onOpen(ServerHandshake handshakedata) {}
+        @Override public void onMessage(String message) {
             try {
                 JsonObject json = JsonParser.parseString(message).getAsJsonObject();
-                
-                if (!json.has("p")) {
-                    return; 
-                }
-                
-                System.out.print("."); System.out.flush();
-                
+                if (!json.has("p")) return; 
                 long sequence = ringBuffer.next();
                 try {
                     TickEvent event = ringBuffer.get(sequence);
@@ -502,37 +447,16 @@ public class HftRegimeDetection {
                     event.volume = json.get("q").getAsDouble();
                     event.timestamp = json.get("T").getAsLong();
                     event.ingressNanoTime = System.nanoTime(); 
-                } finally {
-                    ringBuffer.publish(sequence); 
-                }
-            } catch (Throwable e) {
-                System.err.println("\n🔴 Parsing Error: " + e.getMessage());
-            }
+                } finally { ringBuffer.publish(sequence); }
+            } catch (Throwable e) {}
         }
-        
-        @Override 
-        public void onClose(int code, String reason, boolean remote) {
-            System.err.printf("\n🔴 WebSocket Closed by %s! Reason: %s (Code: %d)\n", (remote ? "Binance" : "Local"), reason, code);
-            System.out.println("🔄 Attempting to reconnect in 5 seconds...");
-            try {
-                Thread.sleep(5000); 
-                this.reconnect();   
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+        @Override public void onClose(int code, String reason, boolean remote) {
+            try { Thread.sleep(5000); this.reconnect(); } catch (InterruptedException e) {}
         }
-        
-        @Override 
-        public void onError(Exception ex) {
-            System.err.println("\n🔴 WebSocket Fatal Error: " + ex.getMessage());
-        }
+        @Override public void onError(Exception ex) {}
     }
 
     public static void main(String[] args) throws Exception {
-        
-        // ==============================================================
-        // 🌟 استارت کردن شنونده ZeroMQ در یک Thread جداگانه
-        // ==============================================================
         Thread zmqThread = new Thread(() -> {
             try (ZContext context = new ZContext()) {
                 ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
@@ -543,40 +467,27 @@ public class HftRegimeDetection {
                 
                 String address = "tcp://" + zmqHost + ":" + zmqPort;
                 subscriber.connect(address);
-                subscriber.subscribe("REGIME".getBytes(ZMQ.CHARSET));
+                subscriber.subscribe(new byte[0]); 
                 
-                System.out.println("🔗 ZeroMQ Subscriber listening on " + address);
+                System.out.println("🔗 ZeroMQ Subscriber active on " + address);
                 
                 while (!Thread.currentThread().isInterrupted()) {
-                    String contents = null;
                     try {
-                        String topic = subscriber.recvStr();
-                        contents = subscriber.recvStr();
-                        if (contents != null) {
-                            String[] parts = contents.trim().split(",");
-                            if (parts.length == 4) {
+                        String msg = subscriber.recvStr();
+                        if (msg != null && msg.startsWith("REGIME|")) {
+                            String[] parts = msg.substring(7).trim().split(",");
+                            if (parts.length >= 4) {
                                 currentHmmRegime = Integer.parseInt(parts[0]);
                                 currentProbTrend = Double.parseDouble(parts[2]);
                                 currentProbCrisis = Double.parseDouble(parts[3]);
-                            } 
-                            // 🌟 سیستم ضد-کِرَش برای مشکل Locale در لینوکس (کاما به جای نقطه)
-                            else if (parts.length == 7) {
-                                currentHmmRegime = Integer.parseInt(parts[0]);
-                                currentProbTrend = Double.parseDouble(parts[3] + "." + parts[4]);
-                                currentProbCrisis = Double.parseDouble(parts[5] + "." + parts[6]);
                             }
                         }
-                    } catch (Exception ex) {
-                        System.err.println("⚠️ ZMQ Parsing Error on [" + contents + "]: " + ex.getMessage());
-                    }
+                    } catch (Exception ex) { }
                 }
-            } catch (Exception e) {
-                System.err.println("⚠️ ZeroMQ Listener Fatal Error: " + e.getMessage());
-            }
+            } catch (Exception e) {}
         });
         zmqThread.setDaemon(true);
         zmqThread.start();
-        // ==============================================================
 
         Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 1024, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new BusySpinWaitStrategy());
         disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
