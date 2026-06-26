@@ -253,24 +253,25 @@
              double ref_price = live_last_close.load();
  
              if (ref_price > 0.0) {
-                 // محاسبه زنده واریانس کندل فعلی
+                 // محاسبه واریانس کندل (باز یا بسته)
                  double log_ret = std::log(current_close / ref_price);
                  double log_rv = std::log(log_ret * log_ret + 1e-12);
  
-                 decode_current_regime(log_rv);
-                 int active_regime = current_hmm_regime.load();
- 
-                 // ارسال دائمی سیگنال به جاوا
-                 std::string payload_str = "REGIME|" + std::to_string(active_regime) + "," +
-                                           std::to_string(prob_state[0].load()) + "," +
-                                           std::to_string(prob_state[1].load()) + "," +
-                                           std::to_string(prob_state[2].load());
- 
-                 zmq::message_t payload(payload_str.data(), payload_str.size());
-                 zmq_pub.send(payload, zmq::send_flags::none);
- 
-                 // اگر کندل بسته شد، قیمت رفرنس را آپدیت می‌کنیم و واریانس را به تاریخچه اضافه می‌کنیم
+                 // 🌟 رفع مشکل نوسان فیک: محاسبات بیز و ارسال ZMQ فقط در لحظه بسته شدن کندل انجام می‌شود
                  if (is_kline_closed) {
+                     decode_current_regime(log_rv);
+                     int active_regime = current_hmm_regime.load();
+ 
+                     // ارسال قطعی یک سیگنال معتبر و ثابت برای کل تایم‌فریم بعدی
+                     std::string payload_str = "REGIME|" + std::to_string(active_regime) + "," +
+                                               std::to_string(prob_state[0].load()) + "," +
+                                               std::to_string(prob_state[1].load()) + "," +
+                                               std::to_string(prob_state[2].load());
+ 
+                     zmq::message_t payload(payload_str.data(), payload_str.size());
+                     zmq_pub.send(payload, zmq::send_flags::none);
+ 
+                     // آپدیت تاریخچه مدل برای آموزش‌های بعدی
                      {
                          std::lock_guard<std::mutex> lock(rv_mutex);
                          rv_history.push_back(log_rv);
@@ -282,12 +283,11 @@
                                << " | Regime: " << active_regime 
                                << " | TrendProb: " << (prob_state[1].load() * 100.0) << "%" << std::endl;
                  } else {
-                     // چاپ وضعیت زنده هر چند ثانیه یک بار
+                     // در زمان باز بودن کندل فقط پرینت می‌کنیم و سیگنال آشفته تولید نمی‌کنیم
                      tick_count++;
                      if (tick_count % 50 == 0) {
-                         std::cout << "[LIVE|OPEN] Price: " << current_close << " | Live LogRV: " << log_rv 
-                                   << " | Regime: " << active_regime 
-                                   << " | TrendProb: " << (prob_state[1].load() * 100.0) << "%" << std::endl;
+                         std::cout << "[LIVE|OPEN] Price: " << current_close << " | Temp LogRV: " << log_rv 
+                                   << " | Waiting for candle close..." << std::endl;
                      }
                  }
              }
