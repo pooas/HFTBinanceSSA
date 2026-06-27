@@ -53,6 +53,18 @@ services:
     networks:
       - hft-net
 
+  # 🌟 سرویس جدید فرمانده: Python Macro Engine
+  python-macro:
+    build:
+      context: ./python-macro
+      dockerfile: Dockerfile
+    container_name: hft_python_macro
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "5556:5556"
+    networks:
+      - hft-net
   java-app:
     build:
       context: ./java-app

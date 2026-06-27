@@ -26,6 +26,10 @@ public class HftRegimeDetection {
     public static volatile double currentProbTrend = 0.0;  
     public static volatile double currentProbCrisis = 0.0; 
     
+    // 🌟 دریافت مقادیر فرمانده (پایتون) از پورت 5556
+    public static volatile double macroL1Value = 0.0;
+    public static volatile double macroL1Slope = 0.0;
+
     public static class TickEvent {
         public double price;
         public double volume;
@@ -48,6 +52,11 @@ public class HftRegimeDetection {
         public double vress;
         public double eigenGap;
 
+        // 🌟 ستون‌های خنثی شده برای جلوگیری از ارور دیتابیس
+        public double value2;
+        public double domCycle;
+
+        // 🌟 فیلدهای مربوط به اجرای استراتژی مقاله
         public double momentumSignal;
         public double regimeWeight;
         public double gatedMomentum;
@@ -95,8 +104,9 @@ public class HftRegimeDetection {
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
 
-        // متغیر جدید برای ذخیره مقدار قبلی PC0 جهت محاسبه شیب روند
+        // 🌟 متغیرهای مورد نیاز برای محاسبه شیب میکرو و فریز
         private double lastEmaPc0 = 0.0;
+        private double lastValue2 = 0.0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -180,6 +190,10 @@ public class HftRegimeDetection {
             priceHistory[head] = event.price;
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
             
+            // پر کردن مقادیر خنثی برای دیتابیس
+            event.domCycle = domCycle;
+            event.value2 = 0.0;
+            
             if (!probInitialized) {
                 emaProbTrend = currentProbTrend;
                 emaProbCrisis = currentProbCrisis;
@@ -252,7 +266,6 @@ public class HftRegimeDetection {
                     rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
-                double alphaPc0 = 0.15;      
                 double alphaMetrics = 0.05;  
                 
                 if (emaPc0 == 0.0) {
@@ -260,10 +273,27 @@ public class HftRegimeDetection {
                     emaEvr = rawEvr;
                     emaGapFactor = rawGapFactor;
                 } else {
-                    emaPc0 = alphaPc0 * rawPc0 + (1.0 - alphaPc0) * emaPc0;
+                    // محاسبه داینامیک فیلتر
                     emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
                     emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
+                    
+                    double evrFactor = Math.min(emaEvr / 100.0, 1.0);
+                    double adaptiveAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
+
+                    // 🌟 قانون 1: Synergy (هم‌افزایی فرمانده و سرباز)
+                    double rawMicroSlope = rawPc0 - lastEmaPc0;
+                    boolean isMacroBullish = macroL1Slope >= 0;
+                    boolean isMicroBullish = rawMicroSlope >= 0;
+
+                    // اگر پایتون (ماکرو) و جاوا (میکرو) هم‌جهت باشند، سرعت انطباق 2 برابر می‌شود
+                    if (macroL1Slope != 0.0 && (isMacroBullish == isMicroBullish)) {
+                        adaptiveAlpha = Math.min(1.0, adaptiveAlpha * 2.0); 
+                    }
+
+                    emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
                 }
+
+                double velocity = emaPc0 - lastEmaPc0;
 
                 double currentResidual = event.price - emaPc0;
                 residualHistory[residualHead] = currentResidual;
@@ -288,33 +318,16 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                // محاسبه زودهنگام بحران برای استفاده در انقباض باندها
-                double CRISIS_THRESHOLD = 0.40; 
-                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
-
                 double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
                 double alpha = 4.0; 
                 double beta = 2.0;  
                 
-                // --- استراتژی جدید: Zero-lag Reversal & Dynamic Tightening ---
-
-                // ۱. محاسبه شیب (Momentum) روند اصلی SSA
-                double pc0Slope = emaPc0 - lastEmaPc0;
-
-                // ۲. ضریب داینامیک هوشمند: کاهش فاصله باندها در زمان افت روند یا آشوب بازار
-                double trendConfidence = Math.max(0.1, emaProbTrend); 
-                if (currentRegimeShiftAlert || event.crisisCapActive == 1) {
-                    trendConfidence = 0.1; // انقباض شدید در صورت هشدار سیستم
-                }
-
-                double rawMultiplier = (1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor) * trendConfidence;
-                double mMultiplier = Math.max(0.5, Math.min(rawMultiplier, 5.0)); // حداقل فاصله کمتر برای واکنش سریع‌تر
+                double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
+                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                
-                // استفاده از آلفای بالاتر (0.20) برای چابکی بیشتر در بروزرسانی فاصله خط زرد
-                smoothedDistance = 0.20 * rawDistance + 0.80 * smoothedDistance;
+                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
                 event.pc0 = emaPc0;
                 event.evr = emaEvr;
@@ -325,48 +338,61 @@ public class HftRegimeDetection {
 
                 double currentLineVal;
 
-                // ۳. منطق جدید تغییر فاز با استفاده از تقاطع قیمت و شیب روند
-                if (currentMarketRegime == 1) { // روند فعلی: صعودی
+                if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
-                    // شرط خروج زودهنگام (Early Exit): 
-                    // شیب منفی معنادار شده + مدل HMM روند را ضعیف می‌داند
-                    boolean isTrendExhausted = (pc0Slope < -(event.vress * 0.5)) && (emaProbTrend < 0.5);
-                    
-                    if (event.price < currentLineVal || isTrendExhausted) {
-                        currentMarketRegime = -1; // چرخش به نزولی
+                    if (event.price < currentLineVal) {
+                        currentMarketRegime = -1; 
                         currentLineVal = event.bandUpper; 
                     }
-                } else { // روند فعلی: نزولی
+                } else { 
                     double proposedResistance = event.bandUpper;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
-                    // شرط خروج زودهنگام در روند نزولی: شیب مثبت معنادار
-                    boolean isTrendExhausted = (pc0Slope > (event.vress * 0.5)) && (emaProbTrend < 0.5);
-                    
-                    if (event.price > currentLineVal || isTrendExhausted) {
-                        currentMarketRegime = 1; // چرخش به صعودی
+                    if (event.price > currentLineVal) {
+                        currentMarketRegime = 1; 
                         currentLineVal = event.bandLower; 
                     }
                 }
 
                 lastLogicalDistanceLine = currentLineVal;
                 event.ssaTrend = currentLineVal;
-                
-                // ذخیره مقدار برای استفاده در تیک بعدی (جهت محاسبه شیب)
-                lastEmaPc0 = emaPc0;
-
-                // -------------------------------------------------------------
-
                 event.regime = currentMarketRegime;
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
                 
+                // 🌟 قانون 2 و 3: Hard Flatline (فریز قطعی بر اساس دستور ماکرو)
+                if (macroL1Slope != 0.0) {
+                    // اگر شیب ماکرو صعودی است اما تیک‌دیتا نزولی است (یا برعکس) -> فریز کامل
+                    if ((macroL1Slope > 0 && velocity < 0) || (macroL1Slope < 0 && velocity > 0)) {
+                        event.value2 = lastValue2; 
+                    } else {
+                        event.value2 = emaPc0;     
+                        lastValue2 = emaPc0;
+                    }
+                } else {
+                    // در صورت قطعی اتصال پایتون
+                    if (velocity < 0) {
+                        event.value2 = lastValue2; 
+                    } else {
+                        event.value2 = emaPc0;
+                        lastValue2 = emaPc0;
+                    }
+                }
+                
+                lastEmaPc0 = emaPc0;
+
+                // =========================================================================
+                // 🌟 پیاده‌سازی منطق مقاله: Trend-following execution logic
+                // =========================================================================
                 event.momentumSignal = event.price - event.pc0;
+
+                double CRISIS_THRESHOLD = 0.40; 
+                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
 
                 double TREND_P_STAR = 0.70;
                 double weight = 0.0;
@@ -405,9 +431,10 @@ public class HftRegimeDetection {
                 event.positionSize = 0.0;
                 event.dynamicStopLoss = 0.0;
                 event.crisisCapActive = 0;
-
-                // مقداردهی اولیه برای جلوگیری از پرش بزرگ در محاسبه شیب اولین تیکِ معتبر
+                
+                event.value2 = event.price;
                 lastEmaPc0 = event.price;
+                lastValue2 = event.price;
             }
 
             // --- محاسبه لیاپانوف ---
@@ -468,7 +495,8 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                // 🌟 دقیقاً 25 پارامتر مطابق با init.sql جدید شما
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
             } catch (SQLException e) {
                 System.err.println("\n🔴 CRITICAL: ClickHouse Failed: " + e.getMessage());
@@ -497,13 +525,14 @@ public class HftRegimeDetection {
                 statement.setInt(15, event.hmmRegime);
                 statement.setDouble(16, event.hmmProbTrend);
                 statement.setDouble(17, event.hmmProbCrisis);
-                
-                statement.setDouble(18, event.momentumSignal);
-                statement.setDouble(19, event.regimeWeight);
-                statement.setDouble(20, event.gatedMomentum);
-                statement.setDouble(21, event.positionSize);
-                statement.setDouble(22, event.dynamicStopLoss);
-                statement.setInt(23, event.crisisCapActive);
+                statement.setDouble(18, event.value2);
+                statement.setDouble(19, event.domCycle);
+                statement.setDouble(20, event.momentumSignal);
+                statement.setDouble(21, event.regimeWeight);
+                statement.setDouble(22, event.gatedMomentum);
+                statement.setDouble(23, event.positionSize);
+                statement.setDouble(24, event.dynamicStopLoss);
+                statement.setInt(25, event.crisisCapActive);
                 
                 statement.addBatch();
                 currentBatchSize++;
@@ -578,6 +607,38 @@ public class HftRegimeDetection {
         });
         zmqThread.setDaemon(true);
         zmqThread.start();
+
+        // 🌟 شنونده جدید برای موتور ماکرو پایتون (پورت 5556)
+        Thread zmqMacroThread = new Thread(() -> {
+            try (ZContext context = new ZContext()) {
+                ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
+                String zmqHost = System.getenv("MACRO_ZMQ_HOST");
+                if (zmqHost == null || zmqHost.trim().isEmpty()) zmqHost = "localhost";
+                String zmqPort = System.getenv("MACRO_ZMQ_PORT");
+                if (zmqPort == null || zmqPort.trim().isEmpty()) zmqPort = "5556";
+                
+                String address = "tcp://" + zmqHost + ":" + zmqPort;
+                subscriber.connect(address);
+                subscriber.subscribe(new byte[0]); 
+                
+                System.out.println("🔗 Python Macro L1 Subscriber active on " + address);
+                
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        String msg = subscriber.recvStr();
+                        if (msg != null && msg.startsWith("MACRO_TREND|")) {
+                            String[] parts = msg.substring(12).trim().split(",");
+                            if (parts.length >= 2) {
+                                macroL1Value = Double.parseDouble(parts[0]);
+                                macroL1Slope = Double.parseDouble(parts[1]);
+                            }
+                        }
+                    } catch (Exception ex) { }
+                }
+            } catch (Exception e) {}
+        });
+        zmqMacroThread.setDaemon(true);
+        zmqMacroThread.start();
 
         Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 1024, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new BusySpinWaitStrategy());
         disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
