@@ -360,30 +360,58 @@ public class HftRegimeDetection {
                 event.hmmProbCrisis = emaProbCrisis;
                 
                 // =========================================================================
-                // 🌟 THE GAME CHANGER: KINEMATIC RATCHET (چرخ‌دنده سینماتیک)
+                // 🌟 THE GAME CHANGER: MACRO-GRAVITATIONAL SUPERTREND (MG-SSA)
                 // =========================================================================
-                if (projectedMacroSlope != 0.0) {
-                    if (projectedMacroSlope > 0) {
-                        // بازار ماهیتاً صعودی است -> خط زرد فقط حق دارد بالا برود (پله‌های رو به بالا)
-                        if (emaPc0 > lastValue2) {
-                            event.value2 = emaPc0;
-                            lastValue2 = emaPc0;
+                // ۱. محاسبه کشش جاذبه ماکرو (Macro Bias): فاصله تیک‌دیتا تا فرمانده پایتون
+                double macroBias = event.price - macroL1Value; 
+                
+                // ۲. فاصله گرفتن هوشمند خط زرد از قیمت
+                // هرچه قیمت زیر L1 ماکرو فرو رود، خط زرد ضخیم‌تر/دورتر می‌شود تا نویزهای فیک به آن برخورد نکنند
+                double dynamicDistance = smoothedDistance;
+                if (macroL1Value != 0.0) {
+                    dynamicDistance = smoothedDistance * (1.0 + (Math.abs(macroBias) / event.price) * 500.0);
+                }
+
+                boolean strongBear = (projectedMacroSlope < 0) && (macroBias < 0);
+                boolean strongBull = (projectedMacroSlope > 0) && (macroBias > 0);
+
+                if (macroL1Value != 0.0) {
+                    if (strongBear) {
+                        // بازار خرسی قطعی: خط زرد تبدیل به یک مقاومت (سقف) می‌شود که در فاصله‌ای *بالای* قیمت قرار دارد
+                        double proposedCeiling = emaPc0 + dynamicDistance;
+                        
+                        if (lastValue2 == 0.0 || event.price > lastValue2) {
+                            event.value2 = proposedCeiling; // قیمت خط را رو به بالا شکست (تغییر فاز)
                         } else {
-                            event.value2 = lastValue2; // فریز کردن ریزش‌های فیک
-                            isRatchetFrozen = true;
+                            // چرخ‌دنده نزولی: خط زرد فقط می‌تواند پایین بیاید یا فریز (Flatline) شود
+                            event.value2 = Math.min(lastValue2, proposedCeiling); 
                         }
-                    } else {
-                        // بازار ماهیتاً نزولی است -> خط زرد فقط حق دارد پایین بیاید (پله‌های رو به پایین)
-                        if (emaPc0 < lastValue2) {
-                            event.value2 = emaPc0;
-                            lastValue2 = emaPc0;
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } 
+                    else if (strongBull) {
+                        // بازار گاوی قطعی: خط زرد تبدیل به یک حمایت (کف) می‌شود که در فاصله‌ای *پایین* قیمت قرار دارد
+                        double proposedFloor = emaPc0 - dynamicDistance;
+                        
+                        if (lastValue2 == 0.0 || event.price < lastValue2) {
+                            event.value2 = proposedFloor; // قیمت خط را رو به پایین شکست (تغییر فاز)
                         } else {
-                            event.value2 = lastValue2; // فریز کردن پرش‌های فیک
+                            // چرخ‌دنده صعودی: خط زرد فقط می‌تواند بالا برود یا فریز (Flatline) شود
+                            event.value2 = Math.max(lastValue2, proposedFloor);
+                        }
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } 
+                    else {
+                        // منطقه درگیری (ترانزیشن): فریز کامل خط زرد تا زمان مشخص شدن مسیر ماکرو
+                        double velocity = emaPc0 - lastEmaPc0;
+                        if ((macroL1Slope < 0 && velocity > 0) || (macroL1Slope > 0 && velocity < 0)) {
+                            event.value2 = lastValue2; 
                             isRatchetFrozen = true;
+                        } else {
+                            event.value2 = emaPc0;
                         }
                     }
                 } else {
-                    // در صورت قطعی پایتون، منطق ساده
+                    // در صورت قطعی اتصال پایتون (Fall-back)
                     double velocity = emaPc0 - lastEmaPc0;
                     if (velocity < 0) {
                         event.value2 = lastValue2; 
@@ -395,6 +423,7 @@ public class HftRegimeDetection {
                 }
                 
                 lastEmaPc0 = emaPc0;
+                lastValue2 = event.value2;
 
                 // =========================================================================
                 
@@ -415,8 +444,8 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | Macro Proj: %+.4f | Micro Pos: %.0f%%\n", 
-                                      event.price, projectedMacroSlope, (event.positionSize * 100.0));
+                    System.out.printf("\n[DEBUG] Price: %.2f | L1_Val: %.2f | MacroBias: %+.2f | Proj Slope: %+.4f | Val2: %.2f\n", 
+                                      event.price, macroL1Value, macroBias, projectedMacroSlope, event.value2);
                 }
                 
             } else {
