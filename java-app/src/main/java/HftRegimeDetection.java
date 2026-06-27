@@ -95,9 +95,10 @@ public class HftRegimeDetection {
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
 
-        // متغیرهای لازم برای محاسبه شیب و شتاب (ایده Game Changer)
+        // 🌟 متغیرهای Game Changer برای قفل فاز و فیلترهای بدون زنگ‌زدگی
         private double lastEmaPc0 = 0.0;
-        private double lastVelocity = 0.0;
+        private double smoothedDomCycle = 0.0;
+        private int lockedL = 0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -180,7 +181,6 @@ public class HftRegimeDetection {
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
             priceHistory[head] = event.price;
             
-            // 🌟 استخراج dom_cycle دقیقاً مشابه پایتون
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
             
             if (!probInitialized) {
@@ -191,8 +191,23 @@ public class HftRegimeDetection {
                 emaProbTrend = 0.05 * currentProbTrend + 0.95 * emaProbTrend;
                 emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
             }
-            
-            int L = Math.max(4, (int) Math.round(domCycle / 2.0));
+
+            // =======================================================
+            // 🌟 GAME CHANGER 1: Phase-Locked SSA (قفل کردن ابعاد ماتریس)
+            // ریشه تمام پرش‌ها و پله‌پله شدنِ SVD اینجاست. 
+            // با اعمال Hysteresis، اجازه نمیدهیم ابعاد ماتریس مدام تغییر کند.
+            // =======================================================
+            if (smoothedDomCycle == 0.0) smoothedDomCycle = domCycle;
+            smoothedDomCycle = 0.05 * domCycle + 0.95 * smoothedDomCycle;
+
+            int proposedL = Math.max(4, (int) Math.round(smoothedDomCycle / 2.0));
+            if (lockedL == 0) {
+                lockedL = proposedL;
+            } else if (Math.abs(proposedL - lockedL) >= 2) { 
+                // ماتریس فقط وقتی تغییر سایز میدهد که شیفت اساسی در سیکل بازار رخ دهد
+                lockedL = proposedL; 
+            }
+            int L = lockedL;
             int N_ssa = L * 2;
             
             if (count >= N_ssa - 1) {
@@ -256,37 +271,38 @@ public class HftRegimeDetection {
                 }
 
                 // =======================================================
-                // 🌟 GAME CHANGER 1: Adaptive Alpha (آلفای تطبیق‌پذیر)
-                // به جای مقدار ثابت، سرعت واکنش خط زرد را به ضربان بازار (domCycle) گره می‌زنیم
+                // 🌟 GAME CHANGER 2: Eigen-Adaptive 1st-Order Filter
+                // حذف فیلترهای درجه-دو (که باعث Overshoot و آن شاخک‌ها در عکس میشد).
+                // استفاده از فیلتر درجه‌یک با سرعتِ متغیر وابسته به قدرت روند SVD.
                 // =======================================================
-                double adaptPeriod = Math.max(4.0, domCycle / 2.0);
-                double alphaPc0 = 2.0 / (adaptPeriod + 1.0);
                 double alphaMetrics = 0.05;  
+                emaEvr = (emaEvr == 0.0) ? rawEvr : alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
+                emaGapFactor = (emaGapFactor == 0.0) ? rawGapFactor : alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
 
-                // ساختار کلاسیکِ پایدار حفظ شد تا هیچ پرشی نداشته باشیم
+                double evrFactor = Math.min(emaEvr / 100.0, 1.0);
+                // اگر EVR بالا باشد (روند خالص)، فیلتر سریع آپدیت می‌شود (بدون تاخیر).
+                // اگر EVR پایین باشد (نویز)، آلفا کوچک شده و خط کاملاً صاف (Smooth) می‌شود.
+                double adaptiveAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2); 
+
                 if (emaPc0 == 0.0) {
                     emaPc0 = rawPc0;
-                    emaEvr = rawEvr;
-                    emaGapFactor = rawGapFactor;
                 } else {
-                    emaPc0 = alphaPc0 * rawPc0 + (1.0 - alphaPc0) * emaPc0;
-                    emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
-                    emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
+                    emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
                 }
 
                 // =======================================================
-                // 🌟 GAME CHANGER 2: Voss Predictive Trigger (پیش‌بینی قیمت)
-                // از تاخیر فاز (domCycle/8) استفاده می‌کنیم تا قیمت آینده را پیش‌بینی کنیم
+                // 🌟 GAME CHANGER 3: Voss Price Projection (پرتاب قیمت به آینده)
+                // به جای فیلتر کردن خروجی کند، فرمول 3.5 و 2.5 پایتون را روی قیمت پیاده میکنیم!
+                // این یک سیستم راداری میسازد که اگر قیمت در آینده قرار است خط را قطع کند، همین الان می‌فهمد.
                 // =======================================================
-                int vossDelay = Math.max(1, (int) Math.round(domCycle / 8.0));
+                int vossDelay = Math.max(1, (int) Math.round(smoothedDomCycle / 8.0));
                 double delayedPrice = event.price;
                 if (count > vossDelay) {
                     delayedPrice = priceHistory[(head - vossDelay + MAX_CAPACITY) % MAX_CAPACITY];
                 }
-                // اگر projectedPrice خط ما را قطع کند، زودتر از قیمت واقعی سیگنال می‌دهد!
                 double projectedPrice = 3.5 * event.price - 2.5 * delayedPrice;
                 
-                // محاسبه سرعت استخوان‌بندی خالص (Slope)
+                // محاسبه شتاب استخوان‌بندی خالص
                 double velocity = emaPc0 - lastEmaPc0;
 
                 double currentResidual = event.price - emaPc0;
@@ -312,34 +328,22 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                // =======================================================
-                // 🌟 GAME CHANGER 3: Magnetic Bands (باندهای مغناطیسی)
-                // اگر روند فعلی ما با شیب خالص در تضاد باشد (Trend Exhaustion)،
-                // باندها فورا جمع می‌شوند تا با کوچکترین پولبک خارج شویم.
-                // =======================================================
-                boolean isExhausted = false;
-                if (currentMarketRegime == 1 && velocity < 0) {
-                    isExhausted = true; // روند صعودی است اما استخوان‌بندی به سمت پایین خم شده
-                } else if (currentMarketRegime == -1 && velocity > 0) {
-                    isExhausted = true; // روند نزولی است اما استخوان‌بندی در حال بالا آمدن است
-                }
+                // ❄️ انقباض مغناطیسی: اگر شیب روند مخالف وضعیت ما شد، باندها سریعاً جمع می‌شوند
+                boolean isExhausted = (currentMarketRegime == 1 && velocity < 0) || (currentMarketRegime == -1 && velocity > 0);
 
-                double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
                 double alpha = 4.0; 
                 double beta = 2.0;  
-                
                 double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
                 
-                // انقباض شدید: اگر روند خسته شده است، باند را 5 برابر کوچکتر کن!
                 if (isExhausted) {
-                    rawMultiplier *= 0.2; 
+                    rawMultiplier *= 0.2; // آهنربای خروج: خطوط به قیمت می‌چسبند!
                 }
 
                 double mMultiplier = Math.max(0.1, Math.min(rawMultiplier, 5.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
+                smoothedDistance = 0.10 * rawDistance + 0.90 * smoothedDistance;
 
                 event.pc0 = emaPc0;
                 event.evr = emaEvr;
@@ -350,13 +354,12 @@ public class HftRegimeDetection {
 
                 double currentLineVal;
 
-                // منطق تقاطع: هم قیمت واقعی چک می‌شود، هم قیمت پیش‌بینی شده!
+                // منطق تقاطع راداری: تقاطع قیمت فعلی OR قیمت پیش‌بینی شده در آینده!
                 if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
-                    // ترکیب تقاطع فیزیکی و تقاطع پیش‌بینی‌شده (Zero-lag)
                     if (event.price < currentLineVal || projectedPrice < currentLineVal) {
                         currentMarketRegime = -1; 
                         currentLineVal = event.bandUpper; 
@@ -374,9 +377,6 @@ public class HftRegimeDetection {
 
                 lastLogicalDistanceLine = currentLineVal;
                 event.ssaTrend = currentLineVal;
-                
-                // ذخیره متغیرها برای مشتق‌گیری در تیک بعدی
-                lastVelocity = velocity;
                 lastEmaPc0 = emaPc0;
 
                 event.regime = currentMarketRegime;
@@ -462,7 +462,6 @@ public class HftRegimeDetection {
                 }
             }
 
-            // فریز نهایی: ترکیب آشوب لیاپانوف با شرایط خستگی روند (Quantum Freeze پایتون)
             double pc0Slope = emaPc0 - lastEmaPc0;
             boolean isSsaFrozen = (currentMarketRegime == 1 && pc0Slope < 0) || (currentMarketRegime == -1 && pc0Slope > 0);
             
