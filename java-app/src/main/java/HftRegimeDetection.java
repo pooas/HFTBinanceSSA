@@ -60,7 +60,7 @@ public class HftRegimeDetection {
         
         private final QuantDSP.MesaStrategyMEE mesaStrategy = new QuantDSP.MesaStrategyMEE(8.0, 330.0, 150, 5, 3);
         
-        // 🌟 GAME CHANGER: استفاده از فیلتر نرم‌کننده برای از بین بردن پرش‌های ماتریس SSA
+        // فیلتر نرم‌کننده برای از بین بردن پرش‌های ماتریس SSA
         private final QuantDSP.DynamicSuperSmoother pc0Smoother = new QuantDSP.DynamicSuperSmoother();
         
         private final int MAX_CAPACITY = 1000;
@@ -99,6 +99,11 @@ public class HftRegimeDetection {
         private boolean probInitialized = false;
 
         private double lastEmaPc0 = 0.0;
+        
+        // 🌟 اضافه شدن متغیرهای مربوط به Game Changer (Value2 و تاریخچه خط روند)
+        private final double[] pc0History = new double[1024];
+        private int pc0Head = 0;
+        private double lastValue2 = 0.0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -180,6 +185,8 @@ public class HftRegimeDetection {
         @Override
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
             priceHistory[head] = event.price;
+            
+            // 🌟 1. استخراج dom_cycle دقیقاً مشابه پایتون
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
             
             if (!probInitialized) {
@@ -256,12 +263,44 @@ public class HftRegimeDetection {
 
                 double alphaMetrics = 0.05;  
                 
-                // 🌟 GAME CHANGER CORE: جایگزینی EMAی ساده با SuperSmoother 🌟
-                // این کار پرش‌های SVD را فیلتر کرده و خطی به نرمی ابریشم (Buttery Smooth) تحویل می‌دهد
+                // خطی به نرمی ابریشم با فیلتر SuperSmoother
                 emaPc0 = pc0Smoother.update(rawPc0, Math.max(4.0, domCycle / 2.0));
                 
                 emaEvr = (emaEvr == 0.0) ? rawEvr : alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
                 emaGapFactor = (emaGapFactor == 0.0) ? rawGapFactor : alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
+
+                // ذخیره تاریخچه برای فیلتر پیش‌بین
+                pc0Head = (pc0Head + 1) % 1024;
+                pc0History[pc0Head] = emaPc0;
+
+                // =======================================================
+                // 🌟 GAME CHANGER CORE: ترکیب Value2 و Dom_Cycle
+                // =======================================================
+                
+                // محاسبه تاخیر کسر دار (Fractional Delay) بر اساس ضربان بازار (dom_cycle)
+                double delayFloat = Math.max(2.0, domCycle / 8.0);
+                int delayInt = (int) delayFloat;
+                double delayFrac = delayFloat - delayInt;
+
+                double pastVal;
+                if (count > delayInt + 1) {
+                    int idx1 = (pc0Head - delayInt + 1024) % 1024;
+                    int idx2 = (pc0Head - delayInt - 1 + 1024) % 1024;
+                    pastVal = (1.0 - delayFrac) * pc0History[idx1] + delayFrac * pc0History[idx2];
+                } else {
+                    pastVal = emaPc0;
+                }
+
+                // فیلتر پیش‌بین (Voss Predictive Filter -> Value2)
+                // این فیلتر تاخیر را کاملا صفر کرده و نوک پیکان روند را نشان می‌دهد
+                double value2 = 3.5 * emaPc0 - 2.5 * pastVal;
+                double v2Slope = value2 - lastValue2;
+                lastValue2 = value2;
+
+                // شیب استخوان‌بندی خالص SSA
+                double pc0Slope = emaPc0 - lastEmaPc0;
+                
+                // =======================================================
 
                 double currentResidual = event.price - emaPc0;
                 residualHistory[residualHead] = currentResidual;
@@ -304,21 +343,30 @@ public class HftRegimeDetection {
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
-                // 🌟 ترکیب ایده پایتون: محاسبه شیب روندِ نرم شده 🌟
-                double pc0Slope = emaPc0 - lastEmaPc0;
-                double slopeThreshold = noiseStdDev * 0.1; // یک آستانه تحمل نویز برای جلوگیری از سیگنال درجا
-
+                double slopeThreshold = noiseStdDev * 0.1; 
                 double currentLineVal;
+
+                // ❄️ کلید قطع و وصل کوانتومی (فریز کردن روند) از ایده پایتون
+                boolean isSsaFrozen = false;
+                if (currentMarketRegime == 1 && pc0Slope < 0) {
+                    isSsaFrozen = true; // شیب روند استخوان‌بندی نزولی شد، سیستم فریز می‌شود
+                } else if (currentMarketRegime == -1 && pc0Slope > 0) {
+                    isSsaFrozen = true; // شیب روند صعودی شد، فریز
+                }
 
                 if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
-                    // ترکیب شرط برخورد کلاسیک + شرط تغییر جهت شیب (ایده پایتون)
-                    boolean slopeReversed = pc0Slope < -slopeThreshold;
+                    // ترکیب سه شرط برای خروج هوشمند (Zero-lag Exit):
+                    // 1. برخورد کلاسیک قیمت با خط زرد
+                    // 2. فیلتر value2 پیش‌بینی ریزش کند (value2 به زیر خط حمایت نفوذ کند)
+                    // 3. شیب خالص SSA فریز/معکوس شود (ایده اصلی پایتون)
+                    boolean predictiveReversal = (value2 < currentLineVal) && (v2Slope < -slopeThreshold);
+                    boolean slopeReversed = (pc0Slope < -slopeThreshold) || isSsaFrozen;
                     
-                    if (event.price < currentLineVal || slopeReversed) {
+                    if (event.price < currentLineVal || predictiveReversal || slopeReversed) {
                         currentMarketRegime = -1; 
                         currentLineVal = event.bandUpper; 
                     }
@@ -327,10 +375,10 @@ public class HftRegimeDetection {
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
-                    // ترکیب شرط برخورد کلاسیک + شرط تغییر جهت شیب (ایده پایتون)
-                    boolean slopeReversed = pc0Slope > slopeThreshold;
+                    boolean predictiveReversal = (value2 > currentLineVal) && (v2Slope > slopeThreshold);
+                    boolean slopeReversed = (pc0Slope > slopeThreshold) || isSsaFrozen;
                     
-                    if (event.price > currentLineVal || slopeReversed) {
+                    if (event.price > currentLineVal || predictiveReversal || slopeReversed) {
                         currentMarketRegime = 1; 
                         currentLineVal = event.bandLower; 
                     }
@@ -425,7 +473,7 @@ public class HftRegimeDetection {
                 }
             }
 
-            // ترکیب فریز سیستم پایتون: اگر شیب روند مخالف وضعیت فعلی بود، سیستم را فریز کن
+            // ترکیب فریز لیاپانوف با فریز شیب روند
             double pc0Slope = emaPc0 - lastEmaPc0;
             boolean isSsaFrozen = (currentMarketRegime == 1 && pc0Slope < 0) || (currentMarketRegime == -1 && pc0Slope > 0);
             
