@@ -48,6 +48,11 @@ public class HftRegimeDetection {
         public double vress;
         public double eigenGap;
 
+        // خروجی‌های همراستا با گرافانا
+        public double value2;
+        public double dominantCycle;
+
+        // سیگنال‌های مقاله
         public double momentumSignal;
         public double regimeWeight;
         public double gatedMomentum;
@@ -99,6 +104,14 @@ public class HftRegimeDetection {
         private double lastEmaPc0 = 0.0;
         private double smoothedDomCycle = 0.0;
         private int lockedL = 0;
+        
+        // 🌟 متغیرهای محافظ CPU (کلاچ SVD) و فریز گرافانا
+        private long lastSvdTime = 0;
+        private double lastSvdPrice = 0.0;
+        private double lastRawPc0 = 0.0;
+        private double lastRawEvr = 0.0;
+        private double lastRawGapFactor = 0.0;
+        private double lastValue2 = 0.0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -192,11 +205,6 @@ public class HftRegimeDetection {
                 emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
             }
 
-            // =======================================================
-            // 🌟 GAME CHANGER 1: Phase-Locked SSA (قفل کردن ابعاد ماتریس)
-            // ریشه تمام پرش‌ها و پله‌پله شدنِ SVD اینجاست. 
-            // با اعمال Hysteresis، اجازه نمیدهیم ابعاد ماتریس مدام تغییر کند.
-            // =======================================================
             if (smoothedDomCycle == 0.0) smoothedDomCycle = domCycle;
             smoothedDomCycle = 0.05 * domCycle + 0.95 * smoothedDomCycle;
 
@@ -204,84 +212,93 @@ public class HftRegimeDetection {
             if (lockedL == 0) {
                 lockedL = proposedL;
             } else if (Math.abs(proposedL - lockedL) >= 2) { 
-                // ماتریس فقط وقتی تغییر سایز میدهد که شیفت اساسی در سیکل بازار رخ دهد
                 lockedL = proposedL; 
             }
             int L = lockedL;
             int N_ssa = L * 2;
             
             if (count >= N_ssa - 1) {
-                int K = N_ssa - L + 1;
-                double[] data = new double[N_ssa];
-                for (int i = 0; i < N_ssa; i++) {
-                    data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
-                }
                 
-                double mean = 0.0;
-                for (int i = 0; i < N_ssa; i++) mean += data[i];
-                mean /= N_ssa;
+                // 🌟 استفاده از کلاچ برای جلوگیری از لگ جاوا
+                boolean runSvd = false;
+                long now = System.currentTimeMillis();
+                if (now - lastSvdTime > 250 || Math.abs(event.price - lastSvdPrice) >= 0.5) {
+                    runSvd = true;
+                }
 
-                double frobeniusSq = 0.0;
-                SimpleMatrix X = new SimpleMatrix(L, K);
-                for (int j = 0; j < K; j++) {
-                    for (int i = 0; i < L; i++) {
-                        double val = data[j + i] - mean;
-                        X.set(i, j, val);
-                        frobeniusSq += val * val; 
+                double rawPc0 = lastRawPc0;
+                double rawEvr = lastRawEvr;
+                double rawGapFactor = lastRawGapFactor;
+
+                if (runSvd) {
+                    int K = N_ssa - L + 1;
+                    double[] data = new double[N_ssa];
+                    for (int i = 0; i < N_ssa; i++) {
+                        data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
                     }
-                }
-                
-                double rawPc0, rawEvr, rawGapFactor;
+                    
+                    double mean = 0.0;
+                    for (int i = 0; i < N_ssa; i++) mean += data[i];
+                    mean /= N_ssa;
 
-                if (frobeniusSq < 1e-10) {
-                    rawPc0 = mean;
-                    rawEvr = 100.0; 
-                    rawGapFactor = 0.0;
-                } else {
-                    SimpleSVD<SimpleMatrix> svd = X.svd();
-                    SimpleMatrix U = svd.getU();
-                    SimpleMatrix V = svd.getV();
-                    SimpleMatrix W = svd.getW();
-                    
-                    int numSingularValues = Math.min(L, K);
-                    double sigma0 = -1.0;
-                    int maxIndex = 0;
-                    
-                    double[] sigmas = new double[numSingularValues];
-                    for (int c = 0; c < numSingularValues; c++) {
-                        double s = Math.abs(W.get(c, c));
-                        sigmas[c] = s;
-                        if (s > sigma0) {
-                            sigma0 = s;
-                            maxIndex = c;
+                    double frobeniusSq = 0.0;
+                    SimpleMatrix X = new SimpleMatrix(L, K);
+                    for (int j = 0; j < K; j++) {
+                        for (int i = 0; i < L; i++) {
+                            double val = data[j + i] - mean;
+                            X.set(i, j, val);
+                            frobeniusSq += val * val; 
                         }
                     }
-                    
-                    double sigma1 = 0.0;
-                    for (int c = 0; c < numSingularValues; c++) {
-                        if (c != maxIndex && sigmas[c] > sigma1) {
-                            sigma1 = sigmas[c];
+
+                    if (frobeniusSq < 1e-10) {
+                        rawPc0 = mean;
+                        rawEvr = 100.0; 
+                        rawGapFactor = 0.0;
+                    } else {
+                        SimpleSVD<SimpleMatrix> svd = X.svd();
+                        SimpleMatrix U = svd.getU();
+                        SimpleMatrix V = svd.getV();
+                        SimpleMatrix W = svd.getW();
+                        
+                        int numSingularValues = Math.min(L, K);
+                        double sigma0 = -1.0;
+                        int maxIndex = 0;
+                        
+                        double[] sigmas = new double[numSingularValues];
+                        for (int c = 0; c < numSingularValues; c++) {
+                            double s = Math.abs(W.get(c, c));
+                            sigmas[c] = s;
+                            if (s > sigma0) {
+                                sigma0 = s;
+                                maxIndex = c;
+                            }
                         }
+                        
+                        double sigma1 = 0.0;
+                        for (int c = 0; c < numSingularValues; c++) {
+                            if (c != maxIndex && sigmas[c] > sigma1) {
+                                sigma1 = sigmas[c];
+                            }
+                        }
+                        
+                        rawPc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
+                        rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
+                        double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
+                        rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                     }
-                    
-                    rawPc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
-                    rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
-                    double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
-                    rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
+                    lastRawPc0 = rawPc0;
+                    lastRawEvr = rawEvr;
+                    lastRawGapFactor = rawGapFactor;
+                    lastSvdTime = now;
+                    lastSvdPrice = event.price;
                 }
 
-                // =======================================================
-                // 🌟 GAME CHANGER 2: Eigen-Adaptive 1st-Order Filter
-                // حذف فیلترهای درجه-دو (که باعث Overshoot و آن شاخک‌ها در عکس میشد).
-                // استفاده از فیلتر درجه‌یک با سرعتِ متغیر وابسته به قدرت روند SVD.
-                // =======================================================
                 double alphaMetrics = 0.05;  
                 emaEvr = (emaEvr == 0.0) ? rawEvr : alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
                 emaGapFactor = (emaGapFactor == 0.0) ? rawGapFactor : alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
 
                 double evrFactor = Math.min(emaEvr / 100.0, 1.0);
-                // اگر EVR بالا باشد (روند خالص)، فیلتر سریع آپدیت می‌شود (بدون تاخیر).
-                // اگر EVR پایین باشد (نویز)، آلفا کوچک شده و خط کاملاً صاف (Smooth) می‌شود.
                 double adaptiveAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2); 
 
                 if (emaPc0 == 0.0) {
@@ -290,11 +307,6 @@ public class HftRegimeDetection {
                     emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
                 }
 
-                // =======================================================
-                // 🌟 GAME CHANGER 3: Voss Price Projection (پرتاب قیمت به آینده)
-                // به جای فیلتر کردن خروجی کند، فرمول 3.5 و 2.5 پایتون را روی قیمت پیاده میکنیم!
-                // این یک سیستم راداری میسازد که اگر قیمت در آینده قرار است خط را قطع کند، همین الان می‌فهمد.
-                // =======================================================
                 int vossDelay = Math.max(1, (int) Math.round(smoothedDomCycle / 8.0));
                 double delayedPrice = event.price;
                 if (count > vossDelay) {
@@ -302,7 +314,6 @@ public class HftRegimeDetection {
                 }
                 double projectedPrice = 3.5 * event.price - 2.5 * delayedPrice;
                 
-                // محاسبه شتاب استخوان‌بندی خالص
                 double velocity = emaPc0 - lastEmaPc0;
 
                 double currentResidual = event.price - emaPc0;
@@ -328,7 +339,6 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                // ❄️ انقباض مغناطیسی: اگر شیب روند مخالف وضعیت ما شد، باندها سریعاً جمع می‌شوند
                 boolean isExhausted = (currentMarketRegime == 1 && velocity < 0) || (currentMarketRegime == -1 && velocity > 0);
 
                 double alpha = 4.0; 
@@ -336,7 +346,7 @@ public class HftRegimeDetection {
                 double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
                 
                 if (isExhausted) {
-                    rawMultiplier *= 0.2; // آهنربای خروج: خطوط به قیمت می‌چسبند!
+                    rawMultiplier *= 0.2; 
                 }
 
                 double mMultiplier = Math.max(0.1, Math.min(rawMultiplier, 5.0));
@@ -354,7 +364,6 @@ public class HftRegimeDetection {
 
                 double currentLineVal;
 
-                // منطق تقاطع راداری: تقاطع قیمت فعلی OR قیمت پیش‌بینی شده در آینده!
                 if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
@@ -377,6 +386,16 @@ public class HftRegimeDetection {
 
                 lastLogicalDistanceLine = currentLineVal;
                 event.ssaTrend = currentLineVal;
+
+                // 🌟 شبیه‌ساز L1-Trend (ایجاد پله‌های گرافانا)
+                if (velocity < 0) {
+                    event.value2 = lastValue2; // فریز کردن خط 
+                } else {
+                    event.value2 = emaPc0;
+                    lastValue2 = emaPc0;
+                }
+                event.dominantCycle = domCycle;
+
                 lastEmaPc0 = emaPc0;
 
                 event.regime = currentMarketRegime;
@@ -427,7 +446,11 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = 0.0;
                 event.crisisCapActive = 0;
                 
+                event.value2 = event.price;
+                event.dominantCycle = 20.0;
+                
                 lastEmaPc0 = event.price;
+                lastValue2 = event.price;
             }
 
             // --- محاسبه لیاپانوف ---
@@ -491,7 +514,7 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
             } catch (SQLException e) {
                 System.err.println("\n🔴 CRITICAL: ClickHouse Failed: " + e.getMessage());
@@ -520,13 +543,14 @@ public class HftRegimeDetection {
                 statement.setInt(15, event.hmmRegime);
                 statement.setDouble(16, event.hmmProbTrend);
                 statement.setDouble(17, event.hmmProbCrisis);
-                
-                statement.setDouble(18, event.momentumSignal);
-                statement.setDouble(19, event.regimeWeight);
-                statement.setDouble(20, event.gatedMomentum);
-                statement.setDouble(21, event.positionSize);
-                statement.setDouble(22, event.dynamicStopLoss);
-                statement.setInt(23, event.crisisCapActive);
+                statement.setDouble(18, event.value2);
+                statement.setDouble(19, event.dominantCycle);
+                statement.setDouble(20, event.momentumSignal);
+                statement.setDouble(21, event.regimeWeight);
+                statement.setDouble(22, event.gatedMomentum);
+                statement.setDouble(23, event.positionSize);
+                statement.setDouble(24, event.dynamicStopLoss);
+                statement.setInt(25, event.crisisCapActive);
                 
                 statement.addBatch();
                 currentBatchSize++;
