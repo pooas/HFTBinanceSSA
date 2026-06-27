@@ -4,20 +4,20 @@
   "metadata": {
     "name": "33a7676e-fdc3-40de-b98a-0c9c63ae6c84",
     "namespace": "default",
-    "uid": "36ae9b1f-2c93-4c68-8a61-feab34c65409",
-    "resourceVersion": "1782293901826018",
+    "uid": "d4b520e6-00ba-4a4e-a0d7-402f3d9ef68f",
+    "resourceVersion": "1782544060777008",
     "generation": 1,
-    "creationTimestamp": "2026-06-24T09:38:21Z",
+    "creationTimestamp": "2026-06-27T07:07:40Z",
     "labels": {
-      "grafana.app/deprecatedInternalID": "2564523056377856"
+      "grafana.app/deprecatedInternalID": "3613765727010816"
     },
     "annotations": {
       "grafana.app/createdBy": "access-policy:service",
       "grafana.app/managedBy": "classic-file-provisioning",
       "grafana.app/managerId": "HFT Dashboards",
-      "grafana.app/sourceChecksum": "00b138105bed29c5c9d3ca436e5f977d",
+      "grafana.app/sourceChecksum": "985f6a9ce6c0877dfbabd43a9a825ce0",
       "grafana.app/sourcePath": "/etc/grafana/provisioning/dashboards/json/dashboard-HFTBinance.json",
-      "grafana.app/sourceTimestamp": "1782293830000",
+      "grafana.app/sourceTimestamp": "1782544005000",
       "grafana.app/folder": ""
     }
   },
@@ -798,6 +798,135 @@
             "version": "13.0.2"
           }
         }
+      },
+      "panel-6": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "PDEE91DDB90597936"
+                      },
+                      "group": "grafana-clickhouse-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorType": "sql",
+                        "format": 1,
+                        "meta": {
+                          "builderOptions": {
+                            "columns": [],
+                            "database": "",
+                            "limit": 1000,
+                            "mode": "list",
+                            "queryType": "table",
+                            "table": ""
+                          }
+                        },
+                        "pluginVersion": "4.18.0",
+                        "queryType": "table",
+                        "rawSql": "SELECT \n    timestamp,\n    hmm_regime AS \"رژیم C++ (0=آرام, 1=ترند, 2=بحران)\"\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY timestamp ASC"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "",
+          "id": 6,
+          "links": [],
+          "title": "New panel",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "barWidthFactor": 0.6,
+                    "drawStyle": "line",
+                    "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "linear",
+                    "lineWidth": 1,
+                    "pointSize": 5,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "auto",
+                    "showValues": false,
+                    "spanNulls": false,
+                    "stacking": {
+                      "group": "A",
+                      "mode": "none"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              },
+              "options": {
+                "annotations": {
+                  "clustering": -1,
+                  "multiLane": false
+                },
+                "legend": {
+                  "calcs": [],
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "single",
+                  "sort": "none"
+                }
+              }
+            },
+            "version": "13.0.2"
+          }
+        }
       }
     },
     "layout": {
@@ -835,12 +964,25 @@
             "spec": {
               "element": {
                 "kind": "ElementReference",
+                "name": "panel-6"
+              },
+              "height": 8,
+              "width": 21,
+              "x": 2,
+              "y": 8
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "element": {
+                "kind": "ElementReference",
                 "name": "panel-1"
               },
               "height": 11,
               "width": 24,
               "x": 0,
-              "y": 8
+              "y": 16
             }
           },
           {
@@ -853,7 +995,7 @@
               "height": 8,
               "width": 24,
               "x": 0,
-              "y": 19
+              "y": 27
             }
           },
           {
@@ -866,7 +1008,7 @@
               "height": 11,
               "width": 24,
               "x": 0,
-              "y": 27
+              "y": 35
             }
           }
         ]
