@@ -48,7 +48,6 @@ public class HftRegimeDetection {
         public double vress;
         public double eigenGap;
 
-        // فیلدهای جدید مربوط به اجرای استراتژی مقاله
         public double momentumSignal;
         public double regimeWeight;
         public double gatedMomentum;
@@ -96,7 +95,9 @@ public class HftRegimeDetection {
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
 
-        // 🌟 بازگرداندن کلاس ChaosMath که به اشتباه حذف شده بود
+        // متغیر جدید برای ذخیره مقدار قبلی PC0 جهت محاسبه شیب روند
+        private double lastEmaPc0 = 0.0;
+
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
                 int n = data.length;
@@ -287,16 +288,33 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
+                // محاسبه زودهنگام بحران برای استفاده در انقباض باندها
+                double CRISIS_THRESHOLD = 0.40; 
+                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
+
                 double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
                 double alpha = 4.0; 
                 double beta = 2.0;  
                 
-                double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
-                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
+                // --- استراتژی جدید: Zero-lag Reversal & Dynamic Tightening ---
+
+                // ۱. محاسبه شیب (Momentum) روند اصلی SSA
+                double pc0Slope = emaPc0 - lastEmaPc0;
+
+                // ۲. ضریب داینامیک هوشمند: کاهش فاصله باندها در زمان افت روند یا آشوب بازار
+                double trendConfidence = Math.max(0.1, emaProbTrend); 
+                if (currentRegimeShiftAlert || event.crisisCapActive == 1) {
+                    trendConfidence = 0.1; // انقباض شدید در صورت هشدار سیستم
+                }
+
+                double rawMultiplier = (1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor) * trendConfidence;
+                double mMultiplier = Math.max(0.5, Math.min(rawMultiplier, 5.0)); // حداقل فاصله کمتر برای واکنش سریع‌تر
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
+                
+                // استفاده از آلفای بالاتر (0.20) برای چابکی بیشتر در بروزرسانی فاصله خط زرد
+                smoothedDistance = 0.20 * rawDistance + 0.80 * smoothedDistance;
 
                 event.pc0 = emaPc0;
                 event.evr = emaEvr;
@@ -307,38 +325,48 @@ public class HftRegimeDetection {
 
                 double currentLineVal;
 
-                if (currentMarketRegime == 1) { 
+                // ۳. منطق جدید تغییر فاز با استفاده از تقاطع قیمت و شیب روند
+                if (currentMarketRegime == 1) { // روند فعلی: صعودی
                     double proposedSupport = event.bandLower;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
-                    if (event.price < currentLineVal) {
-                        currentMarketRegime = -1; 
+                    // شرط خروج زودهنگام (Early Exit): 
+                    // شیب منفی معنادار شده + مدل HMM روند را ضعیف می‌داند
+                    boolean isTrendExhausted = (pc0Slope < -(event.vress * 0.5)) && (emaProbTrend < 0.5);
+                    
+                    if (event.price < currentLineVal || isTrendExhausted) {
+                        currentMarketRegime = -1; // چرخش به نزولی
                         currentLineVal = event.bandUpper; 
                     }
-                } else { 
+                } else { // روند فعلی: نزولی
                     double proposedResistance = event.bandUpper;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
-                    if (event.price > currentLineVal) {
-                        currentMarketRegime = 1; 
+                    // شرط خروج زودهنگام در روند نزولی: شیب مثبت معنادار
+                    boolean isTrendExhausted = (pc0Slope > (event.vress * 0.5)) && (emaProbTrend < 0.5);
+                    
+                    if (event.price > currentLineVal || isTrendExhausted) {
+                        currentMarketRegime = 1; // چرخش به صعودی
                         currentLineVal = event.bandLower; 
                     }
                 }
 
                 lastLogicalDistanceLine = currentLineVal;
                 event.ssaTrend = currentLineVal;
+                
+                // ذخیره مقدار برای استفاده در تیک بعدی (جهت محاسبه شیب)
+                lastEmaPc0 = emaPc0;
+
+                // -------------------------------------------------------------
+
                 event.regime = currentMarketRegime;
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
                 
-                // پیاده‌سازی منطق مقاله: Trend-following execution logic
                 event.momentumSignal = event.price - event.pc0;
-
-                double CRISIS_THRESHOLD = 0.40; 
-                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
 
                 double TREND_P_STAR = 0.70;
                 double weight = 0.0;
@@ -377,6 +405,9 @@ public class HftRegimeDetection {
                 event.positionSize = 0.0;
                 event.dynamicStopLoss = 0.0;
                 event.crisisCapActive = 0;
+
+                // مقداردهی اولیه برای جلوگیری از پرش بزرگ در محاسبه شیب اولین تیکِ معتبر
+                lastEmaPc0 = event.price;
             }
 
             // --- محاسبه لیاپانوف ---
