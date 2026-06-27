@@ -26,9 +26,11 @@ public class HftRegimeDetection {
     public static volatile double currentProbTrend = 0.0;  
     public static volatile double currentProbCrisis = 0.0; 
     
-    // 🌟 دریافت مقادیر فرمانده (پایتون) از پورت 5556
+    // 🌟 متغیرهای فرمانده (پایتون) - مجهز به سیستم فیزیک سینماتیک
     public static volatile double macroL1Value = 0.0;
     public static volatile double macroL1Slope = 0.0;
+    public static volatile double macroL1Accel = 0.0;
+    public static volatile double projectedMacroSlope = 0.0;
 
     public static class TickEvent {
         public double price;
@@ -52,11 +54,9 @@ public class HftRegimeDetection {
         public double vress;
         public double eigenGap;
 
-        // 🌟 ستون‌های خنثی شده برای جلوگیری از ارور دیتابیس
         public double value2;
         public double domCycle;
 
-        // 🌟 فیلدهای مربوط به اجرای استراتژی مقاله
         public double momentumSignal;
         public double regimeWeight;
         public double gatedMomentum;
@@ -104,7 +104,6 @@ public class HftRegimeDetection {
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
 
-        // 🌟 متغیرهای مورد نیاز برای محاسبه شیب میکرو و فریز
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
 
@@ -190,9 +189,8 @@ public class HftRegimeDetection {
             priceHistory[head] = event.price;
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
             
-            // پر کردن مقادیر خنثی برای دیتابیس
             event.domCycle = domCycle;
-            event.value2 = 0.0;
+            boolean isRatchetFrozen = false;
             
             if (!probInitialized) {
                 emaProbTrend = currentProbTrend;
@@ -273,27 +271,23 @@ public class HftRegimeDetection {
                     emaEvr = rawEvr;
                     emaGapFactor = rawGapFactor;
                 } else {
-                    // محاسبه داینامیک فیلتر
                     emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
                     emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
                     
                     double evrFactor = Math.min(emaEvr / 100.0, 1.0);
                     double adaptiveAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
 
-                    // 🌟 قانون 1: Synergy (هم‌افزایی فرمانده و سرباز)
+                    // 🌟 هم‌افزایی با پیش‌بینی فیزیک (Synergy)
                     double rawMicroSlope = rawPc0 - lastEmaPc0;
-                    boolean isMacroBullish = macroL1Slope >= 0;
+                    boolean isMacroBullish = projectedMacroSlope >= 0;
                     boolean isMicroBullish = rawMicroSlope >= 0;
 
-                    // اگر پایتون (ماکرو) و جاوا (میکرو) هم‌جهت باشند، سرعت انطباق 2 برابر می‌شود
-                    if (macroL1Slope != 0.0 && (isMacroBullish == isMicroBullish)) {
+                    if (projectedMacroSlope != 0.0 && (isMacroBullish == isMicroBullish)) {
                         adaptiveAlpha = Math.min(1.0, adaptiveAlpha * 2.0); 
                     }
 
                     emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
                 }
-
-                double velocity = emaPc0 - lastEmaPc0;
 
                 double currentResidual = event.price - emaPc0;
                 residualHistory[residualHead] = currentResidual;
@@ -365,19 +359,35 @@ public class HftRegimeDetection {
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
                 
-                // 🌟 قانون 2 و 3: Hard Flatline (فریز قطعی بر اساس دستور ماکرو)
-                if (macroL1Slope != 0.0) {
-                    // اگر شیب ماکرو صعودی است اما تیک‌دیتا نزولی است (یا برعکس) -> فریز کامل
-                    if ((macroL1Slope > 0 && velocity < 0) || (macroL1Slope < 0 && velocity > 0)) {
-                        event.value2 = lastValue2; 
+                // =========================================================================
+                // 🌟 THE GAME CHANGER: KINEMATIC RATCHET (چرخ‌دنده سینماتیک)
+                // =========================================================================
+                if (projectedMacroSlope != 0.0) {
+                    if (projectedMacroSlope > 0) {
+                        // بازار ماهیتاً صعودی است -> خط زرد فقط حق دارد بالا برود (پله‌های رو به بالا)
+                        if (emaPc0 > lastValue2) {
+                            event.value2 = emaPc0;
+                            lastValue2 = emaPc0;
+                        } else {
+                            event.value2 = lastValue2; // فریز کردن ریزش‌های فیک
+                            isRatchetFrozen = true;
+                        }
                     } else {
-                        event.value2 = emaPc0;     
-                        lastValue2 = emaPc0;
+                        // بازار ماهیتاً نزولی است -> خط زرد فقط حق دارد پایین بیاید (پله‌های رو به پایین)
+                        if (emaPc0 < lastValue2) {
+                            event.value2 = emaPc0;
+                            lastValue2 = emaPc0;
+                        } else {
+                            event.value2 = lastValue2; // فریز کردن پرش‌های فیک
+                            isRatchetFrozen = true;
+                        }
                     }
                 } else {
-                    // در صورت قطعی اتصال پایتون
+                    // در صورت قطعی پایتون، منطق ساده
+                    double velocity = emaPc0 - lastEmaPc0;
                     if (velocity < 0) {
                         event.value2 = lastValue2; 
+                        isRatchetFrozen = true;
                     } else {
                         event.value2 = emaPc0;
                         lastValue2 = emaPc0;
@@ -387,13 +397,10 @@ public class HftRegimeDetection {
                 lastEmaPc0 = emaPc0;
 
                 // =========================================================================
-                // 🌟 پیاده‌سازی منطق مقاله: Trend-following execution logic
-                // =========================================================================
+                
                 event.momentumSignal = event.price - event.pc0;
-
                 double CRISIS_THRESHOLD = 0.40; 
                 event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
-
                 double TREND_P_STAR = 0.70;
                 double weight = 0.0;
 
@@ -408,8 +415,8 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Seq: %d | Price: %.2f | TrendProb: %.1f%% | GateWt: %.2f | PosSize: %.0f%% | StopDist: %.2f\n", 
-                                      sequence, event.price, (event.hmmProbTrend * 100.0), event.regimeWeight, (event.positionSize * 100.0), event.dynamicStopLoss);
+                    System.out.printf("\n[DEBUG] Price: %.2f | Macro Proj: %+.4f | Micro Pos: %.0f%%\n", 
+                                      event.price, projectedMacroSlope, (event.positionSize * 100.0));
                 }
                 
             } else {
@@ -470,7 +477,7 @@ public class HftRegimeDetection {
             }
 
             event.lambda = currentLambda;
-            event.isFrozen = currentRegimeShiftAlert;
+            event.isFrozen = currentRegimeShiftAlert || isRatchetFrozen;
 
             head = (head + 1) % MAX_CAPACITY;
             if (count < MAX_CAPACITY) count++;
@@ -493,7 +500,6 @@ public class HftRegimeDetection {
             
             String url = "jdbc:ch://" + host + ":8123/default?compress=0";
             
-            // 🌟 اضافه کردن مکانیزم Retry برای حل مشکل مسابقه در اجرای داکر (Race Condition)
             int retries = 10;
             while (retries > 0) {
                 try {
@@ -504,10 +510,10 @@ public class HftRegimeDetection {
                     break;
                 } catch (SQLException e) {
                     retries--;
-                    System.err.println("⏳ Waiting for ClickHouse to fully initialize... Retries left: " + retries);
+                    System.err.println("⏳ Waiting for ClickHouse... Retries left: " + retries);
                     try { Thread.sleep(3000); } catch (InterruptedException ie) {}
                     if (retries == 0) {
-                        System.err.println("\n🔴 CRITICAL: ClickHouse Failed to connect after retries: " + e.getMessage());
+                        System.err.println("\n🔴 CRITICAL: ClickHouse Failed to connect!");
                         System.exit(1); 
                     }
                 }
@@ -598,7 +604,7 @@ public class HftRegimeDetection {
                 subscriber.connect(address);
                 subscriber.subscribe(new byte[0]); 
                 
-                System.out.println("🔗 ZeroMQ Subscriber active on " + address);
+                System.out.println("🔗 C++ HMM Subscriber active on " + address);
                 
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
@@ -618,7 +624,7 @@ public class HftRegimeDetection {
         zmqThread.setDaemon(true);
         zmqThread.start();
 
-        // 🌟 شنونده جدید برای موتور ماکرو پایتون (پورت 5556)
+        // 🌟 شنونده هوش ماکرو (پایتون) مجهز به محاسبه شتاب
         Thread zmqMacroThread = new Thread(() -> {
             try (ZContext context = new ZContext()) {
                 ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
@@ -631,7 +637,7 @@ public class HftRegimeDetection {
                 subscriber.connect(address);
                 subscriber.subscribe(new byte[0]); 
                 
-                System.out.println("🔗 Python Macro L1 Subscriber active on " + address);
+                System.out.println("🔗 Python Macro-L1 Subscriber active on " + address);
                 
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
@@ -640,7 +646,14 @@ public class HftRegimeDetection {
                             String[] parts = msg.substring(12).trim().split(",");
                             if (parts.length >= 2) {
                                 macroL1Value = Double.parseDouble(parts[0]);
-                                macroL1Slope = Double.parseDouble(parts[1]);
+                                double newSlope = Double.parseDouble(parts[1]);
+                                
+                                // محاسبه شتاب و پیش‌بینی تیلور (شتاب + سرعت)
+                                if (macroL1Slope != 0.0) {
+                                    macroL1Accel = newSlope - macroL1Slope;
+                                }
+                                macroL1Slope = newSlope;
+                                projectedMacroSlope = macroL1Slope + macroL1Accel;
                             }
                         }
                     } catch (Exception ex) { }
