@@ -18,8 +18,8 @@ CREATE TABLE default.hft_market_data (
     hmm_regime Int8,
     hmm_prob_trend Float64,
     hmm_prob_crisis Float64,
-    value2 Float64,
-    dom_cycle Float64,
+    --value2 Float64,
+    --dom_cycle Float64,
 
     -- 🌟 ستون‌های خروجی قانون بیز و استراتژی مقاله
     momentum_signal Float64,      
