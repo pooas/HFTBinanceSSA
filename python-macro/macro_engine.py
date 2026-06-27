@@ -236,7 +236,7 @@ class BinanceLiveQuantBot:
                 await asyncio.sleep(3)
 
 if __name__ == "__main__":
-    bot = BinanceLiveQuantBot(symbol="BTCUSDT", interval="15m", history_limit=3000)
+    bot = BinanceLiveQuantBot(symbol="BTCUSDT", interval="1m", history_limit=3000)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(bot.run_binance_stream())
