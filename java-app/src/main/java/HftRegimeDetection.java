@@ -43,6 +43,24 @@ public class HftRegimeDetection {
         public double value2;
         public double dominantCycle;
         public int isFrozen;
+
+        // 🌟 فیلدهای قدیمی که در شمای دیتابیس وجود دارند
+        public double lambda;
+        public int regime;
+        public double bandUpper;
+        public double bandLower;
+        public double pc0;
+        public double evr;
+        public double vress;
+        public double eigenGap;
+
+        // 🌟 فیلدهای جدید مربوط به اجرای استراتژی مقاله
+        public double momentumSignal;
+        public double regimeWeight;
+        public double gatedMomentum;
+        public double positionSize;
+        public double dynamicStopLoss;
+        public int crisisCapActive;
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -206,6 +224,35 @@ public class HftRegimeDetection {
             event.hmmProbTrend = currentProbTrend;
             event.hmmProbCrisis = currentProbCrisis;
 
+            // پر کردن مقادیر قدیمی با صفر (برای همخوانی با دیتابیس بدون ارور)
+            event.lambda = 0.0;
+            event.regime = 0;
+            event.bandUpper = 0.0;
+            event.bandLower = 0.0;
+            event.pc0 = 0.0;
+            event.evr = 0.0;
+            event.vress = 0.0;
+            event.eigenGap = 0.0;
+
+            // 🌟 پیاده‌سازی منطق مقاله: Trend-following execution logic
+            event.momentumSignal = currentPrice - lastSsaTrend;
+
+            double CRISIS_THRESHOLD = 0.40; 
+            event.crisisCapActive = (currentProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
+
+            double TREND_P_STAR = 0.70;
+            double weight = 0.0;
+
+            if (event.crisisCapActive == 0 && currentProbTrend >= TREND_P_STAR) {
+                weight = Math.min(1.0, (currentProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR));
+            }
+            event.regimeWeight = weight;
+            event.gatedMomentum = event.momentumSignal * event.regimeWeight;
+
+            double MAX_POSITION = 1.0; 
+            event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
+            event.dynamicStopLoss = currentPrice * 0.01;
+
             head = (head + 1) % MAX_CAPACITY;
             if (count < MAX_CAPACITY) count++;
         }
@@ -229,7 +276,7 @@ public class HftRegimeDetection {
                 String url = "jdbc:ch://" + host + ":8123/default?compress=0";
                 this.connection = DriverManager.getConnection(url, user, password);
                 
-                String sql = "INSERT INTO hft_market_data (timestamp, price, volume, ssa_trend, is_frozen, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 this.statement = connection.prepareStatement(sql);
             } catch (SQLException e) {
                 System.err.println("\n🔴 CRITICAL: ClickHouse Failed: " + e.getMessage());
@@ -242,15 +289,30 @@ public class HftRegimeDetection {
             if (statement == null) return;
             try {
                 statement.setTimestamp(1, new java.sql.Timestamp(event.timestamp));
-                statement.setDouble(2, event.price);
-                statement.setDouble(3, event.volume);
-                statement.setDouble(4, event.ssaTrend);
-                statement.setInt(5, event.isFrozen);
-                statement.setInt(6, event.hmmRegime);
-                statement.setDouble(7, event.hmmProbTrend);
-                statement.setDouble(8, event.hmmProbCrisis);
-                statement.setDouble(9, event.value2);
-                statement.setDouble(10, event.dominantCycle);
+                statement.setLong(2, sequence);
+                statement.setDouble(3, event.price);
+                statement.setDouble(4, event.volume);
+                statement.setDouble(5, event.ssaTrend);
+                statement.setDouble(6, event.lambda);
+                statement.setInt(7, event.isFrozen);
+                statement.setInt(8, event.regime);
+                statement.setDouble(9, event.bandUpper);
+                statement.setDouble(10, event.bandLower);
+                statement.setDouble(11, event.pc0);
+                statement.setDouble(12, event.evr);
+                statement.setDouble(13, event.vress);
+                statement.setDouble(14, event.eigenGap);
+                statement.setInt(15, event.hmmRegime);
+                statement.setDouble(16, event.hmmProbTrend);
+                statement.setDouble(17, event.hmmProbCrisis);
+                statement.setDouble(18, event.value2);
+                statement.setDouble(19, event.dominantCycle);
+                statement.setDouble(20, event.momentumSignal);
+                statement.setDouble(21, event.regimeWeight);
+                statement.setDouble(22, event.gatedMomentum);
+                statement.setDouble(23, event.positionSize);
+                statement.setDouble(24, event.dynamicStopLoss);
+                statement.setInt(25, event.crisisCapActive);
                 
                 statement.addBatch();
                 currentBatchSize++;
