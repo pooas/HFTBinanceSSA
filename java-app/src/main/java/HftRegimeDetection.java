@@ -484,23 +484,33 @@ public class HftRegimeDetection {
         private int currentBatchSize = 0;
 
         public ClickHouseBatchHandler() {
-            try {
-                String host = System.getenv("CLICKHOUSE_HOST");
-                if (host == null || host.trim().isEmpty()) host = "clickhouse"; 
-                String user = System.getenv("CLICKHOUSE_USER");
-                if (user == null || user.trim().isEmpty()) user = "default";
-                String password = System.getenv("CLICKHOUSE_PASSWORD");
-                if (password == null) password = ""; 
-                
-                String url = "jdbc:ch://" + host + ":8123/default?compress=0";
-                this.connection = DriverManager.getConnection(url, user, password);
-                
-                // 🌟 دقیقاً 25 پارامتر مطابق با init.sql جدید شما
-                String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                this.statement = connection.prepareStatement(sql);
-            } catch (SQLException e) {
-                System.err.println("\n🔴 CRITICAL: ClickHouse Failed: " + e.getMessage());
-                System.exit(1); 
+            String host = System.getenv("CLICKHOUSE_HOST");
+            if (host == null || host.trim().isEmpty()) host = "clickhouse"; 
+            String user = System.getenv("CLICKHOUSE_USER");
+            if (user == null || user.trim().isEmpty()) user = "default";
+            String password = System.getenv("CLICKHOUSE_PASSWORD");
+            if (password == null) password = ""; 
+            
+            String url = "jdbc:ch://" + host + ":8123/default?compress=0";
+            
+            // 🌟 اضافه کردن مکانیزم Retry برای حل مشکل مسابقه در اجرای داکر (Race Condition)
+            int retries = 10;
+            while (retries > 0) {
+                try {
+                    this.connection = DriverManager.getConnection(url, user, password);
+                    String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    this.statement = connection.prepareStatement(sql);
+                    System.out.println("✅ Successfully connected to ClickHouse!");
+                    break;
+                } catch (SQLException e) {
+                    retries--;
+                    System.err.println("⏳ Waiting for ClickHouse to fully initialize... Retries left: " + retries);
+                    try { Thread.sleep(3000); } catch (InterruptedException ie) {}
+                    if (retries == 0) {
+                        System.err.println("\n🔴 CRITICAL: ClickHouse Failed to connect after retries: " + e.getMessage());
+                        System.exit(1); 
+                    }
+                }
             }
         }
 
