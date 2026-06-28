@@ -106,9 +106,13 @@ public class HftRegimeDetection {
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
         
-        // 🌟 متغیرهای سیستم جدید KMT (Kinematic Magnetic Tape)
+        // 🌟 متغیرهای سیستم KMT و State Machine جدید
         private double smoothedVelocity = 0.0; 
-        private int strictMicroTrend = 0; // 1 = صعودی | -1 = نزولی | 0 = نامشخص
+        private int strictMicroTrend = 0; 
+        
+        private boolean isSidewaysState = true;
+        private boolean isCrisisState = false;
+        private long lastTimestamp = 0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -127,13 +131,24 @@ public class HftRegimeDetection {
             event.domCycle = domCycle;
             boolean isRatchetFrozen = false;
             
+            // =========================================================================
+            // 🌟 1. T-EMA (Time-Weighted Smoothing) for HMM Probabilities
+            // تبدیل پرش‌های 1 دقیقه‌ای C++ به منحنی‌های نرم و پیوسته بر اساس زمان
+            // =========================================================================
+            if (lastTimestamp == 0) lastTimestamp = event.timestamp;
+            long dt = Math.max(1, event.timestamp - lastTimestamp);
+            lastTimestamp = event.timestamp;
+            
+            double tauMs = 15000.0; // ثابت زمانی 15 ثانیه برای هموارسازی نرم
+            double alphaProb = 1.0 - Math.exp(-dt / tauMs);
+
             if (!probInitialized) {
                 emaProbTrend = currentProbTrend;
                 emaProbCrisis = currentProbCrisis;
                 probInitialized = true;
             } else {
-                emaProbTrend = 0.05 * currentProbTrend + 0.95 * emaProbTrend;
-                emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
+                emaProbTrend += alphaProb * (currentProbTrend - emaProbTrend);
+                emaProbCrisis += alphaProb * (currentProbCrisis - emaProbCrisis);
             }
             
             int L = Math.max(4, (int) Math.round(domCycle / 2.0));
@@ -254,51 +269,61 @@ public class HftRegimeDetection {
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
 
-                // ثبت باندها صرفا جهت رکورد در دیتابیس (بدون دخالت در منطق خط زرد)
                 event.bandUpper = emaPc0 + smoothedDistance;
                 event.bandLower = emaPc0 - smoothedDistance;
 
                 // =========================================================================
+                // 🌟 2. Micro-Macro Fusion (MMF) & Schmitt Trigger
+                // =========================================================================
+                
+                // ترکیب احتمال روند ماکرو (C++) با قدرت روند میکرو (SSA EVR)
+                // اگر کندل ۱ دقیقه‌ای صعودی باشد اما تیک‌ها نویزی شوند (EVR پایین)، احتمال روند فورا کاهش می‌یابد
+                double normEvr = Math.min(emaEvr / 75.0, 1.0); 
+                double fusedTrendProb = emaProbTrend * normEvr;
+
+                // اشمیت تریگر (Hysteresis) برای حذف قطعی پرش بین رژیم‌ها
+                if (isSidewaysState) {
+                    if (fusedTrendProb > 0.55) isSidewaysState = false; // خروج از سایدوی (نیاز به قدرت بالا)
+                } else {
+                    if (fusedTrendProb < 0.35) isSidewaysState = true;  // بازگشت به سایدوی (نیاز به افت شدید)
+                }
+
+                if (isCrisisState) {
+                    if (emaProbCrisis < 0.30) isCrisisState = false;
+                } else {
+                    if (emaProbCrisis > 0.50) isCrisisState = true;
+                }
+
+                boolean isSideways = isSidewaysState;
+
+                // =========================================================================
                 // 🌟 THE GAME CHANGER: KINEMATIC MAGNETIC TAPE (KMT) + MG-SSA
-                // فیلتر هوشمند غیرخطی DSP + دیود سینماتیک برای جلوگیری از تیک‌های بازگشتی
                 // =========================================================================
                 
                 if (lastValue2 == 0.0) lastValue2 = emaPc0;
 
-                // ۱. محاسبه سرعت و شتاب میکرو با فیلتر ZLEMA-شکل
                 double pc0Velocity = emaPc0 - lastEmaPc0;
                 smoothedVelocity = 0.1 * pc0Velocity + 0.9 * smoothedVelocity;
 
-                // ۲. تعیین رژیم سخت‌گیرانه (سایدوی در برابر روند)
-                boolean isSideways = (emaProbTrend < 0.40); // بازار رنج (احتمال روند زیر ۴۰ درصد)
-
-                // ۳. محاسبه میدان دافعه (Dynamic Repulsion)
-                // هرچه روند قوی‌تر (emaProbTrend بالا) و نویز (noiseStdDev) بیشتر باشد، 
-                // خط با قدرت بیشتری از قیمت فرار می‌کند تا تاچ نشود.
-                double repulsionForce = noiseStdDev * Math.max(1.5, 1.0 + (emaEvr / 50.0)) * Math.pow(emaProbTrend + 0.5, 2);
+                // ۳. محاسبه میدان دافعه (Dynamic Repulsion) - اکنون با Fused Prob آپدیت می‌شود
+                double repulsionForce = noiseStdDev * Math.max(1.5, 1.0 + (emaEvr / 50.0)) * Math.pow(fusedTrendProb + 0.5, 2);
                 
-                // درک وضعیت کلان (Macro Bias)
                 double macroBias = (macroL1Value != 0.0) ? (event.price - macroL1Value) : 0.0;
                 boolean strongMacroBear = (projectedMacroSlope < 0) && (macroBias < 0);
                 boolean strongMacroBull = (projectedMacroSlope > 0) && (macroBias > 0);
 
-                // ۴. تشخیص سوئیچ فاز (شکست معتبر حمایت/مقاومت)
-                // فقط در صورتی تغییر جهت می‌دهیم که قیمت با قدرت خط را بشکند (بیشتر از حد نویز)
                 if (strictMicroTrend == 1 && event.price < lastValue2 - noiseStdDev && !strongMacroBull) {
-                    strictMicroTrend = -1; // تغییر به نزولی
+                    strictMicroTrend = -1; 
                 } else if (strictMicroTrend == -1 && event.price > lastValue2 + noiseStdDev && !strongMacroBear) {
-                    strictMicroTrend = 1;  // تغییر به صعودی
+                    strictMicroTrend = 1;  
                 } else if (strictMicroTrend == 0) {
                     strictMicroTrend = (smoothedVelocity >= 0) ? 1 : -1;
                 }
 
-                // ۵. هدف‌گذاری داینامیک (Target Line)
                 double targetLine;
                 if (isSideways) {
-                    // 🧲 جاذبه مغناطیسی: در بازار سایدوی، خط دقیقاً روی قیمت می‌افتد
                     targetLine = event.price; 
                 } else {
-                    // 🛡 دافعه مغناطیسی: در روند، خط با فاصله امن به عنوان حمایت/مقاومت قرار می‌گیرد
                     if (strictMicroTrend == 1 || strongMacroBull) {
                         targetLine = emaPc0 - repulsionForce; 
                     } else {
@@ -306,23 +331,17 @@ public class HftRegimeDetection {
                     }
                 }
 
-                // ۶. هموارساز DSP
-                // در سایدوی سرعت آپدیت بالاست تا به قیمت بچسبد، در روند کُند است تا اسموت (Smooth) بماند
                 double smoothAlpha = isSideways ? 0.30 : 0.03; 
                 double proposedLine = lastValue2 + smoothAlpha * (targetLine - lastValue2);
 
-                // ۷. دیود سینماتیک (Kinematic Diode / Slew-Rate Limiter)
-                // این بخش دقیقاً مشکل «تیک زدن خط زرد به سمت بالا در روند نزولی» را نابود می‌کند!
                 isRatchetFrozen = false;
                 if (!isSideways) {
                     if (strictMicroTrend == 1 || strongMacroBull) { 
-                        // در روند صعودی: خط فقط می‌تواند بالا برود یا فریز شود. تیک نزولی ممنوع!
                         if (proposedLine < lastValue2) {
                             proposedLine = lastValue2; 
                             isRatchetFrozen = true;
                         }
                     } else if (strictMicroTrend == -1 || strongMacroBear) { 
-                        // در روند نزولی: خط فقط می‌تواند پایین برود یا فریز شود. تیک صعودی ممنوع!
                         if (proposedLine > lastValue2) {
                             proposedLine = lastValue2; 
                             isRatchetFrozen = true;
@@ -330,24 +349,22 @@ public class HftRegimeDetection {
                     }
                 }
 
-                // ست کردن وضعیت نهایی در ایونت
                 event.value2 = proposedLine;
-                event.ssaTrend = proposedLine; // همگام‌سازی برای نمایش بی‌نقص در گرافانا
+                event.ssaTrend = proposedLine; 
                 event.regime = strictMicroTrend;
                 
                 lastEmaPc0 = emaPc0;
                 lastValue2 = event.value2;
+                
                 // =========================================================================
                 
-                // مومنتوم و سایز پوزیشن بر اساس خط تصفیه‌شده جدید
                 event.momentumSignal = event.price - event.value2; 
-                
-                double CRISIS_THRESHOLD = 0.40; 
-                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
+                event.crisisCapActive = isCrisisState ? 1 : 0; // استفاده از State فیلتر شده
                 
                 double TREND_P_STAR = 0.70;
-                event.regimeWeight = (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) ? 
-                                     Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR)) : 0.0;
+                // استفاده از فیوژن برای تعیین وزن سایز پوزیشن به صورت نرم
+                event.regimeWeight = (event.crisisCapActive == 0 && fusedTrendProb >= TREND_P_STAR) ? 
+                                     Math.min(1.0, (fusedTrendProb - TREND_P_STAR) / (1.0 - TREND_P_STAR)) : 0.0;
                 
                 event.gatedMomentum = event.momentumSignal * event.regimeWeight;
                 double MAX_POSITION = 1.0; 
@@ -355,8 +372,8 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | isSideways: %b | Repulsion: %.2f | Val2: %.2f | Frozen: %b\n", 
-                                      event.price, isSideways, repulsionForce, event.value2, isRatchetFrozen);
+                    System.out.printf("\n[DEBUG] Price: %.2f | isSideways: %b | FusedProb: %.2f | Val2: %.2f | Frozen: %b\n", 
+                                      event.price, isSideways, fusedTrendProb, event.value2, isRatchetFrozen);
                 }
                 
             } else {
