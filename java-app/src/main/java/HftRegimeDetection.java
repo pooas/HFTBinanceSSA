@@ -235,6 +235,8 @@ public class HftRegimeDetection {
                         resVar += diff * diff;
                     }
                     noiseStdDev = Math.sqrt(resVar / (activeResCount - 1));
+                } else if (activeResCount == 1) {
+                    noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
                 double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
@@ -248,7 +250,7 @@ public class HftRegimeDetection {
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
-                // 👇 بازگردانی محاسبات باندهای بولینگر و ssaTrend قدیمی برای سازگاری با گرافانا
+                // باندهای بولینگر منطقی (از کد اول شما)
                 event.bandUpper = emaPc0 + smoothedDistance;
                 event.bandLower = emaPc0 - smoothedDistance;
 
@@ -278,106 +280,166 @@ public class HftRegimeDetection {
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
 
-
                 // =========================================================================
-                // 🌟 THE 3-TIER MG-SSA ARCHITECTURE (طبق Blueprint درخواست شده)
+                // 🌟 THE GAME CHANGER: MACRO-GRAVITATIONAL SUPERTREND (MG-SSA)
+                // تلفیق فرمول‌های مقاله با ساختار اصلی کدهای شما
                 // =========================================================================
                 
-                // مقداردهی اولیه برای تیک‌های نخستین
                 if (lastValue2 == 0.0) lastValue2 = emaPc0;
 
-                // --- لایه ۱: هموارسازی تطبیقی برای رفتار پله‌ای (Adaptive Staircase Smoothing) ---
-                // آلفا بر اساس چرخه غالب، نویز جاری و احتمال بحران مدل‌سازی می‌شود
-                double sigmaDomCycle = Math.max(0.1, Math.min(10.0 / Math.max(event.domCycle, 1.0), 1.0));
-                double sigmaNoise = Math.min(noiseStdDev / Math.max(smoothedDistance, 1e-5), 1.0);
-                double hCrisis = Math.max(0.0, 1.0 - emaProbCrisis); // در بحران آلفا کم می‌شود تا فریز شود
+                // فرمول ۱ مقاله: تابع Gating (Multiplicative)
+                double wvEvr = Math.min(emaEvr / 100.0, 1.0);
+                double wvGap = Math.min(emaGapFactor, 1.0);
+                double gT = wvEvr * wvGap * emaProbTrend; // ضریب باز و بسته شدن خط
+
+                // فرمول ۲ مقاله: Adaptive Smoothing 
+                double sigmaDomCycle = Math.max(0.1, Math.min(1.0, 10.0 / Math.max(event.domCycle, 1.0)));
+                double sigmaNoise = Math.min(1.0, noiseStdDev / Math.max(smoothedDistance, 1e-5));
+                double hCrisis = Math.max(0.0, 1.0 - emaProbCrisis);
                 
                 double alphaT = sigmaDomCycle * (1.0 - 0.5 * sigmaNoise) * hCrisis;
-                alphaT = Math.max(0.01, Math.min(alphaT, 1.0)); // محدودسازی آلفا بین 0.01 و 1
-                
-                // آپدیت بدون تاخیر (Zero-lag update): 
-                double value2Raw = lastValue2 + alphaT * (emaPc0 - lastValue2);
+                alphaT = Math.max(0.01, Math.min(alphaT, 1.0));
 
-                // --- لایه ۲: تابع دروازه (Trend vs. Sideways Gating Function) ---
-                double normEvr = Math.min(emaEvr / 100.0, 1.0);
-                double normGap = Math.min(emaGapFactor, 1.0);
-                
-                // Option A: Multiplicative gating
-                double gT = normEvr * normGap * emaProbTrend; 
-                
-                // سوئیچ نرم بین خط مسطح (lastValue2) و خط خام (value2Raw)
-                double value2Gated = (gT * value2Raw) + ((1.0 - gT) * lastValue2);
-
-                // --- لایه ۳: همگام‌سازی فیزیک ماکرو-میکرو (Macro Ratchet Effect) ---
-                double deltaXC = value2Gated - lastValue2;
-                event.value2 = value2Gated;
-                isRatchetFrozen = false;
-
+                // منطق قدرتمند فاصله ماکرو (ساختار اوریجینال شما)
+                double macroBias = event.price - macroL1Value; 
+                double dynamicDistance = smoothedDistance;
                 if (macroL1Value != 0.0) {
-                    // D(t) = sgn(macro_slope) * sgn(delta_x_c)
-                    double dM = Math.signum(projectedMacroSlope) * Math.signum(deltaXC);
-                    
-                    if (dM < 0) {
-                        // حرکت خلاف جهت کلان! -> اعمال ضامن مکث (Flatline)
+                    dynamicDistance = smoothedDistance * (1.0 + (Math.abs(macroBias) / event.price) * 500.0);
+                }
+
+                boolean strongBear = (projectedMacroSlope < 0) && (macroBias < 0);
+                boolean strongBull = (projectedMacroSlope > 0) && (macroBias > 0);
+                
+                // ۱. تعیین هدف بر اساس ساختار سقف/کف شما
+                double rawTarget = emaPc0; 
+                if (macroL1Value != 0.0) {
+                    if (strongBear) rawTarget = emaPc0 + dynamicDistance; // Proposed Ceiling
+                    else if (strongBull) rawTarget = emaPc0 - dynamicDistance; // Proposed Floor
+                }
+
+                // ۲. اعمال هموارسازی ریاضی روی هدف انتخاب شده
+                double smoothedTarget = lastValue2 + alphaT * (rawTarget - lastValue2);
+                
+                // ۳. اعمال فرمول گیتینگ (Gated Equation)
+                double gatedTarget = (gT * smoothedTarget) + ((1.0 - gT) * lastValue2);
+
+                // ۴. اعمال اثر چرخ‌دنده (Ratchet Effect) با ساختار منطقی اصلی شما
+                if (macroL1Value != 0.0) {
+                    if (strongBear) {
+                        if (lastValue2 == 0.0 || event.price > lastValue2) {
+                            event.value2 = gatedTarget; 
+                        } else {
+                            // حرکت فقط رو به پایین (یا مسطح شدن در زمان حرکت خلاف روند)
+                            event.value2 = Math.min(lastValue2, gatedTarget); 
+                        }
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } 
+                    else if (strongBull) {
+                        if (lastValue2 == 0.0 || event.price < lastValue2) {
+                            event.value2 = gatedTarget; 
+                        } else {
+                            // حرکت فقط رو به بالا (یا مسطح شدن در زمان حرکت خلاف روند)
+                            event.value2 = Math.max(lastValue2, gatedTarget);
+                        }
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } 
+                    else {
+                        double velocity = gatedTarget - lastValue2;
+                        if ((macroL1Slope < 0 && velocity > 0) || (macroL1Slope > 0 && velocity < 0)) {
+                            event.value2 = lastValue2; 
+                            isRatchetFrozen = true;
+                        } else {
+                            event.value2 = gatedTarget;
+                        }
+                    }
+                } else {
+                    double velocity = emaPc0 - lastEmaPc0; // Fallback منطبق با کد اول شما
+                    if (velocity < 0) {
                         event.value2 = lastValue2; 
                         isRatchetFrozen = true;
-                    } else if (dM > 0) {
-                        // هم‌سو با جهت کلان -> کشش نرم به سمت خط کلان (Gravity Projection)
-                        double macroGravityBeta = 0.05 * gT; // کشش فقط در زمان روندهای قوی
-                        event.value2 = value2Gated + macroGravityBeta * (macroL1Value - lastValue2);
+                    } else {
+                        event.value2 = gatedTarget;
                     }
                 }
                 
                 lastEmaPc0 = emaPc0;
                 lastValue2 = event.value2;
-
                 // =========================================================================
-
-                event.momentumSignal = event.price - event.value2; // اکنون مومنتوم براساس Value2 محاسبه می‌شود
-                event.crisisCapActive = (emaProbCrisis > 0.40) ? 1 : 0;
+                
+                // بازگشت به محاسبه مومنتوم مبتنی بر pc0 (کد اول شما)
+                event.momentumSignal = event.price - event.pc0; 
+                
+                double CRISIS_THRESHOLD = 0.40; 
+                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
                 
                 double TREND_P_STAR = 0.70;
                 event.regimeWeight = (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) ? 
                                      Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR)) : 0.0;
                 
                 event.gatedMomentum = event.momentumSignal * event.regimeWeight;
-                event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (1.0 * event.regimeWeight);
+                double MAX_POSITION = 1.0; 
+                event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | Gating(gT): %.3f | Alpha(aT): %.3f | Val2: %.2f | Frozen: %b\n", 
-                                      event.price, gT, alphaT, event.value2, isRatchetFrozen);
+                    System.out.printf("\n[DEBUG] Price: %.2f | Gating(gT): %.3f | Val2: %.2f | Frozen: %b\n", 
+                                      event.price, gT, event.value2, isRatchetFrozen);
                 }
                 
             } else {
-                // (Initialization block skipped for brevity, keeps defaults)
+                event.pc0 = event.price;
+                event.evr = 0.0;
+                event.bandUpper = event.price;
+                event.bandLower = event.price;
+                event.ssaTrend = event.price;
+                event.regime = currentMarketRegime;
+                event.vress = 0.0;
+                event.eigenGap = 0.0;
+                event.hmmRegime = currentHmmRegime;
+                event.hmmProbTrend = emaProbTrend;
+                event.hmmProbCrisis = emaProbCrisis;
+                
+                event.momentumSignal = 0.0;
+                event.regimeWeight = 0.0;
+                event.gatedMomentum = 0.0;
+                event.positionSize = 0.0;
+                event.dynamicStopLoss = 0.0;
+                event.crisisCapActive = 0;
+                
                 event.value2 = event.price;
                 lastEmaPc0 = event.price;
                 lastValue2 = event.price;
             }
 
-            // --- محاسبه لیاپانوف ---
-            ssaTrendBuffer[ssaHead] = event.value2; // اکنون به جای ssaTrend روی value2 محاسبه می‌کنیم
+            // --- محاسبه لیاپانوف روی ssaTrend (بازگشت به کد اول شما) ---
+            ssaTrendBuffer[ssaHead] = event.ssaTrend;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
 
-            if (ssaBufferFull && sequence % 10 == 0) {
+            if (ssaBufferFull) {
                 double[] flatBuffer = new double[LLE_WINDOW];
                 for (int i = 0; i < LLE_WINDOW; i++) flatBuffer[i] = ssaTrendBuffer[(ssaHead + i) % LLE_WINDOW];
 
-                currentLambda = QuantDSP.LyapunovEstimator.calculateRigorousLLE(
-                        flatBuffer, currentM, currentTau, currentTau * 2, 5
-                );
-                
-                lambdaHistory[lambdaHead] = currentLambda;
-                lambdaHead = (lambdaHead + 1) % 20; 
-                if (lambdaHead == 0) lambdaBufferFull = true;
+                if (sequence % 500 == 0) {
+                    currentTau = ChaosMath.calculateAMI(flatBuffer, 30, 20); 
+                    currentM = ChaosMath.calculateFNN(flatBuffer, currentTau, 6, 15.0); 
+                }
 
-                if (lambdaBufferFull) {
-                    double avgLambda = 0;
-                    for (double l : lambdaHistory) avgLambda += l;
-                    avgLambda /= 20;
-                    currentRegimeShiftAlert = (currentLambda > 0.05) && (currentLambda > avgLambda * 1.40);
+                if (sequence % 10 == 0) {
+                    currentLambda = QuantDSP.LyapunovEstimator.calculateRigorousLLE(
+                            flatBuffer, currentM, currentTau, currentTau * 2, 5
+                    );
+                    
+                    lambdaHistory[lambdaHead] = currentLambda;
+                    lambdaHead = (lambdaHead + 1) % 20; 
+                    if (lambdaHead == 0) lambdaBufferFull = true;
+
+                    if (lambdaBufferFull) {
+                        double avgLambda = 0;
+                        for (double l : lambdaHistory) avgLambda += l;
+                        avgLambda /= 20;
+                        currentRegimeShiftAlert = (currentLambda > 0.05) && (currentLambda > avgLambda * 1.40);
+                    }
                 }
             }
 
