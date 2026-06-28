@@ -93,7 +93,6 @@ public class HftRegimeDetection {
         private int currentM = 3;
 
         private int currentMarketRegime = 1;
-        private double lastLogicalDistanceLine = 0.0;
         private double smoothedDistance = 0.0;
 
         private double emaPc0 = 0.0;
@@ -106,15 +105,16 @@ public class HftRegimeDetection {
 
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
+        
+        // 🌟 متغیرهای سیستم جدید KMT (Kinematic Magnetic Tape)
+        private double smoothedVelocity = 0.0; 
+        private int strictMicroTrend = 0; // 1 = صعودی | -1 = نزولی | 0 = نامشخص
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
-                // (Implementation remains unchanged for brevity)
                 return Math.max(1, maxTau / 2); 
             }
-
             public static int calculateFNN(double[] data, int tau, int maxM, double rTol) {
-                // (Implementation remains unchanged for brevity)
                 return maxM;
             }
         }
@@ -249,125 +249,98 @@ public class HftRegimeDetection {
                 event.evr = emaEvr;
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
-
-                // باندهای بولینگر منطقی (از کد اول شما)
-                event.bandUpper = emaPc0 + smoothedDistance;
-                event.bandLower = emaPc0 - smoothedDistance;
-
-                double currentLineVal;
-                if (currentMarketRegime == 1) { 
-                    double proposedSupport = event.bandLower;
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
-                                     Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
-                    if (event.price < currentLineVal) {
-                        currentMarketRegime = -1; 
-                        currentLineVal = event.bandUpper; 
-                    }
-                } else { 
-                    double proposedResistance = event.bandUpper;
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
-                                     Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
-                    if (event.price > currentLineVal) {
-                        currentMarketRegime = 1; 
-                        currentLineVal = event.bandLower; 
-                    }
-                }
-
-                lastLogicalDistanceLine = currentLineVal;
-                event.ssaTrend = currentLineVal;
-                event.regime = currentMarketRegime;
+                
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
 
+                // ثبت باندها صرفا جهت رکورد در دیتابیس (بدون دخالت در منطق خط زرد)
+                event.bandUpper = emaPc0 + smoothedDistance;
+                event.bandLower = emaPc0 - smoothedDistance;
+
                 // =========================================================================
-                // 🌟 THE GAME CHANGER: MACRO-GRAVITATIONAL SUPERTREND (MG-SSA)
-                // تلفیق فرمول‌های مقاله با ساختار اصلی کدهای شما
+                // 🌟 THE GAME CHANGER: KINEMATIC MAGNETIC TAPE (KMT) + MG-SSA
+                // فیلتر هوشمند غیرخطی DSP + دیود سینماتیک برای جلوگیری از تیک‌های بازگشتی
                 // =========================================================================
                 
                 if (lastValue2 == 0.0) lastValue2 = emaPc0;
 
-                // فرمول ۱ مقاله: تابع Gating (Multiplicative)
-                double wvEvr = Math.min(emaEvr / 100.0, 1.0);
-                double wvGap = Math.min(emaGapFactor, 1.0);
-                double gT = wvEvr * wvGap * emaProbTrend; // ضریب باز و بسته شدن خط
+                // ۱. محاسبه سرعت و شتاب میکرو با فیلتر ZLEMA-شکل
+                double pc0Velocity = emaPc0 - lastEmaPc0;
+                smoothedVelocity = 0.1 * pc0Velocity + 0.9 * smoothedVelocity;
 
-                // فرمول ۲ مقاله: Adaptive Smoothing 
-                double sigmaDomCycle = Math.max(0.1, Math.min(1.0, 10.0 / Math.max(event.domCycle, 1.0)));
-                double sigmaNoise = Math.min(1.0, noiseStdDev / Math.max(smoothedDistance, 1e-5));
-                double hCrisis = Math.max(0.0, 1.0 - emaProbCrisis);
+                // ۲. تعیین رژیم سخت‌گیرانه (سایدوی در برابر روند)
+                boolean isSideways = (emaProbTrend < 0.40); // بازار رنج (احتمال روند زیر ۴۰ درصد)
+
+                // ۳. محاسبه میدان دافعه (Dynamic Repulsion)
+                // هرچه روند قوی‌تر (emaProbTrend بالا) و نویز (noiseStdDev) بیشتر باشد، 
+                // خط با قدرت بیشتری از قیمت فرار می‌کند تا تاچ نشود.
+                double repulsionForce = noiseStdDev * Math.max(1.5, 1.0 + (emaEvr / 50.0)) * Math.pow(emaProbTrend + 0.5, 2);
                 
-                double alphaT = sigmaDomCycle * (1.0 - 0.5 * sigmaNoise) * hCrisis;
-                alphaT = Math.max(0.01, Math.min(alphaT, 1.0));
+                // درک وضعیت کلان (Macro Bias)
+                double macroBias = (macroL1Value != 0.0) ? (event.price - macroL1Value) : 0.0;
+                boolean strongMacroBear = (projectedMacroSlope < 0) && (macroBias < 0);
+                boolean strongMacroBull = (projectedMacroSlope > 0) && (macroBias > 0);
 
-                // منطق قدرتمند فاصله ماکرو (ساختار اوریجینال شما)
-                double macroBias = event.price - macroL1Value; 
-                double dynamicDistance = smoothedDistance;
-                if (macroL1Value != 0.0) {
-                    dynamicDistance = smoothedDistance * (1.0 + (Math.abs(macroBias) / event.price) * 500.0);
+                // ۴. تشخیص سوئیچ فاز (شکست معتبر حمایت/مقاومت)
+                // فقط در صورتی تغییر جهت می‌دهیم که قیمت با قدرت خط را بشکند (بیشتر از حد نویز)
+                if (strictMicroTrend == 1 && event.price < lastValue2 - noiseStdDev && !strongMacroBull) {
+                    strictMicroTrend = -1; // تغییر به نزولی
+                } else if (strictMicroTrend == -1 && event.price > lastValue2 + noiseStdDev && !strongMacroBear) {
+                    strictMicroTrend = 1;  // تغییر به صعودی
+                } else if (strictMicroTrend == 0) {
+                    strictMicroTrend = (smoothedVelocity >= 0) ? 1 : -1;
                 }
 
-                boolean strongBear = (projectedMacroSlope < 0) && (macroBias < 0);
-                boolean strongBull = (projectedMacroSlope > 0) && (macroBias > 0);
-                
-                // ۱. تعیین هدف بر اساس ساختار سقف/کف شما
-                double rawTarget = emaPc0; 
-                if (macroL1Value != 0.0) {
-                    if (strongBear) rawTarget = emaPc0 + dynamicDistance; // Proposed Ceiling
-                    else if (strongBull) rawTarget = emaPc0 - dynamicDistance; // Proposed Floor
-                }
-
-                // ۲. اعمال هموارسازی ریاضی روی هدف انتخاب شده
-                double smoothedTarget = lastValue2 + alphaT * (rawTarget - lastValue2);
-                
-                // ۳. اعمال فرمول گیتینگ (Gated Equation)
-                double gatedTarget = (gT * smoothedTarget) + ((1.0 - gT) * lastValue2);
-
-                // ۴. اعمال اثر چرخ‌دنده (Ratchet Effect) با ساختار منطقی اصلی شما
-                if (macroL1Value != 0.0) {
-                    if (strongBear) {
-                        if (lastValue2 == 0.0 || event.price > lastValue2) {
-                            event.value2 = gatedTarget; 
-                        } else {
-                            // حرکت فقط رو به پایین (یا مسطح شدن در زمان حرکت خلاف روند)
-                            event.value2 = Math.min(lastValue2, gatedTarget); 
-                        }
-                        isRatchetFrozen = (event.value2 == lastValue2);
-                    } 
-                    else if (strongBull) {
-                        if (lastValue2 == 0.0 || event.price < lastValue2) {
-                            event.value2 = gatedTarget; 
-                        } else {
-                            // حرکت فقط رو به بالا (یا مسطح شدن در زمان حرکت خلاف روند)
-                            event.value2 = Math.max(lastValue2, gatedTarget);
-                        }
-                        isRatchetFrozen = (event.value2 == lastValue2);
-                    } 
-                    else {
-                        double velocity = gatedTarget - lastValue2;
-                        if ((macroL1Slope < 0 && velocity > 0) || (macroL1Slope > 0 && velocity < 0)) {
-                            event.value2 = lastValue2; 
-                            isRatchetFrozen = true;
-                        } else {
-                            event.value2 = gatedTarget;
-                        }
-                    }
+                // ۵. هدف‌گذاری داینامیک (Target Line)
+                double targetLine;
+                if (isSideways) {
+                    // 🧲 جاذبه مغناطیسی: در بازار سایدوی، خط دقیقاً روی قیمت می‌افتد
+                    targetLine = event.price; 
                 } else {
-                    double velocity = emaPc0 - lastEmaPc0; // Fallback منطبق با کد اول شما
-                    if (velocity < 0) {
-                        event.value2 = lastValue2; 
-                        isRatchetFrozen = true;
+                    // 🛡 دافعه مغناطیسی: در روند، خط با فاصله امن به عنوان حمایت/مقاومت قرار می‌گیرد
+                    if (strictMicroTrend == 1 || strongMacroBull) {
+                        targetLine = emaPc0 - repulsionForce; 
                     } else {
-                        event.value2 = gatedTarget;
+                        targetLine = emaPc0 + repulsionForce;
                     }
                 }
+
+                // ۶. هموارساز DSP
+                // در سایدوی سرعت آپدیت بالاست تا به قیمت بچسبد، در روند کُند است تا اسموت (Smooth) بماند
+                double smoothAlpha = isSideways ? 0.30 : 0.03; 
+                double proposedLine = lastValue2 + smoothAlpha * (targetLine - lastValue2);
+
+                // ۷. دیود سینماتیک (Kinematic Diode / Slew-Rate Limiter)
+                // این بخش دقیقاً مشکل «تیک زدن خط زرد به سمت بالا در روند نزولی» را نابود می‌کند!
+                isRatchetFrozen = false;
+                if (!isSideways) {
+                    if (strictMicroTrend == 1 || strongMacroBull) { 
+                        // در روند صعودی: خط فقط می‌تواند بالا برود یا فریز شود. تیک نزولی ممنوع!
+                        if (proposedLine < lastValue2) {
+                            proposedLine = lastValue2; 
+                            isRatchetFrozen = true;
+                        }
+                    } else if (strictMicroTrend == -1 || strongMacroBear) { 
+                        // در روند نزولی: خط فقط می‌تواند پایین برود یا فریز شود. تیک صعودی ممنوع!
+                        if (proposedLine > lastValue2) {
+                            proposedLine = lastValue2; 
+                            isRatchetFrozen = true;
+                        }
+                    }
+                }
+
+                // ست کردن وضعیت نهایی در ایونت
+                event.value2 = proposedLine;
+                event.ssaTrend = proposedLine; // همگام‌سازی برای نمایش بی‌نقص در گرافانا
+                event.regime = strictMicroTrend;
                 
                 lastEmaPc0 = emaPc0;
                 lastValue2 = event.value2;
                 // =========================================================================
                 
-                // بازگشت به محاسبه مومنتوم مبتنی بر pc0 (کد اول شما)
-                event.momentumSignal = event.price - event.pc0; 
+                // مومنتوم و سایز پوزیشن بر اساس خط تصفیه‌شده جدید
+                event.momentumSignal = event.price - event.value2; 
                 
                 double CRISIS_THRESHOLD = 0.40; 
                 event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
@@ -382,8 +355,8 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | Gating(gT): %.3f | Val2: %.2f | Frozen: %b\n", 
-                                      event.price, gT, event.value2, isRatchetFrozen);
+                    System.out.printf("\n[DEBUG] Price: %.2f | isSideways: %b | Repulsion: %.2f | Val2: %.2f | Frozen: %b\n", 
+                                      event.price, isSideways, repulsionForce, event.value2, isRatchetFrozen);
                 }
                 
             } else {
@@ -411,7 +384,7 @@ public class HftRegimeDetection {
                 lastValue2 = event.price;
             }
 
-            // --- محاسبه لیاپانوف روی ssaTrend (بازگشت به کد اول شما) ---
+            // --- محاسبه لیاپانوف ---
             ssaTrendBuffer[ssaHead] = event.ssaTrend;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
