@@ -248,6 +248,36 @@ public class HftRegimeDetection {
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
+                // 👇 بازگردانی محاسبات باندهای بولینگر و ssaTrend قدیمی برای سازگاری با گرافانا
+                event.bandUpper = emaPc0 + smoothedDistance;
+                event.bandLower = emaPc0 - smoothedDistance;
+
+                double currentLineVal;
+                if (currentMarketRegime == 1) { 
+                    double proposedSupport = event.bandLower;
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
+                                     Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
+                    if (event.price < currentLineVal) {
+                        currentMarketRegime = -1; 
+                        currentLineVal = event.bandUpper; 
+                    }
+                } else { 
+                    double proposedResistance = event.bandUpper;
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
+                                     Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
+                    if (event.price > currentLineVal) {
+                        currentMarketRegime = 1; 
+                        currentLineVal = event.bandLower; 
+                    }
+                }
+
+                lastLogicalDistanceLine = currentLineVal;
+                event.ssaTrend = currentLineVal;
+                event.regime = currentMarketRegime;
+                event.hmmRegime = currentHmmRegime;
+                event.hmmProbTrend = emaProbTrend;
+                event.hmmProbCrisis = emaProbCrisis;
+
 
                 // =========================================================================
                 // 🌟 THE 3-TIER MG-SSA ARCHITECTURE (طبق Blueprint درخواست شده)
