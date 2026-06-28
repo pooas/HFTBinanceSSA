@@ -360,31 +360,196 @@ public class HftRegimeDetection {
     }
 
     public static class ClickHouseBatchHandler implements EventHandler<TickEvent> {
-        // (ClickHouse block unchanged - writes event.value2 properly)
         private Connection connection;
         private PreparedStatement statement;
         private final int batchSizeThreshold = 1000;
         private int currentBatchSize = 0;
 
+        public ClickHouseBatchHandler() {
+            String host = System.getenv("CLICKHOUSE_HOST");
+            if (host == null || host.trim().isEmpty()) host = "clickhouse"; 
+            String user = System.getenv("CLICKHOUSE_USER");
+            if (user == null || user.trim().isEmpty()) user = "default";
+            String password = System.getenv("CLICKHOUSE_PASSWORD");
+            if (password == null) password = ""; 
+            
+            String url = "jdbc:ch://" + host + ":8123/default?compress=0";
+            
+            int retries = 10;
+            while (retries > 0) {
+                try {
+                    this.connection = DriverManager.getConnection(url, user, password);
+                    String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    this.statement = connection.prepareStatement(sql);
+                    System.out.println("✅ Successfully connected to ClickHouse!");
+                    break;
+                } catch (SQLException e) {
+                    retries--;
+                    System.err.println("⏳ Waiting for ClickHouse... Retries left: " + retries);
+                    try { Thread.sleep(3000); } catch (InterruptedException ie) {}
+                    if (retries == 0) {
+                        System.err.println("\n🔴 CRITICAL: ClickHouse Failed to connect!");
+                        System.exit(1); 
+                    }
+                }
+            }
+        }
+
         @Override
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
-            // (DB Insert stub)
+            if (statement == null) return;
+            try {
+                statement.setTimestamp(1, new java.sql.Timestamp(event.timestamp));
+                statement.setLong(2, sequence);
+                statement.setDouble(3, event.price);
+                statement.setDouble(4, event.volume);
+                statement.setDouble(5, event.ssaTrend);
+                statement.setDouble(6, event.lambda);
+                statement.setInt(7, event.isFrozen ? 1 : 0);
+                statement.setInt(8, event.regime);
+                statement.setDouble(9, event.bandUpper);
+                statement.setDouble(10, event.bandLower);
+                statement.setDouble(11, event.pc0);
+                statement.setDouble(12, event.evr);
+                statement.setDouble(13, event.vress);
+                statement.setDouble(14, event.eigenGap);
+                statement.setInt(15, event.hmmRegime);
+                statement.setDouble(16, event.hmmProbTrend);
+                statement.setDouble(17, event.hmmProbCrisis);
+                statement.setDouble(18, event.value2);
+                statement.setDouble(19, event.domCycle);
+                statement.setDouble(20, event.momentumSignal);
+                statement.setDouble(21, event.regimeWeight);
+                statement.setDouble(22, event.gatedMomentum);
+                statement.setDouble(23, event.positionSize);
+                statement.setDouble(24, event.dynamicStopLoss);
+                statement.setInt(25, event.crisisCapActive);
+                
+                statement.addBatch();
+                currentBatchSize++;
+                if (currentBatchSize >= batchSizeThreshold || endOfBatch) flush();
+            } catch (SQLException e) {}
+        }
+
+        private void flush() {
+            if (currentBatchSize == 0) return;
+            try { statement.executeBatch(); currentBatchSize = 0; } 
+            catch (SQLException e) { currentBatchSize = 0; }
         }
     }
 
     public static class BinanceProducer extends WebSocketClient {
-        // (Websocket block unchanged)
         private final RingBuffer<TickEvent> ringBuffer;
-        public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) { super(serverUri); this.ringBuffer = ringBuffer; }
-        @Override public void onOpen(ServerHandshake handshakedata) {}
-        @Override public void onMessage(String message) {}
-        @Override public void onClose(int code, String reason, boolean remote) {}
+        public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
+            super(serverUri); 
+            this.ringBuffer = ringBuffer;
+            this.setConnectionLostTimeout(0); 
+        }
+        @Override public void onOpen(ServerHandshake handshakedata) {
+            System.out.println("✅ Connected to Binance WebSocket (Tick Stream).");
+        }
+        @Override public void onMessage(String message) {
+            try {
+                JsonObject json = JsonParser.parseString(message).getAsJsonObject();
+                if (!json.has("p")) return; 
+                long sequence = ringBuffer.next();
+                try {
+                    TickEvent event = ringBuffer.get(sequence);
+                    event.price = json.get("p").getAsDouble();
+                    event.volume = json.get("q").getAsDouble();
+                    event.timestamp = json.get("T").getAsLong();
+                    event.ingressNanoTime = System.nanoTime(); 
+                } finally { ringBuffer.publish(sequence); }
+            } catch (Throwable e) {}
+        }
+        @Override public void onClose(int code, String reason, boolean remote) {
+            try { Thread.sleep(5000); this.reconnect(); } catch (InterruptedException e) {}
+        }
         @Override public void onError(Exception ex) {}
     }
 
     public static void main(String[] args) throws Exception {
-        // (ZMQ connections and Disruptor initialization unchanged)
+        Thread zmqThread = new Thread(() -> {
+            try (ZContext context = new ZContext()) {
+                ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
+                String zmqHost = System.getenv("ZMQ_HOST");
+                if (zmqHost == null || zmqHost.trim().isEmpty()) zmqHost = "localhost";
+                String zmqPort = System.getenv("ZMQ_PORT");
+                if (zmqPort == null || zmqPort.trim().isEmpty()) zmqPort = "5555";
+                
+                String address = "tcp://" + zmqHost + ":" + zmqPort;
+                subscriber.connect(address);
+                subscriber.subscribe(new byte[0]); 
+                
+                System.out.println("🔗 C++ HMM Subscriber active on " + address);
+                
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        String msg = subscriber.recvStr();
+                        if (msg != null && msg.startsWith("REGIME|")) {
+                            String[] parts = msg.substring(7).trim().split(",");
+                            if (parts.length >= 4) {
+                                currentHmmRegime = Integer.parseInt(parts[0]);
+                                currentProbTrend = Double.parseDouble(parts[2]);
+                                currentProbCrisis = Double.parseDouble(parts[3]);
+                            }
+                        }
+                    } catch (Exception ex) { }
+                }
+            } catch (Exception e) {}
+        });
+        zmqThread.setDaemon(true);
+        zmqThread.start();
+
+        // 🌟 شنونده هوش ماکرو (پایتون) مجهز به محاسبه شتاب
+        Thread zmqMacroThread = new Thread(() -> {
+            try (ZContext context = new ZContext()) {
+                ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
+                String zmqHost = System.getenv("MACRO_ZMQ_HOST");
+                if (zmqHost == null || zmqHost.trim().isEmpty()) zmqHost = "localhost";
+                String zmqPort = System.getenv("MACRO_ZMQ_PORT");
+                if (zmqPort == null || zmqPort.trim().isEmpty()) zmqPort = "5556";
+                
+                String address = "tcp://" + zmqHost + ":" + zmqPort;
+                subscriber.connect(address);
+                subscriber.subscribe(new byte[0]); 
+                
+                System.out.println("🔗 Python Macro-L1 Subscriber active on " + address);
+                
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        String msg = subscriber.recvStr();
+                        if (msg != null && msg.startsWith("MACRO_TREND|")) {
+                            String[] parts = msg.substring(12).trim().split(",");
+                            if (parts.length >= 2) {
+                                macroL1Value = Double.parseDouble(parts[0]);
+                                double newSlope = Double.parseDouble(parts[1]);
+                                
+                                // محاسبه شتاب و پیش‌بینی تیلور (شتاب + سرعت)
+                                if (macroL1Slope != 0.0) {
+                                    macroL1Accel = newSlope - macroL1Slope;
+                                }
+                                macroL1Slope = newSlope;
+                                projectedMacroSlope = macroL1Slope + macroL1Accel;
+                            }
+                        }
+                    } catch (Exception ex) { }
+                }
+            } catch (Exception e) {}
+        });
+        zmqMacroThread.setDaemon(true);
+        zmqMacroThread.start();
+
         System.out.println("HFT Regime Detection System Started...");
+        
+        Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 1024, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new BusySpinWaitStrategy());
+        disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
+        RingBuffer<TickEvent> ringBuffer = disruptor.start();
+        
+        new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking(); 
+        
+        // جلوگیری از بسته شدن برنامه
+        Thread.currentThread().join();
     }
 
     // =========================================================================
