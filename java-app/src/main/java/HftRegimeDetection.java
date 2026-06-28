@@ -93,6 +93,7 @@ public class HftRegimeDetection {
         private int currentM = 3;
 
         private int currentMarketRegime = 1;
+        private double lastLogicalDistanceLine = 0.0;
         private double smoothedDistance = 0.0;
 
         private double emaPc0 = 0.0;
@@ -105,20 +106,80 @@ public class HftRegimeDetection {
 
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
-        
-        // 🌟 متغیرهای سیستم KMT و State Machine جدید
-        private double smoothedVelocity = 0.0; 
-        private int strictMicroTrend = 0; 
-        
-        private boolean isSidewaysState = true;
-        private boolean isCrisisState = false;
-        private long lastTimestamp = 0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
+                int n = data.length;
+                double[] ami = new double[maxTau + 1];
+                double minVal = Double.MAX_VALUE;
+                double maxVal = -Double.MAX_VALUE;
+                for (double v : data) {
+                    if (v < minVal) minVal = v;
+                    if (v > maxVal) maxVal = v;
+                }
+                if (maxVal - minVal < 1e-6) return 1;
+                for (int tau = 1; tau <= maxTau; tau++) {
+                    int[][] joint = new int[bins][bins];
+                    int[] marg1 = new int[bins];
+                    int[] marg2 = new int[bins];
+                    int validCount = n - tau;
+                    for (int i = 0; i < validCount; i++) {
+                        int b1 = (int) ((data[i] - minVal) / (maxVal - minVal) * (bins - 1));
+                        int b2 = (int) ((data[i + tau] - minVal) / (maxVal - minVal) * (bins - 1));
+                        b1 = Math.max(0, Math.min(bins - 1, b1));
+                        b2 = Math.max(0, Math.min(bins - 1, b2));
+                        joint[b1][b2]++; marg1[b1]++; marg2[b2]++;
+                    }
+                    double mutualInfo = 0.0;
+                    for (int i = 0; i < bins; i++) {
+                        for (int j = 0; j < bins; j++) {
+                            if (joint[i][j] > 0) {
+                                double pxy = (double) joint[i][j] / validCount;
+                                double px = (double) marg1[i] / validCount;
+                                double py = (double) marg2[j] / validCount;
+                                mutualInfo += pxy * Math.log(pxy / (px * py));
+                            }
+                        }
+                    }
+                    ami[tau] = mutualInfo;
+                }
+                for (int tau = 2; tau < maxTau; tau++) {
+                    if (ami[tau] < ami[tau - 1] && ami[tau] < ami[tau + 1]) return tau;
+                }
                 return Math.max(1, maxTau / 2); 
             }
+
             public static int calculateFNN(double[] data, int tau, int maxM, double rTol) {
+                int n = data.length;
+                if (n < 50) return 3;
+                for (int m = 1; m <= maxM; m++) {
+                    int falseNeighbors = 0; int totalNeighbors = 0;
+                    int numVectors = n - m * tau;
+                    if (numVectors < 10) return m;
+                    for (int i = 0; i < numVectors; i++) {
+                        double minDistSq = Double.MAX_VALUE; int nearestNeighbor = -1;
+                        for (int j = 0; j < numVectors; j++) {
+                            if (Math.abs(i - j) > tau) { 
+                                double distSq = 0;
+                                for (int d = 0; d < m; d++) {
+                                    double diff = data[i + d * tau] - data[j + d * tau];
+                                    distSq += diff * diff;
+                                }
+                                if (distSq > 1e-12 && distSq < minDistSq) {
+                                    minDistSq = distSq; nearestNeighbor = j;
+                                }
+                            }
+                        }
+                        if (nearestNeighbor != -1) {
+                            double rM = Math.sqrt(minDistSq);
+                            double nextDiff = Math.abs(data[i + m * tau] - data[nearestNeighbor + m * tau]);
+                            double ratio = nextDiff / Math.max(rM, 1e-10);
+                            if (ratio > rTol) falseNeighbors++;
+                            totalNeighbors++;
+                        }
+                    }
+                    if (totalNeighbors > 0 && (double) falseNeighbors / totalNeighbors < 0.05) return m;
+                }
                 return maxM;
             }
         }
@@ -131,31 +192,19 @@ public class HftRegimeDetection {
             event.domCycle = domCycle;
             boolean isRatchetFrozen = false;
             
-            // =========================================================================
-            // 🌟 1. T-EMA (Time-Weighted Smoothing) for HMM Probabilities
-            // تبدیل پرش‌های 1 دقیقه‌ای C++ به منحنی‌های نرم و پیوسته بر اساس زمان
-            // =========================================================================
-            if (lastTimestamp == 0) lastTimestamp = event.timestamp;
-            long dt = Math.max(1, event.timestamp - lastTimestamp);
-            lastTimestamp = event.timestamp;
-            
-            double tauMs = 15000.0; // ثابت زمانی 15 ثانیه برای هموارسازی نرم
-            double alphaProb = 1.0 - Math.exp(-dt / tauMs);
-
             if (!probInitialized) {
                 emaProbTrend = currentProbTrend;
                 emaProbCrisis = currentProbCrisis;
                 probInitialized = true;
             } else {
-                emaProbTrend += alphaProb * (currentProbTrend - emaProbTrend);
-                emaProbCrisis += alphaProb * (currentProbCrisis - emaProbCrisis);
+                emaProbTrend = 0.05 * currentProbTrend + 0.95 * emaProbTrend;
+                emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
             }
             
             int L = Math.max(4, (int) Math.round(domCycle / 2.0));
             int N_ssa = L * 2;
             
             if (count >= N_ssa - 1) {
-                // --- استخراج ماتریس و محاسبه SVD ---
                 int K = N_ssa - L + 1;
                 double[] data = new double[N_ssa];
                 for (int i = 0; i < N_ssa; i++) {
@@ -228,10 +277,18 @@ public class HftRegimeDetection {
                     double evrFactor = Math.min(emaEvr / 100.0, 1.0);
                     double adaptiveAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
 
+                    // 🌟 هم‌افزایی با پیش‌بینی فیزیک (Synergy)
+                    double rawMicroSlope = rawPc0 - lastEmaPc0;
+                    boolean isMacroBullish = projectedMacroSlope >= 0;
+                    boolean isMicroBullish = rawMicroSlope >= 0;
+
+                    if (projectedMacroSlope != 0.0 && (isMacroBullish == isMicroBullish)) {
+                        adaptiveAlpha = Math.min(1.0, adaptiveAlpha * 2.0); 
+                    }
+
                     emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
                 }
 
-                // محاسبه واریانس نویز (Vress)
                 double currentResidual = event.price - emaPc0;
                 residualHistory[residualHead] = currentResidual;
                 residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
@@ -244,6 +301,7 @@ public class HftRegimeDetection {
                     double resMean = 0;
                     for (int i = 0; i < activeResCount; i++) resMean += residualHistory[i];
                     resMean /= activeResCount;
+
                     double resVar = 0;
                     for (int i = 0; i < activeResCount; i++) {
                         double diff = residualHistory[i] - resMean;
@@ -255,125 +313,153 @@ public class HftRegimeDetection {
                 }
 
                 double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
-                double rawDistance = noiseStdDev * Math.max(1.0, 1.0 + 4.0 * (1.0 - evrFactor) + 2.0 * emaGapFactor); 
+                double alpha = 4.0; 
+                double beta = 2.0;  
                 
+                double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
+                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
+
+                double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
                 smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
                 event.pc0 = emaPc0;
                 event.evr = emaEvr;
+                event.bandUpper = emaPc0 + smoothedDistance;
+                event.bandLower = emaPc0 - smoothedDistance;
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
-                
+
+                double currentLineVal;
+
+                if (currentMarketRegime == 1) { 
+                    double proposedSupport = event.bandLower;
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
+                                     Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
+                    
+                    if (event.price < currentLineVal) {
+                        currentMarketRegime = -1; 
+                        currentLineVal = event.bandUpper; 
+                    }
+                } else { 
+                    double proposedResistance = event.bandUpper;
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
+                                     Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
+                    
+                    if (event.price > currentLineVal) {
+                        currentMarketRegime = 1; 
+                        currentLineVal = event.bandLower; 
+                    }
+                }
+
+                lastLogicalDistanceLine = currentLineVal;
+                event.ssaTrend = currentLineVal;
+                event.regime = currentMarketRegime;
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
-
-                event.bandUpper = emaPc0 + smoothedDistance;
-                event.bandLower = emaPc0 - smoothedDistance;
-
-                // =========================================================================
-                // 🌟 2. Micro-Macro Fusion (MMF) & Schmitt Trigger
-                // =========================================================================
                 
-                // ترکیب احتمال روند ماکرو (C++) با قدرت روند میکرو (SSA EVR)
-                // اگر کندل ۱ دقیقه‌ای صعودی باشد اما تیک‌ها نویزی شوند (EVR پایین)، احتمال روند فورا کاهش می‌یابد
-                double normEvr = Math.min(emaEvr / 75.0, 1.0); 
-                double fusedTrendProb = emaProbTrend * normEvr;
+                // =========================================================================
+                // 🌟 THE GAME CHANGER: QUANTUM KINEMATIC RATCHET (MACRO-MICRO FUSION)
+                // =========================================================================
+                // ۱. تشخیص آکادمیک رنج بودن (SNR Gating) بر اساس قدرت روند و خلوص مقادیر ویژه
+                double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend;
+                boolean isSidewaysNoise = trendPower < 0.15; // فیلتر قدرتمند تشخیص بازار بی‌تصمیم
 
-                // اشمیت تریگر (Hysteresis) برای حذف قطعی پرش بین رژیم‌ها
-                if (isSidewaysState) {
-                    if (fusedTrendProb > 0.55) isSidewaysState = false; // خروج از سایدوی (نیاز به قدرت بالا)
-                } else {
-                    if (fusedTrendProb < 0.35) isSidewaysState = true;  // بازگشت به سایدوی (نیاز به افت شدید)
+                // ۲. کشش جاذبه ماکرو
+                double macroBias = event.price - macroL1Value; 
+                
+                // ۳. باندینگ دینامیک
+                double dynamicDistance = smoothedDistance;
+                if (macroL1Value != 0.0 && event.price != 0) {
+                    double biasRatio = Math.min(Math.abs(macroBias) / event.price, 0.05); 
+                    dynamicDistance = smoothedDistance * (1.0 + biasRatio * 50.0);
                 }
 
-                if (isCrisisState) {
-                    if (emaProbCrisis < 0.30) isCrisisState = false;
+                // ۴. 💡 استپ‌های کوانتومی (شبیه‌ساز رفتار Cvxpy L1-Trend)
+                // رازِ ساختن پله‌های کاملاً صاف و بدون لرزش (Deadband) در این خط است
+                double quantumStep = noiseStdDev * 0.4; 
+
+                boolean strongBear = (projectedMacroSlope < 0) && (macroBias < 0);
+                boolean strongBull = (projectedMacroSlope > 0) && (macroBias > 0);
+
+                if (macroL1Value != 0.0) {
+                    if (isSidewaysNoise) {
+                        // 🛑 فریز مطلق: در زمان نویز، خط زرد تکان نمی‌خورد و صاف (Flatline) می‌ماند
+                        event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2;
+                        isRatchetFrozen = true;
+                    } 
+                    else if (strongBear) {
+                        // بازار خرسی: خط زرد تبدیل به سقفی می‌شود که فقط حق دارد پایین بیاید (پله‌های نزولی)
+                        double proposedCeiling = emaPc0 + dynamicDistance;
+                        
+                        if (lastValue2 == 0.0 || event.price > lastValue2) {
+                            event.value2 = proposedCeiling; // شکست سقف -> ریست شدن
+                        } else if (proposedCeiling < lastValue2 - quantumStep) {
+                            // فقط در صورتی یک پله نزولی جدید می‌سازیم که افتِ روند از آستانه نویز (کوانتوم استپ) بیشتر باشد
+                            event.value2 = proposedCeiling;
+                        } else {
+                            event.value2 = lastValue2; // فریز کردن پرش‌های ریز (تولید خط صاف)
+                        }
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } 
+                    else if (strongBull) {
+                        // بازار گاوی: خط زرد تبدیل به کفی می‌شود که فقط حق دارد بالا برود (پله‌های صعودی)
+                        double proposedFloor = emaPc0 - dynamicDistance;
+                        
+                        if (lastValue2 == 0.0 || event.price < lastValue2) {
+                            event.value2 = proposedFloor; // شکست کف -> ریست شدن
+                        } else if (proposedFloor > lastValue2 + quantumStep) {
+                            // فقط در صورتی پله صعودی جدید می‌سازیم که رشد روند از آستانه نویز بیشتر باشد
+                            event.value2 = proposedFloor;
+                        } else {
+                            event.value2 = lastValue2; // فریز کردن افت‌های ریز (تولید خط صاف)
+                        }
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } 
+                    else {
+                        // درگیری (میکرو و ماکرو مخالف هم هستند): فریز کردن برای جلوگیری از باخت در نویز
+                        event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2;
+                        isRatchetFrozen = true;
+                    }
                 } else {
-                    if (emaProbCrisis > 0.50) isCrisisState = true;
-                }
-
-                boolean isSideways = isSidewaysState;
-
-                // =========================================================================
-                // 🌟 THE GAME CHANGER: KINEMATIC MAGNETIC TAPE (KMT) + MG-SSA
-                // =========================================================================
-                
-                if (lastValue2 == 0.0) lastValue2 = emaPc0;
-
-                double pc0Velocity = emaPc0 - lastEmaPc0;
-                smoothedVelocity = 0.1 * pc0Velocity + 0.9 * smoothedVelocity;
-
-                // ۳. محاسبه میدان دافعه (Dynamic Repulsion) - اکنون با Fused Prob آپدیت می‌شود
-                double repulsionForce = noiseStdDev * Math.max(1.5, 1.0 + (emaEvr / 50.0)) * Math.pow(fusedTrendProb + 0.5, 2);
-                
-                double macroBias = (macroL1Value != 0.0) ? (event.price - macroL1Value) : 0.0;
-                boolean strongMacroBear = (projectedMacroSlope < 0) && (macroBias < 0);
-                boolean strongMacroBull = (projectedMacroSlope > 0) && (macroBias > 0);
-
-                if (strictMicroTrend == 1 && event.price < lastValue2 - noiseStdDev && !strongMacroBull) {
-                    strictMicroTrend = -1; 
-                } else if (strictMicroTrend == -1 && event.price > lastValue2 + noiseStdDev && !strongMacroBear) {
-                    strictMicroTrend = 1;  
-                } else if (strictMicroTrend == 0) {
-                    strictMicroTrend = (smoothedVelocity >= 0) ? 1 : -1;
-                }
-
-                double targetLine;
-                if (isSideways) {
-                    targetLine = event.price; 
-                } else {
-                    if (strictMicroTrend == 1 || strongMacroBull) {
-                        targetLine = emaPc0 - repulsionForce; 
+                    // Fallback (در صورتی که پایتون خاموش باشد)
+                    if (isSidewaysNoise || (emaPc0 - lastEmaPc0) < 0) {
+                        event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2; 
+                        isRatchetFrozen = true;
                     } else {
-                        targetLine = emaPc0 + repulsionForce;
-                    }
-                }
-
-                double smoothAlpha = isSideways ? 0.30 : 0.03; 
-                double proposedLine = lastValue2 + smoothAlpha * (targetLine - lastValue2);
-
-                isRatchetFrozen = false;
-                if (!isSideways) {
-                    if (strictMicroTrend == 1 || strongMacroBull) { 
-                        if (proposedLine < lastValue2) {
-                            proposedLine = lastValue2; 
-                            isRatchetFrozen = true;
-                        }
-                    } else if (strictMicroTrend == -1 || strongMacroBear) { 
-                        if (proposedLine > lastValue2) {
-                            proposedLine = lastValue2; 
-                            isRatchetFrozen = true;
+                        if (emaPc0 > lastValue2 + quantumStep || lastValue2 == 0.0) {
+                            event.value2 = emaPc0;
+                        } else {
+                            event.value2 = lastValue2;
                         }
                     }
                 }
-
-                event.value2 = proposedLine;
-                event.ssaTrend = proposedLine; 
-                event.regime = strictMicroTrend;
                 
                 lastEmaPc0 = emaPc0;
                 lastValue2 = event.value2;
-                
+
                 // =========================================================================
                 
-                event.momentumSignal = event.price - event.value2; 
-                event.crisisCapActive = isCrisisState ? 1 : 0; // استفاده از State فیلتر شده
-                
+                event.momentumSignal = event.price - event.pc0;
+                double CRISIS_THRESHOLD = 0.40; 
+                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
                 double TREND_P_STAR = 0.70;
-                // استفاده از فیوژن برای تعیین وزن سایز پوزیشن به صورت نرم
-                event.regimeWeight = (event.crisisCapActive == 0 && fusedTrendProb >= TREND_P_STAR) ? 
-                                     Math.min(1.0, (fusedTrendProb - TREND_P_STAR) / (1.0 - TREND_P_STAR)) : 0.0;
-                
+                double weight = 0.0;
+
+                if (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) {
+                    weight = Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR));
+                }
+                event.regimeWeight = weight;
                 event.gatedMomentum = event.momentumSignal * event.regimeWeight;
+
                 double MAX_POSITION = 1.0; 
                 event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | isSideways: %b | FusedProb: %.2f | Val2: %.2f | Frozen: %b\n", 
-                                      event.price, isSideways, fusedTrendProb, event.value2, isRatchetFrozen);
+                    System.out.printf("\n[DEBUG] Price: %.2f | SNR Power: %.2f | Proj Slope: %+.4f | Val2: %.2f\n", 
+                                      event.price, trendPower, projectedMacroSlope, event.value2);
                 }
                 
             } else {
@@ -527,9 +613,7 @@ public class HftRegimeDetection {
             this.ringBuffer = ringBuffer;
             this.setConnectionLostTimeout(0); 
         }
-        @Override public void onOpen(ServerHandshake handshakedata) {
-            System.out.println("✅ Connected to Binance WebSocket (Tick Stream).");
-        }
+        @Override public void onOpen(ServerHandshake handshakedata) {}
         @Override public void onMessage(String message) {
             try {
                 JsonObject json = JsonParser.parseString(message).getAsJsonObject();
@@ -622,28 +706,10 @@ public class HftRegimeDetection {
         zmqMacroThread.setDaemon(true);
         zmqMacroThread.start();
 
-        System.out.println("HFT Regime Detection System Started...");
-        
         Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 1024, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new BusySpinWaitStrategy());
         disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
         RingBuffer<TickEvent> ringBuffer = disruptor.start();
-        
         new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking(); 
-        
-        // جلوگیری از بسته شدن برنامه
         Thread.currentThread().join();
-    }
-
-    // =========================================================================
-    // Mock Classes for standalone compilation consistency
-    // =========================================================================
-    public static class QuantDSP {
-        public static class MesaStrategyMEE {
-            public MesaStrategyMEE(double v1, double v2, int v3, int v4, int v5) {}
-            public double updateAndGetCycle(double price) { return 15.0; } // Mock value
-        }
-        public static class LyapunovEstimator {
-            public static double calculateRigorousLLE(double[] data, int m, int tau, int tau2, int v) { return 0.02; } // Mock value
-        }
     }
 }
