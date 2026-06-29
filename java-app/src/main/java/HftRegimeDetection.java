@@ -113,6 +113,9 @@ public class HftRegimeDetection {
         private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
         private double lastTrendSlope = 0.0;
+        
+        // 🌟 NEW: State tracking for the Kinematic Ratchet
+        private int lastV2Regime = 0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -474,94 +477,87 @@ public class HftRegimeDetection {
                 event.hmmProbCrisis = emaProbCrisis;
                 
                 // =========================================================================
-                // 🌟 ELASTIC RATCHET EFFECT: SYMMETRIC MACRO-MICRO FUSION
+                // 🌟 STATE-SPACE KINEMATIC RATCHET: SYMMETRIC MACRO-MICRO FUSION
                 // =========================================================================
                 
-                boolean isSidewaysNoise = emaSidewayScore > 0.6 || trendPower < 0.15;
-
-                // Macro Bias & Dynamic Distance
-                double macroBias = event.price - macroL1Value; 
-                double dynamicDistance = smoothedDistance;
-                if (macroL1Value != 0.0 && event.price != 0) {
-                    double biasRatio = Math.min(Math.abs(macroBias) / event.price, 0.05); 
-                    dynamicDistance = smoothedDistance * (1.0 + biasRatio * 50.0);
-                }
-
-                // Quantum Step (Deadband)
-                double quantumStep = noiseStdDev * 0.4; 
-
-                // Directional Coupling D(t) = sgn(macro) * sgn(micro)
-                double microSlopeThreshold = noiseStdDev * 0.1;
-                boolean isMicroBull = emaTrendSlope > microSlopeThreshold;
-                boolean isMicroBear = emaTrendSlope < -microSlopeThreshold;
+                // 1. Determine Market State via Macro-Micro Consensus
+                boolean isSideways = emaSidewayScore > 0.60;
+                double microSlopeThreshold = Math.max(event.vress * 0.5, 1e-8);
                 
-                double D_t = Math.signum(projectedMacroSlope) * Math.signum(emaTrendSlope);
-
-                // Dynamic Smoothing Factor alpha(t)
-                // Calculated as a function of domCycle, vress, and hmmProbCrisis
-                double cyclicalFactor = Math.max(0.2, Math.min(1.5, 15.0 / Math.max(1.0, event.domCycle)));
-                double volatilityFactor = Math.max(0.5, Math.min(2.0, 1.0 + (event.vress / Math.max(event.price * 0.001, 1e-6))));
-                double crisisDampening = 1.0 - (0.7 * emaProbCrisis);
+                boolean microBull = emaTrendSlope > microSlopeThreshold;
+                boolean microBear = emaTrendSlope < -microSlopeThreshold;
+                boolean macroBull = projectedMacroSlope > 0;
+                boolean macroBear = projectedMacroSlope < 0;
                 
-                double alpha_t = 0.25 * cyclicalFactor * volatilityFactor * crisisDampening;
-                alpha_t = Math.max(0.01, Math.min(0.8, alpha_t)); // Clamp between 1% and 80%
-
-                // Elastic Ratchet with Override
-                double effectiveAlpha = alpha_t;
-
-                if (isSidewaysNoise) {
-                    // Flatline in pure noise
-                    event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2;
-                    isRatchetFrozen = true;
+                int targetRegime = lastV2Regime;
+                
+                if (isSideways) {
+                    targetRegime = 0; // Sideways dominates
                 } else {
-                    if (D_t < 0) {
-                        // Counter-trend: heavily damp/flatline alpha
-                        effectiveAlpha = alpha_t * 0.1;
-                        
-                        // Override Condition 1: Exceptionally strong counter-trend momentum
-                        boolean momentumOverride = Math.abs(emaTrendSlope) > (event.vress * 0.5);
-                        
-                        // Override Condition 2: Aggressive breach of opposite band
-                        boolean breachOverride = (isMicroBull && event.price > event.bandUpper) || 
-                                                (isMicroBear && event.price < event.bandLower);
-                        
-                        if (momentumOverride || breachOverride) {
-                            // Break macro lock, track reversal immediately
-                            effectiveAlpha = Math.min(1.0, alpha_t * 2.0);
-                        }
-                    }
-                    
-                    // Determine Target based on micro trend
-                    double target;
-                    if (isMicroBull) {
-                        target = emaPc0 - dynamicDistance; // Floor
-                    } else if (isMicroBear) {
-                        target = emaPc0 + dynamicDistance; // Ceiling
-                    } else {
-                        target = emaPc0; // Neutral
-                    }
+                    if (microBull && macroBull) targetRegime = 1;
+                    else if (microBear && macroBear) targetRegime = -1;
+                    else if (microBull && projectedMacroSlope == 0.0) targetRegime = 1; // Fallback
+                    else if (microBear && projectedMacroSlope == 0.0) targetRegime = -1; // Fallback
+                    else if (macroBull && !microBear) targetRegime = 1; // Macro bull, micro neutral
+                    else if (macroBear && !microBull) targetRegime = -1; // Macro bear, micro neutral
+                    // If complete conflict (e.g., macroBull and microBear), hold last regime to prevent whipsaw
+                }
 
-                    // Symmetric Staircase Smoothing
-                    if (lastValue2 == 0.0) {
-                        event.value2 = target;
+                // 2. Calculate Dynamic Smoothing Alpha based on domCycle
+                double cyclicalAlpha = 2.0 / (Math.max(20.0, event.domCycle / 2.0) + 1.0);
+                double alpha_v2 = Math.max(0.02, Math.min(0.15, cyclicalAlpha));
+
+                // 3. Define Target & Strict Bounds
+                double minDistance = Math.max(event.vress * 1.5, 1e-6);
+                double quantumStep = Math.max(event.vress * 0.5, 1e-6);
+                
+                double target;
+                if (targetRegime == 1) {
+                    target = event.bandLower; // Trailing Support
+                    if (target > event.price - minDistance) target = event.price - minDistance;
+                } else if (targetRegime == -1) {
+                    target = event.bandUpper; // Trailing Resistance
+                    if (target < event.price + minDistance) target = event.price + minDistance;
+                } else {
+                    target = emaPc0; // Mean Baseline
+                }
+
+                // 4. Apply State-Space Tracking with Structural Snap & Deadband
+                if (lastValue2 == 0.0) {
+                    event.value2 = target;
+                    isRatchetFrozen = false;
+                } else if (targetRegime != lastV2Regime) {
+                    // Regime changed: Instantly snap to the correct structural side to prevent crossing
+                    if (targetRegime == 1) {
+                        event.value2 = event.price - minDistance;
+                    } else if (targetRegime == -1) {
+                        event.value2 = event.price + minDistance;
                     } else {
-                        double diff = target - lastValue2;
-                        if (diff > quantumStep) {
-                            // Move Up
-                            event.value2 = lastValue2 + effectiveAlpha * diff;
-                            if (event.value2 > target) event.value2 = target; // Prevent overshoot
-                        } else if (diff < -quantumStep) {
-                            // Move Down
-                            event.value2 = lastValue2 + effectiveAlpha * diff;
-                            if (event.value2 < target) event.value2 = target; // Prevent undershoot
-                        } else {
-                            // Deadband - flatline
-                            event.value2 = lastValue2;
-                            isRatchetFrozen = true;
+                        event.value2 = emaPc0;
+                    }
+                    isRatchetFrozen = false;
+                } else {
+                    // Same regime: smoothly trail or flatline
+                    double diff = target - lastValue2;
+                    if (Math.abs(diff) < quantumStep) {
+                        // Deadband: hold flat to form clean, stable structural steps
+                        event.value2 = lastValue2;
+                        isRatchetFrozen = true;
+                    } else {
+                        // Smoothly track the target
+                        event.value2 = lastValue2 + alpha_v2 * diff;
+                        
+                        // Enforce strict bounds during transition so it never crosses the price
+                        if (targetRegime == 1 && event.value2 > event.price - minDistance) {
+                            event.value2 = event.price - minDistance;
+                        } else if (targetRegime == -1 && event.value2 < event.price + minDistance) {
+                            event.value2 = event.price + minDistance;
                         }
+                        isRatchetFrozen = false;
                     }
                 }
                 
+                lastV2Regime = targetRegime;
                 lastEmaPc0 = emaPc0;
                 lastValue2 = event.value2;
                 lastTrendSlope = emaTrendSlope;
