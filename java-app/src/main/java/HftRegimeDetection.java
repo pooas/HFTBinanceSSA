@@ -26,7 +26,6 @@ public class HftRegimeDetection {
     public static volatile double currentProbTrend = 0.0;  
     public static volatile double currentProbCrisis = 0.0; 
     
-    // 🌟 متغیرهای فرمانده (پایتون) - مجهز به سیستم فیزیک سینماتیک
     public static volatile double macroL1Value = 0.0;
     public static volatile double macroL1Slope = 0.0;
     public static volatile double macroL1Accel = 0.0;
@@ -63,6 +62,11 @@ public class HftRegimeDetection {
         public double positionSize;
         public double dynamicStopLoss;
         public int crisisCapActive;
+        
+        // 🌟 NEW: Sideway-aware trend fields
+        public double ssaTrendSlope;      // Slope of reconstructed trend
+        public double sidewayScore;      // 0 = strong trend, 1 = pure sideway
+        public double trendStrength;     // Normalized trend power [0,1]
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -106,6 +110,11 @@ public class HftRegimeDetection {
 
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
+        
+        // 🌟 NEW: Smoothed trend slope for stable trend detection from sidewaves
+        private double emaTrendSlope = 0.0;
+        private double emaSidewayScore = 0.0;
+        private double lastTrendSlope = 0.0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -183,6 +192,109 @@ public class HftRegimeDetection {
                 return maxM;
             }
         }
+        
+        // =========================================================================
+        // 🌟 NEW: SSA Reconstruction via Hankelization (Diagonal Averaging)
+        // This is the KEY change — proper SSA trend extraction from sideway waves.
+        // Instead of using a single point estimate, we reconstruct the full trend
+        // component time series and compute its slope.
+        // =========================================================================
+        
+        /**
+         * Reconstruct a component time series from SVD factors via diagonal averaging
+         * (Hankelization). Given rank-1 outer product sigma * u * v^T, the reconstructed
+         * elementary matrix is Hankelized back into a 1D time series of length N = L + K - 1.
+         * 
+         * @param sigma singular value
+         * @param u left singular vector (length L)
+         * @param v right singular vector (length K)
+         * @param L window length
+         * @param K number of lag vectors (N - L + 1)
+         * @return reconstructed time series of length N = L + K - 1
+         */
+        private double[] hankelizeRank1(double sigma, double[] u, double[] v, int L, int K) {
+            int N = L + K - 1;
+            double[] series = new double[N];
+            // Element (i,j) of rank-1 matrix = sigma * u[i] * v[j]
+            // Hankelization: average anti-diagonals where i+j = const
+            for (int k = 0; k < N; k++) {
+                double sum = 0.0;
+                int cnt = 0;
+                int iMin = Math.max(0, k - K + 1);
+                int iMax = Math.min(L - 1, k);
+                for (int i = iMin; i <= iMax; i++) {
+                    int j = k - i;
+                    if (j >= 0 && j < K) {
+                        sum += sigma * u[i] * v[j];
+                        cnt++;
+                    }
+                }
+                series[k] = (cnt > 0) ? (sum / cnt) : 0.0;
+            }
+            return series;
+        }
+        
+        /**
+         * Compute linear regression slope of a series — this is the trend direction.
+         * Uses ordinary least squares: slope = cov(t, y) / var(t).
+         */
+        private double computeTrendSlope(double[] series) {
+            int n = series.length;
+            if (n < 2) return 0.0;
+            double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+            for (int i = 0; i < n; i++) {
+                sumX += i;
+                sumY += series[i];
+                sumXY += (double) i * series[i];
+                sumX2 += (double) i * i;
+            }
+            double denom = (double) n * sumX2 - sumX * sumX;
+            if (Math.abs(denom) < 1e-12) return 0.0;
+            return ((double) n * sumXY - sumX * sumY) / denom;
+        }
+        
+        /**
+         * Detect sideway pattern by analyzing eigenvalue pairing structure.
+         * In SSA, oscillatory components produce paired singular values (sigma_k ≈ sigma_{k+1}).
+         * A pure trend produces a single isolated dominant singular value.
+         * 
+         * @param sigmas sorted singular values (descending)
+         * @param numSingularValues count of singular values
+         * @return sideway score in [0, 1]: 0 = strong trend, 1 = pure sideway
+         */
+        private double computeSidewayScore(double[] sigmas, int numSingularValues) {
+            if (numSingularValues < 4) return 0.0;
+            
+            // Compute total energy for normalization
+            double totalEnergy = 0.0;
+            for (int i = 0; i < numSingularValues; i++) {
+                totalEnergy += sigmas[i] * sigmas[i];
+            }
+            if (totalEnergy < 1e-12) return 1.0;
+            
+            // Energy in the first (trend) component
+            double trendEnergy = sigmas[0] * sigmas[0];
+            
+            // Energy in oscillatory pairs: components 1-2, 3-4, etc.
+            // If sigmas[1] ≈ sigmas[2], that's an oscillatory pair (sideway wave)
+            double oscillatoryEnergy = 0.0;
+            for (int i = 1; i + 1 < numSingularValues; i += 2) {
+                double pairRatio = Math.min(sigmas[i], sigmas[i + 1]) / 
+                                   Math.max(sigmas[i], sigmas[i + 1] + 1e-12);
+                // If ratio close to 1 -> paired (oscillatory) -> contributes to sideway
+                if (pairRatio > 0.85) {
+                    oscillatoryEnergy += sigmas[i] * sigmas[i] + sigmas[i + 1] * sigmas[i + 1];
+                }
+            }
+            
+            // Sideway score = oscillatory energy / total energy, 
+            // scaled by how weak the trend component is relative to oscillation
+            double oscRatio = oscillatoryEnergy / totalEnergy;
+            double trendRatio = trendEnergy / totalEnergy;
+            
+            // High sideway score when oscillation dominates and trend is weak
+            return Math.max(0.0, Math.min(1.0, oscRatio * (1.0 - trendRatio)));
+        }
 
         @Override
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
@@ -226,11 +338,15 @@ public class HftRegimeDetection {
                 }
                 
                 double rawPc0, rawEvr, rawGapFactor;
+                double rawTrendSlope = 0.0;
+                double rawSidewayScore = 0.0;
 
                 if (frobeniusSq < 1e-10) {
                     rawPc0 = mean;
                     rawEvr = 100.0; 
                     rawGapFactor = 0.0;
+                    rawTrendSlope = 0.0;
+                    rawSidewayScore = 1.0; // Flat = maximum sideway
                 } else {
                     SimpleSVD<SimpleMatrix> svd = X.svd();
                     SimpleMatrix U = svd.getU();
@@ -258,13 +374,59 @@ public class HftRegimeDetection {
                         }
                     }
                     
-                    rawPc0 = mean + (sigma0 * U.get(L - 1, maxIndex) * V.get(K - 1, maxIndex));
+                    // 🌟 KEY CHANGE: Reconstruct the trend component time series
+                    // using Hankelization instead of just using the last point.
+                    // This extracts the underlying trend even when the data
+                    // contains strong oscillatory (sideway) components.
+                    
+                    // Extract the dominant singular vectors for trend component
+                    double[] u0 = new double[L];
+                    double[] v0 = new double[K];
+                    for (int i = 0; i < L; i++) u0[i] = U.get(i, maxIndex);
+                    for (int j = 0; j < K; j++) v0[j] = V.get(j, maxIndex);
+                    
+                    // Hankelize the rank-1 matrix to get the trend time series
+                    double[] trendSeries = hankelizeRank1(sigma0, u0, v0, L, K);
+                    
+                    // Add back the mean (since we centered the data)
+                    for (int i = 0; i < trendSeries.length; i++) {
+                        trendSeries[i] += mean;
+                    }
+                    
+                    // Compute the trend slope from the reconstructed series
+                    rawTrendSlope = computeTrendSlope(trendSeries);
+                    
+                    // The trend value at the last point (most recent observation)
+                    rawPc0 = trendSeries[trendSeries.length - 1];
+                    
+                    // 🌟 NEW: Compute sideway score from eigenvalue pairing structure
+                    rawSidewayScore = computeSidewayScore(sigmas, numSingularValues);
+                    
                     rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
                     double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
                     rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
                 double alphaMetrics = 0.05;  
+                
+                // 🌟 Smooth the trend slope and sideway score for stability
+                double alphaSlope = 0.1;
+                double alphaSideway = 0.05;
+                
+                if (emaTrendSlope == 0.0 && rawTrendSlope != 0.0) {
+                    emaTrendSlope = rawTrendSlope;
+                } else {
+                    // Adaptive smoothing: when sideway score is high, smooth more aggressively
+                    // to avoid false trend signals from noise
+                    double adaptiveSlopeAlpha = alphaSlope * (1.0 - 0.5 * emaSidewayScore);
+                    emaTrendSlope = adaptiveSlopeAlpha * rawTrendSlope + (1.0 - adaptiveSlopeAlpha) * emaTrendSlope;
+                }
+                
+                if (emaSidewayScore == 0.0) {
+                    emaSidewayScore = rawSidewayScore;
+                } else {
+                    emaSidewayScore = alphaSideway * rawSidewayScore + (1.0 - alphaSideway) * emaSidewayScore;
+                }
                 
                 if (emaPc0 == 0.0) {
                     emaPc0 = rawPc0;
@@ -275,9 +437,15 @@ public class HftRegimeDetection {
                     emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
                     
                     double evrFactor = Math.min(emaEvr / 100.0, 1.0);
-                    double adaptiveAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
+                    
+                    // 🌟 KEY: When sideway score is high, the pc0 should follow the
+                    // reconstructed trend more slowly to filter oscillatory noise.
+                    // When trend is strong, follow more quickly.
+                    double baseAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
+                    double sidewayPenalty = 1.0 - 0.7 * emaSidewayScore; // Reduce alpha in sideway markets
+                    double adaptiveAlpha = baseAlpha * Math.max(0.3, sidewayPenalty);
 
-                    // 🌟 هم‌افزایی با پیش‌بینی فیزیک (Synergy)
+                    // Synergy with macro physics prediction
                     double rawMicroSlope = rawPc0 - lastEmaPc0;
                     boolean isMacroBullish = projectedMacroSlope >= 0;
                     boolean isMicroBullish = rawMicroSlope >= 0;
@@ -316,8 +484,11 @@ public class HftRegimeDetection {
                 double alpha = 4.0; 
                 double beta = 2.0;  
                 
-                double rawMultiplier = 1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor;
-                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 5.0));
+                // 🌟 Sideway-aware band multiplier: widen bands in sideway markets
+                // to prevent false regime switches from oscillatory noise
+                double sidewayBandWiden = 1.0 + 1.5 * emaSidewayScore;
+                double rawMultiplier = (1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor) * sidewayBandWiden;
+                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 8.0));
 
                 double rawDistance = noiseStdDev * mMultiplier; 
                 if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
@@ -329,15 +500,34 @@ public class HftRegimeDetection {
                 event.bandLower = emaPc0 - smoothedDistance;
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
+                
+                // 🌟 NEW: Populate sideway-aware trend fields
+                event.ssaTrendSlope = emaTrendSlope;
+                event.sidewayScore = emaSidewayScore;
+                
+                // Trend strength: combine EVR, eigen gap, probability, and inverse sideway score
+                double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
+                event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
 
                 double currentLineVal;
 
+                // 🌟 KEY CHANGE: Use the reconstructed trend SLOPE to determine regime
+                // instead of just band crossovers. This is more robust in sideway markets.
+                
+                // Determine regime from trend slope direction (primary) and band crossover (secondary)
+                double slopeThreshold = noiseStdDev * 0.1; // Minimum slope to count as trending
+                
                 if (currentMarketRegime == 1) { 
                     double proposedSupport = event.bandLower;
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
                                      Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
                     
-                    if (event.price < currentLineVal) {
+                    // 🌟 In sideway markets, require BOTH a band breach AND a significant
+                    // trend slope against the current regime to switch — prevents whipsaws
+                    boolean bandBreach = event.price < currentLineVal;
+                    boolean strongCounterSlope = emaTrendSlope < -slopeThreshold && emaSidewayScore < 0.7;
+                    
+                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
                         currentMarketRegime = -1; 
                         currentLineVal = event.bandUpper; 
                     }
@@ -346,7 +536,10 @@ public class HftRegimeDetection {
                     currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
                                      Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
                     
-                    if (event.price > currentLineVal) {
+                    boolean bandBreach = event.price > currentLineVal;
+                    boolean strongCounterSlope = emaTrendSlope > slopeThreshold && emaSidewayScore < 0.7;
+                    
+                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
                         currentMarketRegime = 1; 
                         currentLineVal = event.bandLower; 
                     }
@@ -361,95 +554,120 @@ public class HftRegimeDetection {
                 
                 // =========================================================================
                 // 🌟 THE GAME CHANGER: QUANTUM KINEMATIC RATCHET (MACRO-MICRO FUSION)
+                // Now enhanced with sideway-aware trend slope detection
                 // =========================================================================
-                // ۱. تشخیص آکادمیک رنج بودن (SNR Gating) بر اساس قدرت روند و خلوص مقادیر ویژه
-                double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend;
-                boolean isSidewaysNoise = trendPower < 0.15; // فیلتر قدرتمند تشخیص بازار بی‌تصمیم
+                
+                // 1. SNR Gating — now uses sideway score as primary filter
+                boolean isSidewaysNoise = emaSidewayScore > 0.6 || trendPower < 0.15;
 
-                // ۲. کشش جاذبه ماکرو
+                // 2. Macro gravity pull
                 double macroBias = event.price - macroL1Value; 
                 
-                // ۳. باندینگ دینامیک
+                // 3. Dynamic banding
                 double dynamicDistance = smoothedDistance;
                 if (macroL1Value != 0.0 && event.price != 0) {
                     double biasRatio = Math.min(Math.abs(macroBias) / event.price, 0.05); 
                     dynamicDistance = smoothedDistance * (1.0 + biasRatio * 50.0);
                 }
 
-                // ۴. 💡 استپ‌های کوانتومی (شبیه‌ساز رفتار Cvxpy L1-Trend)
-                // رازِ ساختن پله‌های کاملاً صاف و بدون لرزش (Deadband) در این خط است
+                // 4. Quantum steps (deadband)
                 double quantumStep = noiseStdDev * 0.4; 
 
-                boolean strongBear = (projectedMacroSlope < 0) && (macroBias < 0);
-                boolean strongBull = (projectedMacroSlope > 0) && (macroBias > 0);
+                // 🌟 NEW: Use trend slope to determine bull/bear direction
+                // even in sideway markets where band crossovers are unreliable.
+                // The reconstructed SSA trend slope reveals the true underlying direction.
+                boolean slopeBull = emaTrendSlope > 0;
+                boolean slopeBear = emaTrendSlope < 0;
+                
+                boolean strongBear = (projectedMacroSlope < 0) && (macroBias < 0) && slopeBear;
+                boolean strongBull = (projectedMacroSlope > 0) && (macroBias > 0) && slopeBull;
 
                 if (macroL1Value != 0.0) {
                     if (isSidewaysNoise) {
-                        // 🛑 فریز مطلق: در زمان نویز، خط زرد تکان نمی‌خورد و صاف (Flatline) می‌ماند
+                        // 🛑 Freeze: in sideway noise, hold the yellow line flat
                         event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2;
                         isRatchetFrozen = true;
                     } 
                     else if (strongBear) {
-                        // بازار خرسی: خط زرد تبدیل به سقفی می‌شود که فقط حق دارد پایین بیاید (پله‌های نزولی)
                         double proposedCeiling = emaPc0 + dynamicDistance;
                         
                         if (lastValue2 == 0.0 || event.price > lastValue2) {
-                            event.value2 = proposedCeiling; // شکست سقف -> ریست شدن
+                            event.value2 = proposedCeiling;
                         } else if (proposedCeiling < lastValue2 - quantumStep) {
-                            // فقط در صورتی یک پله نزولی جدید می‌سازیم که افتِ روند از آستانه نویز (کوانتوم استپ) بیشتر باشد
                             event.value2 = proposedCeiling;
                         } else {
-                            event.value2 = lastValue2; // فریز کردن پرش‌های ریز (تولید خط صاف)
+                            event.value2 = lastValue2;
                         }
                         isRatchetFrozen = (event.value2 == lastValue2);
                     } 
                     else if (strongBull) {
-                        // بازار گاوی: خط زرد تبدیل به کفی می‌شود که فقط حق دارد بالا برود (پله‌های صعودی)
                         double proposedFloor = emaPc0 - dynamicDistance;
                         
                         if (lastValue2 == 0.0 || event.price < lastValue2) {
-                            event.value2 = proposedFloor; // شکست کف -> ریست شدن
+                            event.value2 = proposedFloor;
                         } else if (proposedFloor > lastValue2 + quantumStep) {
-                            // فقط در صورتی پله صعودی جدید می‌سازیم که رشد روند از آستانه نویز بیشتر باشد
                             event.value2 = proposedFloor;
                         } else {
-                            event.value2 = lastValue2; // فریز کردن افت‌های ریز (تولید خط صاف)
+                            event.value2 = lastValue2;
                         }
                         isRatchetFrozen = (event.value2 == lastValue2);
                     } 
                     else {
-                        // درگیری (میکرو و ماکرو مخالف هم هستند): فریز کردن برای جلوگیری از باخت در نویز
+                        // Conflict (micro and macro disagree): freeze
                         event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2;
                         isRatchetFrozen = true;
                     }
                 } else {
-                    // Fallback (در صورتی که پایتون خاموش باشد)
-                    if (isSidewaysNoise || (emaPc0 - lastEmaPc0) < 0) {
+                    // Fallback (Python offline): use trend slope as primary signal
+                    if (isSidewaysNoise) {
                         event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2; 
                         isRatchetFrozen = true;
-                    } else {
-                        if (emaPc0 > lastValue2 + quantumStep || lastValue2 == 0.0) {
-                            event.value2 = emaPc0;
+                    } else if (emaTrendSlope > slopeThreshold) {
+                        // Upward trend detected from SSA reconstruction
+                        double proposedFloor = emaPc0 - dynamicDistance;
+                        if (lastValue2 == 0.0 || proposedFloor > lastValue2 + quantumStep) {
+                            event.value2 = proposedFloor;
                         } else {
                             event.value2 = lastValue2;
                         }
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } else if (emaTrendSlope < -slopeThreshold) {
+                        // Downward trend detected from SSA reconstruction
+                        double proposedCeiling = emaPc0 + dynamicDistance;
+                        if (lastValue2 == 0.0 || proposedCeiling < lastValue2 - quantumStep) {
+                            event.value2 = proposedCeiling;
+                        } else {
+                            event.value2 = lastValue2;
+                        }
+                        isRatchetFrozen = (event.value2 == lastValue2);
+                    } else {
+                        // Weak slope — freeze
+                        event.value2 = (lastValue2 == 0.0) ? emaPc0 : lastValue2;
+                        isRatchetFrozen = true;
                     }
                 }
                 
                 lastEmaPc0 = emaPc0;
                 lastValue2 = event.value2;
+                lastTrendSlope = emaTrendSlope;
 
                 // =========================================================================
                 
                 event.momentumSignal = event.price - event.pc0;
                 double CRISIS_THRESHOLD = 0.40; 
                 event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
-                double TREND_P_STAR = 0.70;
+                
+                // 🌟 Trend probability threshold: raise the bar in sideway markets
+                double TREND_P_STAR = 0.70 + 0.15 * emaSidewayScore; // Higher threshold when sideway
                 double weight = 0.0;
 
                 if (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) {
                     weight = Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR));
                 }
+                
+                // 🌟 Multiply weight by trend strength to further reduce exposure in sideways markets
+                weight *= event.trendStrength;
+                
                 event.regimeWeight = weight;
                 event.gatedMomentum = event.momentumSignal * event.regimeWeight;
 
@@ -458,8 +676,9 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | SNR Power: %.2f | Proj Slope: %+.4f | Val2: %.2f\n", 
-                                      event.price, trendPower, projectedMacroSlope, event.value2);
+                    System.out.printf("\n[DEBUG] Price: %.2f | SidewayScore: %.3f | TrendSlope: %+.6f | TrendStrength: %.3f | SNR: %.3f | ProjSlope: %+.4f | Val2: %.2f\n", 
+                                      event.price, emaSidewayScore, emaTrendSlope, event.trendStrength, 
+                                      trendPower, projectedMacroSlope, event.value2);
                 }
                 
             } else {
@@ -483,11 +702,14 @@ public class HftRegimeDetection {
                 event.crisisCapActive = 0;
                 
                 event.value2 = event.price;
+                event.ssaTrendSlope = 0.0;
+                event.sidewayScore = 1.0;
+                event.trendStrength = 0.0;
                 lastEmaPc0 = event.price;
                 lastValue2 = event.price;
             }
 
-            // --- محاسبه لیاپانوف ---
+            // --- Lyapunov computation ---
             ssaTrendBuffer[ssaHead] = event.ssaTrend;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
@@ -667,7 +889,6 @@ public class HftRegimeDetection {
         zmqThread.setDaemon(true);
         zmqThread.start();
 
-        // 🌟 شنونده هوش ماکرو (پایتون) مجهز به محاسبه شتاب
         Thread zmqMacroThread = new Thread(() -> {
             try (ZContext context = new ZContext()) {
                 ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
@@ -691,7 +912,6 @@ public class HftRegimeDetection {
                                 macroL1Value = Double.parseDouble(parts[0]);
                                 double newSlope = Double.parseDouble(parts[1]);
                                 
-                                // محاسبه شتاب و پیش‌بینی تیلور (شتاب + سرعت)
                                 if (macroL1Slope != 0.0) {
                                     macroL1Accel = newSlope - macroL1Slope;
                                 }
