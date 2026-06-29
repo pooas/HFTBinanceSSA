@@ -110,11 +110,13 @@ public class HftRegimeDetection {
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
         
+        // 🌟 فیلد جدید برای ذخیره سرعت/شتاب فیلتر ردیاب (Zero-Lag DSP)
+        private double lastVelocity2 = 0.0; 
+        
         private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
         private double lastTrendSlope = 0.0;
         
-        // 🌟 NEW: State tracking for the Kinematic Ratchet
         private int lastV2Regime = 0;
 
         public static class ChaosMath {
@@ -477,10 +479,11 @@ public class HftRegimeDetection {
                 event.hmmProbCrisis = emaProbCrisis;
                 
                 // =========================================================================
-                // 🌟 STATE-SPACE KINEMATIC RATCHET: SYMMETRIC MACRO-MICRO FUSION
+                // 🌟 REGIME-AWARE SAVITZKY-GOLAY FILTERED SSA W/ ASYMPTOTIC REPULSION
+                // پیاده‌سازی فیلتر ردیاب اسپلاین (کاهش تاخیر به صفر) با میدان دافعه هندسی
                 // =========================================================================
                 
-                // 1. Determine Market State via Macro-Micro Consensus
+                // 1. تشخیص جهت رژیم (Target Regime Consensus)
                 boolean isSideways = emaSidewayScore > 0.60;
                 double microSlopeThreshold = Math.max(event.vress * 0.5, 1e-8);
                 
@@ -490,78 +493,77 @@ public class HftRegimeDetection {
                 boolean macroBear = projectedMacroSlope < 0;
                 
                 int targetRegime = lastV2Regime;
-                
                 if (isSideways) {
-                    targetRegime = 0; // Sideways dominates
+                    targetRegime = 0; // بازار خنثی
                 } else {
                     if (microBull && macroBull) targetRegime = 1;
                     else if (microBear && macroBear) targetRegime = -1;
-                    else if (microBull && projectedMacroSlope == 0.0) targetRegime = 1; // Fallback
-                    else if (microBear && projectedMacroSlope == 0.0) targetRegime = -1; // Fallback
-                    else if (macroBull && !microBear) targetRegime = 1; // Macro bull, micro neutral
-                    else if (macroBear && !microBull) targetRegime = -1; // Macro bear, micro neutral
-                    // If complete conflict (e.g., macroBull and microBear), hold last regime to prevent whipsaw
+                    else if (microBull && projectedMacroSlope == 0.0) targetRegime = 1;
+                    else if (microBear && projectedMacroSlope == 0.0) targetRegime = -1;
+                    else if (macroBull && !microBear) targetRegime = 1; 
+                    else if (macroBear && !microBull) targetRegime = -1; 
                 }
 
-                // 2. Calculate Dynamic Smoothing Alpha based on domCycle
-                double cyclicalAlpha = 2.0 / (Math.max(20.0, event.domCycle / 2.0) + 1.0);
-                double alpha_v2 = Math.max(0.02, Math.min(0.15, cyclicalAlpha));
-
-                // 3. Define Target & Strict Bounds
-                double minDistance = Math.max(event.vress * 1.5, 1e-6);
-                double quantumStep = Math.max(event.vress * 0.5, 1e-6);
-                
-                double target;
-                if (targetRegime == 1) {
-                    target = event.bandLower; // Trailing Support
-                    if (target > event.price - minDistance) target = event.price - minDistance;
-                } else if (targetRegime == -1) {
-                    target = event.bandUpper; // Trailing Resistance
-                    if (target < event.price + minDistance) target = event.price + minDistance;
-                } else {
-                    target = emaPc0; // Mean Baseline
-                }
-
-                // 4. Apply State-Space Tracking with Structural Snap & Deadband
                 if (lastValue2 == 0.0) {
-                    event.value2 = target;
-                    isRatchetFrozen = false;
-                } else if (targetRegime != lastV2Regime) {
-                    // Regime changed: Instantly snap to the correct structural side to prevent crossing
-                    if (targetRegime == 1) {
-                        event.value2 = event.price - minDistance;
-                    } else if (targetRegime == -1) {
-                        event.value2 = event.price + minDistance;
-                    } else {
-                        event.value2 = emaPc0;
-                    }
-                    isRatchetFrozen = false;
-                } else {
-                    // Same regime: smoothly trail or flatline
-                    double diff = target - lastValue2;
-                    if (Math.abs(diff) < quantumStep) {
-                        // Deadband: hold flat to form clean, stable structural steps
-                        event.value2 = lastValue2;
-                        isRatchetFrozen = true;
-                    } else {
-                        // Smoothly track the target
-                        event.value2 = lastValue2 + alpha_v2 * diff;
+                    lastValue2 = emaPc0;
+                    lastVelocity2 = 0.0;
+                }
+
+                // 2. فیلتر هموارساز DSP کنترل‌شده با HMM (آلفا-بتا ترکینگ برای تاخیر صفر)
+                // پایه آلفا با چرخه بازار (domCycle) تنظیم می‌شود
+                double cyclicalAlpha = 2.0 / (Math.max(20.0, event.domCycle / 2.0) + 1.0);
+                
+                // HMM Gating: دروازه‌بندی با احتمال مارکوف مخفی
+                // در بحران (ProbCrisis بالا)، فیلتر سفت می‌شود (آلفا کم) تا نویز را نادیده بگیرد
+                // در روند (ProbTrend بالا)، فیلتر نرم می‌شود (آلفا زیاد) تا سریع واکنش نشان دهد
+                double hmmGatingFactor = 1.0 - (emaProbCrisis * 0.7) + (emaProbTrend * 0.5);
+                
+                double alpha_sg = Math.max(0.01, Math.min(0.8, cyclicalAlpha * hmmGatingFactor));
+                // رابطه میراگر بحرانی (Critically Damped) برای کنترل شتاب
+                double beta_sg = (alpha_sg * alpha_sg) / (2.0 - alpha_sg);
+
+                // گام اول فضای حالت: پیش‌بینی (Predict)
+                double predictedV2 = lastValue2 + lastVelocity2;
+                
+                // گام دوم فضای حالت: بروزرسانی با دیتای خام SSA (Update)
+                double residual_v2 = emaPc0 - predictedV2;
+                double rawV2 = predictedV2 + alpha_sg * residual_v2;
+                double currentVel2 = lastVelocity2 + beta_sg * residual_v2;
+
+                // 3. میدان دافعه مجانبی (Asymptotic Repulsion Field) - قانون عدم تقاطع
+                // به جای پرش ناگهانی (Snap)، از یک تابع نمایی برای دور کردن نرم خط استفاده می‌کنیم
+                double safeMargin = Math.max(event.vress * 1.5, 1e-6); 
+                double repulsionStrength = Math.max(0.2, emaProbTrend); // در ترندهای قوی، دافعه محکم‌تر است
+
+                if (targetRegime == 1) { // روند صعودی: خط باید مثل حمایت زیر قیمت بماند
+                    double boundary = event.price - safeMargin;
+                    if (rawV2 > boundary) { 
+                        // نفوذ به میدان دافعه
+                        double penetration = rawV2 - boundary;
+                        // تابع پنالتی نمایی برای هُل دادن خط به سمت پایین
+                        double penalty = safeMargin * (1.0 - Math.exp(-penetration / (safeMargin * 0.5)));
                         
-                        // Enforce strict bounds during transition so it never crosses the price
-                        if (targetRegime == 1 && event.value2 > event.price - minDistance) {
-                            event.value2 = event.price - minDistance;
-                        } else if (targetRegime == -1 && event.value2 < event.price + minDistance) {
-                            event.value2 = event.price + minDistance;
-                        }
-                        isRatchetFrozen = false;
+                        rawV2 -= penalty * repulsionStrength;
+                        currentVel2 -= (penalty * repulsionStrength * 0.1); // کاهش شتاب برای جلوگیری از نوسان
+                    }
+                } else if (targetRegime == -1) { // روند نزولی: خط باید مثل مقاومت بالای قیمت بماند
+                    double boundary = event.price + safeMargin;
+                    if (rawV2 < boundary) {
+                        double penetration = boundary - rawV2;
+                        double penalty = safeMargin * (1.0 - Math.exp(-penetration / (safeMargin * 0.5)));
+                        
+                        rawV2 += penalty * repulsionStrength;
+                        currentVel2 += (penalty * repulsionStrength * 0.1);
                     }
                 }
-                
-                lastV2Regime = targetRegime;
-                lastEmaPc0 = emaPc0;
-                lastValue2 = event.value2;
-                lastTrendSlope = emaTrendSlope;
+                // در حالت 0 (سایدوی)، دافعه غیرفعال است تا خط از وسط قیمت (میانگین) عبور کند.
 
+                event.value2 = rawV2;
+                lastValue2 = rawV2;
+                lastVelocity2 = currentVel2;
+                lastV2Regime = targetRegime;
+                lastTrendSlope = emaTrendSlope;
+                
                 // =========================================================================
                 
                 event.momentumSignal = event.price - event.pc0;
@@ -585,9 +587,9 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | SidewayScore: %.3f | TrendSlope: %+.6f | TrendStrength: %.3f | SNR: %.3f | ProjSlope: %+.4f | Val2: %.2f\n", 
+                    System.out.printf("\n[DEBUG] Price: %.2f | SidewayScore: %.3f | TrendSlope: %+.6f | TrendStrength: %.3f | ProjSlope: %+.4f | Val2: %.2f\n", 
                                       event.price, emaSidewayScore, emaTrendSlope, event.trendStrength, 
-                                      trendPower, projectedMacroSlope, event.value2);
+                                      projectedMacroSlope, event.value2);
                 }
                 
             } else {
@@ -616,6 +618,7 @@ public class HftRegimeDetection {
                 event.trendStrength = 0.0;
                 lastEmaPc0 = event.price;
                 lastValue2 = event.price;
+                lastVelocity2 = 0.0;
             }
 
             // --- Lyapunov computation ---
