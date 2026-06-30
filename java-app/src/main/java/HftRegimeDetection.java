@@ -235,6 +235,7 @@ public class HftRegimeDetection {
         
         private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
+        private double lastTrendSlope = 0.0;
         
         private int lastV2Regime = 0;
 
