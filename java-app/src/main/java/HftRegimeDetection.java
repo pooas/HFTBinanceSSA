@@ -68,130 +68,6 @@ public class HftRegimeDetection {
         public double trendStrength;     
     }
 
-    // =========================================================================
-    // 🌟 CAUSAL (ONE-SIDED) SAVITZKY-GOLAY FILTER
-    // =========================================================================
-    public static class CausalSavitzkyGolay {
-        private final double[][][] valueCoeffs;  
-        private final double[][][] slopeCoeffs;  
-        private final int maxWindow;
-
-        public CausalSavitzkyGolay(int maxWindow) {
-            this.maxWindow = maxWindow;
-            this.valueCoeffs = new double[maxWindow + 1][4][];
-            this.slopeCoeffs = new double[maxWindow + 1][4][];
-
-            for (int w = 3; w <= maxWindow; w++) {
-                for (int d = 1; d <= Math.min(3, w - 1); d++) {
-                    computeAndStore(w, d);
-                }
-            }
-        }
-
-        private void computeAndStore(int N, int deg) {
-            int p = deg;
-            double[][] A = new double[N][p + 1];
-            for (int i = 0; i < N; i++) {
-                double x = 1.0;
-                for (int j = 0; j <= p; j++) { A[i][j] = x; x *= i; }
-            }
-
-            double[][] AtA = new double[p + 1][p + 1];
-            for (int i = 0; i <= p; i++)
-                for (int j = 0; j <= p; j++) {
-                    double s = 0;
-                    for (int k = 0; k < N; k++) s += A[k][i] * A[k][j];
-                    AtA[i][j] = s;
-                }
-
-            double[][] inv = invert(AtA, p + 1);
-
-            double[][] M = new double[p + 1][N];
-            for (int i = 0; i <= p; i++)
-                for (int j = 0; j < N; j++) {
-                    double s = 0;
-                    for (int k = 0; k <= p; k++) s += inv[i][k] * A[j][k];
-                    M[i][j] = s;
-                }
-
-            double[] xp = new double[p + 1];
-            double x = 1.0;
-            for (int j = 0; j <= p; j++) { xp[j] = x; x *= (N - 1); }
-
-            double[] vc = new double[N];
-            for (int i = 0; i < N; i++) {
-                double s = 0;
-                for (int j = 0; j <= p; j++) s += xp[j] * M[j][i];
-                vc[i] = s;
-            }
-
-            double[] sc = new double[N];
-            for (int i = 0; i < N; i++) {
-                double s = 0;
-                for (int j = 1; j <= p; j++) s += j * Math.pow(N - 1, j - 1) * M[j][i];
-                sc[i] = s;
-            }
-
-            valueCoeffs[N][deg] = vc;
-            slopeCoeffs[N][deg] = sc;
-        }
-
-        private double[][] invert(double[][] m, int n) {
-            double[][] a = new double[n][2 * n];
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < n; j++) a[i][j] = m[i][j];
-                a[i][n + i] = 1.0;
-            }
-            for (int i = 0; i < n; i++) {
-                int piv = i;
-                for (int k = i + 1; k < n; k++)
-                    if (Math.abs(a[k][i]) > Math.abs(a[piv][i])) piv = k;
-                if (piv != i) { double[] t = a[i]; a[i] = a[piv]; a[piv] = t; }
-                double pv = a[i][i];
-                if (Math.abs(pv) < 1e-15) continue;
-                for (int j = 0; j < 2 * n; j++) a[i][j] /= pv;
-                for (int k = 0; k < n; k++) {
-                    if (k != i) {
-                        double f = a[k][i];
-                        for (int j = 0; j < 2 * n; j++) a[k][j] -= f * a[i][j];
-                    }
-                }
-            }
-            double[][] r = new double[n][n];
-            for (int i = 0; i < n; i++)
-                for (int j = 0; j < n; j++) r[i][j] = a[i][n + j];
-            return r;
-        }
-
-        public double filterValue(double[] data, int window, int degree) {
-            if (window > maxWindow) window = maxWindow;
-            if (window <= degree) window = degree + 1;
-            if (valueCoeffs[window][degree] == null) computeAndStore(window, degree);
-            double[] c = valueCoeffs[window][degree];
-            double r = 0;
-            int n = data.length;
-            int off = n - window;
-            if (off < 0) { window = n; off = 0; c = valueCoeffs[window][degree]; }
-            if (c == null) return data[n - 1];
-            for (int i = 0; i < window; i++) r += c[i] * data[off + i];
-            return r;
-        }
-
-        public double filterSlope(double[] data, int window, int degree) {
-            if (window > maxWindow) window = maxWindow;
-            if (window <= degree) window = degree + 1;
-            if (slopeCoeffs[window][degree] == null) computeAndStore(window, degree);
-            double[] c = slopeCoeffs[window][degree];
-            double r = 0;
-            int n = data.length;
-            int off = n - window;
-            if (off < 0) { window = n; off = 0; c = slopeCoeffs[window][degree]; }
-            if (c == null) return 0.0;
-            for (int i = 0; i < window; i++) r += c[i] * data[off + i];
-            return r;
-        }
-    }
-
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
         
         private final QuantDSP.MesaStrategyMEE mesaStrategy = new QuantDSP.MesaStrategyMEE(8.0, 330.0, 150, 5, 3);
@@ -220,36 +96,21 @@ public class HftRegimeDetection {
         private int currentM = 3;
 
         private int currentMarketRegime = 1;
-        private double smoothedDistance = 0.0;
 
-        private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
         private double emaGapFactor = 0.0;
-
         private double emaProbTrend = 0.0;
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
 
-        private double lastEmaPc0 = 0.0;
-        private double lastValue2 = 0.0;
+        // 🌟 ZLEMA Wave variables (The Game Changer for smooth lines)
+        private double ema1_pc0 = 0.0;
+        private double ema2_pc0 = 0.0;
+        private double lastSmoothWave = 0.0;
+        private double lastSmoothWaveSlope = 0.0;
         
-        private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
-        private double lastTrendSlope = 0.0;
-        
         private int lastV2Regime = 0;
-
-        // 🌟 افزایش سایز بافر برای ایجاد موج بسیار سنگین و پایدار
-        private final CausalSavitzkyGolay sgFilter = new CausalSavitzkyGolay(250);
-        private static final int SG_BUF_SIZE = 400;
-        private final double[] sgPc0Buffer = new double[SG_BUF_SIZE];
-        private int sgBufHead = 0;
-        private int sgBufCount = 0;
-        
-        // 🌟 به جای پنجره متغیر که نویز ایجاد می‌کرد، از پنجره ثابت و سنگین استفاده می‌کنیم
-        private final int FIXED_SG_WINDOW = 150; 
-        private double lastSgTrend = 0.0;
-        private double lastSgSlope = 0.0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -348,21 +209,6 @@ public class HftRegimeDetection {
             return series;
         }
         
-        private double computeTrendSlope(double[] series) {
-            int n = series.length;
-            if (n < 2) return 0.0;
-            double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-            for (int i = 0; i < n; i++) {
-                sumX += i;
-                sumY += series[i];
-                sumXY += (double) i * series[i];
-                sumX2 += (double) i * i;
-            }
-            double denom = (double) n * sumX2 - sumX * sumX;
-            if (Math.abs(denom) < 1e-12) return 0.0;
-            return ((double) n * sumXY - sumX * sumY) / denom;
-        }
-        
         private double computeSidewayScore(double[] sigmas, int numSingularValues) {
             if (numSingularValues < 4) return 0.0;
             double totalEnergy = 0.0;
@@ -391,9 +237,7 @@ public class HftRegimeDetection {
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
             priceHistory[head] = event.price;
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
-            
             event.domCycle = domCycle;
-            boolean isRatchetFrozen = false;
             
             if (!probInitialized) {
                 emaProbTrend = currentProbTrend;
@@ -404,7 +248,8 @@ public class HftRegimeDetection {
                 emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
             }
             
-            int L = Math.max(4, (int) Math.round(domCycle / 2.0));
+            // 🌟 Use a solid window for SSA
+            int L = Math.max(8, (int) Math.round(domCycle));
             int N_ssa = L * 2;
             
             if (count >= N_ssa - 1) {
@@ -428,15 +273,12 @@ public class HftRegimeDetection {
                     }
                 }
                 
-                double rawPc0, rawEvr, rawGapFactor;
-                double rawTrendSlope = 0.0;
-                double rawSidewayScore = 0.0;
+                double rawPc0, rawEvr, rawGapFactor, rawSidewayScore;
 
                 if (frobeniusSq < 1e-10) {
                     rawPc0 = mean;
                     rawEvr = 100.0; 
                     rawGapFactor = 0.0;
-                    rawTrendSlope = 0.0;
                     rawSidewayScore = 1.0; 
                 } else {
                     SimpleSVD<SimpleMatrix> svd = X.svd();
@@ -471,13 +313,7 @@ public class HftRegimeDetection {
                     for (int j = 0; j < K; j++) v0[j] = V.get(j, maxIndex);
                     
                     double[] trendSeries = hankelizeRank1(sigma0, u0, v0, L, K);
-                    
-                    for (int i = 0; i < trendSeries.length; i++) {
-                        trendSeries[i] += mean;
-                    }
-                    
-                    rawTrendSlope = computeTrendSlope(trendSeries);
-                    rawPc0 = trendSeries[trendSeries.length - 1];
+                    rawPc0 = trendSeries[trendSeries.length - 1] + mean;
                     rawSidewayScore = computeSidewayScore(sigmas, numSingularValues);
                     
                     rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
@@ -485,53 +321,44 @@ public class HftRegimeDetection {
                     rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
+                // Smooth Evr and Sideway metrics
                 double alphaMetrics = 0.05;  
-                double alphaSlope = 0.1;
-                double alphaSideway = 0.05;
+                emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
+                emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
+                emaSidewayScore = 0.05 * rawSidewayScore + 0.95 * emaSidewayScore;
+
+                // =========================================================================
+                // 🌟 THE GAME CHANGER: Continuous Zero-Lag Heavy Wave (ZLEMA)
+                // This produces the sweeping, buttery-smooth yellow line from your image!
+                // =========================================================================
                 
-                if (emaTrendSlope == 0.0 && rawTrendSlope != 0.0) {
-                    emaTrendSlope = rawTrendSlope;
-                } else {
-                    double adaptiveSlopeAlpha = alphaSlope * (1.0 - 0.5 * emaSidewayScore);
-                    emaTrendSlope = adaptiveSlopeAlpha * rawTrendSlope + (1.0 - adaptiveSlopeAlpha) * emaTrendSlope;
+                // Tie smoothing speed to market cycle. Longer cycle = heavier smoothing.
+                double dynamicLength = Math.max(10.0, domCycle);
+                if (emaProbCrisis > 0.4) dynamicLength *= 1.5; // Smooth heavily in crisis
+                
+                double alphaZl = 2.0 / (dynamicLength + 1.0);
+                
+                if (ema1_pc0 == 0.0) {
+                    ema1_pc0 = rawPc0;
+                    ema2_pc0 = rawPc0;
+                    lastSmoothWave = rawPc0;
                 }
                 
-                if (emaSidewayScore == 0.0) {
-                    emaSidewayScore = rawSidewayScore;
-                } else {
-                    emaSidewayScore = alphaSideway * rawSidewayScore + (1.0 - alphaSideway) * emaSidewayScore;
-                }
+                // Double Exponential smoothing of the raw SSA point
+                ema1_pc0 = alphaZl * rawPc0 + (1.0 - alphaZl) * ema1_pc0;
+                ema2_pc0 = alphaZl * ema1_pc0 + (1.0 - alphaZl) * ema2_pc0;
                 
-                if (emaPc0 == 0.0) {
-                    emaPc0 = rawPc0;
-                    emaEvr = rawEvr;
-                    emaGapFactor = rawGapFactor;
-                } else {
-                    emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
-                    emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
-                    
-                    double evrFactor = Math.min(emaEvr / 100.0, 1.0);
-                    double baseAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
-                    double sidewayPenalty = 1.0 - 0.7 * emaSidewayScore; 
-                    double adaptiveAlpha = baseAlpha * Math.max(0.3, sidewayPenalty);
-
-                    double rawMicroSlope = rawPc0 - lastEmaPc0;
-                    boolean isMacroBullish = projectedMacroSlope >= 0;
-                    boolean isMicroBullish = rawMicroSlope >= 0;
-
-                    if (projectedMacroSlope != 0.0 && (isMacroBullish == isMicroBullish)) {
-                        adaptiveAlpha = Math.min(1.0, adaptiveAlpha * 2.0); 
-                    }
-
-                    emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
-                }
-
-                // 🌟 وارد کردن دیتا به بافر سنگین DSP
-                sgPc0Buffer[sgBufHead] = rawPc0;
-                sgBufHead = (sgBufHead + 1) % SG_BUF_SIZE;
-                if (sgBufCount < SG_BUF_SIZE) sgBufCount++;
-
-                double currentResidual = event.price - emaPc0;
+                // Zero-Lag formulation: Removes the lag of heavy moving averages
+                double currentSmoothWave = (2.0 * ema1_pc0) - ema2_pc0;
+                
+                // Calculate the momentum (slope) of this beautifully smooth wave
+                double currentWaveSlope = currentSmoothWave - lastSmoothWave;
+                
+                // Set the final visual output
+                event.value2 = currentSmoothWave;
+                event.pc0 = currentSmoothWave; // Let pc0 also hold the smooth line
+                
+                double currentResidual = event.price - currentSmoothWave;
                 residualHistory[residualHead] = currentResidual;
                 residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
                 if (residualHead == 0) residualFull = true;
@@ -555,125 +382,50 @@ public class HftRegimeDetection {
                 }
 
                 event.vress = noiseStdDev;
-                event.pc0 = emaPc0;
+
+                // =========================================================================
+                // 🌟 REGIME DETECTION: Purely Derivative Based
+                // Regime is decided by the slope of the smooth wave + Macro validation
+                // =========================================================================
+                
+                double slopeThreshold = noiseStdDev * 0.02; // Minimum slope to consider a trend
+                int targetRegime = lastV2Regime;
+                
+                if (currentWaveSlope > slopeThreshold) {
+                    // Smooth line is pointing UP
+                    if (projectedMacroSlope >= 0) targetRegime = 1; // Macro agrees
+                } else if (currentWaveSlope < -slopeThreshold) {
+                    // Smooth line is pointing DOWN
+                    if (projectedMacroSlope <= 0) targetRegime = -1; // Macro agrees
+                } else {
+                    // Line is flat
+                    targetRegime = 0;
+                }
+                
+                // Smooth hysteresis to avoid flickering regime changes
+                if (targetRegime != lastV2Regime) {
+                    // Require the slope to be significantly strong to switch regimes
+                    if (Math.abs(currentWaveSlope) > slopeThreshold * 2.0) {
+                        currentMarketRegime = targetRegime;
+                        lastV2Regime = targetRegime;
+                    }
+                }
+                
+                event.regime = currentMarketRegime;
+
                 event.evr = emaEvr;
                 event.eigenGap = emaGapFactor;
-                event.ssaTrendSlope = emaTrendSlope;
+                event.ssaTrendSlope = currentWaveSlope;
                 event.sidewayScore = emaSidewayScore;
                 
                 double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
                 event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
 
-                // =========================================================================
-                // 🌟 THE ULTIMATE GAME CHANGER: MACRO-GRAVITATIONAL STAIRCASE (MGS)
-                // خط زرد دیگر از طریق Offset یا پرش‌های قیمتی نقاشی نمی‌شود. 
-                // این یک ترند مرکزی خالص است که به وسیله شیب کلان (Python) قفل می‌شود.
-                // =========================================================================
-                
-                // --- STEP 1: HEAVY ANCHOR (تولید موج صاف مرکزی) ---
-                int sgW = Math.min(sgBufCount, FIXED_SG_WINDOW); // پنجره کاملا ثابت و بدون پرش
-                int sgDeg = 2; // درجه ثابت چندجمله‌ای
-
-                double sgTrend, sgSlope;
-                if (sgW >= 5) {
-                    double[] sgData = new double[sgW];
-                    for (int i = 0; i < sgW; i++) {
-                        sgData[i] = sgPc0Buffer[(sgBufHead - sgW + i + SG_BUF_SIZE) % SG_BUF_SIZE];
-                    }
-                    sgTrend = sgFilter.filterValue(sgData, sgW, sgDeg);
-                    sgSlope = sgFilter.filterSlope(sgData, sgW, sgDeg);
-                } else {
-                    sgTrend = emaPc0;
-                    sgSlope = emaTrendSlope;
-                }
-
-                if (lastSgTrend == 0.0) { lastSgTrend = sgTrend; lastSgSlope = sgSlope; }
-                
-                // فیلتر نهایی بی‌نهایت نرم برای از بین بردن هرگونه اثر لبه‌ای (Edge Effects)
-                sgTrend = 0.90 * lastSgTrend + 0.10 * sgTrend;
-                sgSlope = 0.90 * lastSgSlope + 0.10 * sgSlope;
-                lastSgTrend = sgTrend;
-                lastSgSlope = sgSlope;
-                
-                if (lastValue2 == 0.0) {
-                    lastValue2 = sgTrend;
-                    lastV2Regime = (projectedMacroSlope >= 0) ? 1 : -1;
-                }
-
-                // --- STEP 2: MACRO GRAVITY (جهت مجاز حرکت خط) ---
-                double macroGravity = 0.0;
-                if (Math.abs(projectedMacroSlope) > 1e-8) {
-                    macroGravity = Math.signum(projectedMacroSlope);
-                }
-
-                // --- STEP 3: KINEMATIC ONE-WAY RATCHET (قفل یک‌طرفه گام‌ها) ---
-                double diff = sgTrend - lastValue2;
-                double newValue2 = lastValue2;
-                
-                // سایز گام کوانتومی: خط تا زمانی که ترند به اندازه نویز جابجا نشود فریز می‌ماند
-                double quantumStep = Math.max(event.vress * (0.5 + emaProbCrisis), 1e-6);
-                
-                // مکانیزم خروج اضطراری (Emergency Snap): 
-                // فقط زمانی رخ می‌دهد که قیمت به طرز وحشتناکی (بیشتر از ۵ برابر نویز) خط را بشکند
-                double emergencyThreshold = event.vress * 5.0;
-                boolean emergencyBullBreak = (event.price > lastValue2 + emergencyThreshold) && (emaTrendSlope > event.vress * 0.1);
-                boolean emergencyBearBreak = (event.price < lastValue2 - emergencyThreshold) && (emaTrendSlope < -event.vress * 0.1);
-
-                if (emergencyBullBreak) {
-                    // ریست نرم به سمت لنگر مرکزی
-                    newValue2 = sgTrend - event.vress; 
-                } else if (emergencyBearBreak) {
-                    // ریست نرم به سمت لنگر مرکزی
-                    newValue2 = sgTrend + event.vress; 
-                } else {
-                    // --- مکانیزم اصلی چرخ‌دنده (بدون پرش، فقط حرکت در جهت کلان) ---
-                    if (Math.abs(diff) >= quantumStep) {
-                        if (macroGravity > 0) {
-                            // روند کلان صعودی: خط زرد فقط اجازه دارد بالا برود (کف‌سازی)
-                            if (diff > 0) {
-                                newValue2 = lastValue2 + diff * 0.15; // دنبال کردن نرم
-                            } 
-                            // اگر diff منفی بود خط کاملا فریز می‌ماند (پله افقی می‌سازد)
-                            
-                        } else if (macroGravity < 0) {
-                            // روند کلان نزولی: خط زرد فقط اجازه دارد پایین بیاید (سقف‌سازی)
-                            if (diff < 0) {
-                                newValue2 = lastValue2 + diff * 0.15; // دنبال کردن نرم
-                            }
-                            // اگر diff مثبت بود خط کاملا فریز می‌ماند (پله افقی می‌سازد)
-                            
-                        } else {
-                            // رژیم سایدوی کلان: اصطکاک شدید
-                            if (Math.abs(diff) > event.vress * 3.0) {
-                                newValue2 = lastValue2 + diff * 0.05; // نشت بسیار کند
-                            }
-                        }
-                    }
-                }
-
-                // ثبت مقدار نهایی
-                event.value2 = newValue2;
-                event.ssaTrend = sgTrend; // (دیتا صرفا جهت تحلیل در دیتابیس)
-                
-                // رژیم نهایی صرفا بر اساس شیب کلان قفل می‌شود تا پرش رنگی نداشته باشیم
-                event.regime = (macroGravity > 0) ? 1 : (macroGravity < 0 ? -1 : 0);
-                currentMarketRegime = event.regime;
-
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
-
-                isRatchetFrozen = (newValue2 == lastValue2);
-
-                // آپدیت حافظه برای تیک بعدی
-                lastV2Regime = event.regime;
-                lastEmaPc0 = emaPc0;
-                lastValue2 = newValue2;
-                lastTrendSlope = emaTrendSlope;
                 
-                // =========================================================================
-                
-                event.momentumSignal = event.price - event.pc0;
+                event.momentumSignal = event.price - currentSmoothWave;
                 double CRISIS_THRESHOLD = 0.40; 
                 event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
                 
@@ -691,15 +443,20 @@ public class HftRegimeDetection {
 
                 double MAX_POSITION = 1.0; 
                 event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
-                event.dynamicStopLoss = event.vress * 3.0;
+                event.dynamicStopLoss = noiseStdDev * 3.0;
+                
+                // Carry state forward
+                lastSmoothWave = currentSmoothWave;
+                lastSmoothWaveSlope = currentWaveSlope;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | S-Score: %.3f | SG-Slope: %+.6f | V2: %.2f | Regime: %d\n", 
-                                      event.price, emaSidewayScore, sgSlope, event.value2, event.regime);
+                    System.out.printf("\n[DEBUG] Price: %.2f | S-Score: %.3f | WaveSlope: %+.6f | Val2(Wave): %.2f | Regime: %d\n", 
+                                      event.price, emaSidewayScore, currentWaveSlope, event.value2, event.regime);
                 }
                 
             } else {
                 event.pc0 = event.price;
+                event.value2 = event.price;
                 event.evr = 0.0;
                 event.bandUpper = event.price;
                 event.bandLower = event.price;
@@ -718,24 +475,17 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = 0.0;
                 event.crisisCapActive = 0;
                 
-                event.value2 = event.price;
-                
-                sgPc0Buffer[sgBufHead] = event.price;
-                sgBufHead = (sgBufHead + 1) % SG_BUF_SIZE;
-                if (sgBufCount < SG_BUF_SIZE) sgBufCount++;
-
-                lastSgTrend = 0.0;
-                lastSgSlope = 0.0;
-                
                 event.ssaTrendSlope = 0.0;
                 event.sidewayScore = 1.0;
                 event.trendStrength = 0.0;
-                lastEmaPc0 = event.price;
-                lastValue2 = event.price;
+                
+                ema1_pc0 = event.price;
+                ema2_pc0 = event.price;
+                lastSmoothWave = event.price;
             }
 
             // --- Lyapunov computation ---
-            ssaTrendBuffer[ssaHead] = event.ssaTrend;
+            ssaTrendBuffer[ssaHead] = event.value2;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
 
@@ -767,7 +517,7 @@ public class HftRegimeDetection {
             }
 
             event.lambda = currentLambda;
-            event.isFrozen = currentRegimeShiftAlert || isRatchetFrozen;
+            event.isFrozen = currentRegimeShiftAlert;
 
             head = (head + 1) % MAX_CAPACITY;
             if (count < MAX_CAPACITY) count++;
@@ -777,7 +527,6 @@ public class HftRegimeDetection {
     public static class ClickHouseBatchHandler implements EventHandler<TickEvent> {
         private Connection connection;
         private PreparedStatement statement;
-        // 🌟 کاهش سایز بچ برای آپدیت ۵ برابر سریع‌تر گرافانا / Clickhouse
         private final int batchSizeThreshold = 200; 
         private int currentBatchSize = 0;
 
