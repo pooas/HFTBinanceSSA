@@ -684,6 +684,10 @@ public class HftRegimeDetection {
         private final int batchSizeThreshold = 1000;
         private int currentBatchSize = 0;
 
+        // 🌟 متغیرهای جدید برای فلاش زمانی
+        private long lastFlushTime = System.currentTimeMillis();
+        private final long maxFlushDelayMs = 500; // حداکثر تاخیر مجاز (میلی‌ثانیه)
+
         public ClickHouseBatchHandler() {
             String host = System.getenv("CLICKHOUSE_HOST");
             if (host == null || host.trim().isEmpty()) host = "clickhouse";
@@ -746,17 +750,31 @@ public class HftRegimeDetection {
 
                 statement.addBatch();
                 currentBatchSize++;
-                if (currentBatchSize >= batchSizeThreshold || endOfBatch) flush();
+                
+                // 🌟 بررسی شرط زمانی
+                long currentTime = System.currentTimeMillis();
+                boolean timeLimitReached = (currentTime - lastFlushTime) >= maxFlushDelayMs;
+
+                // 🌟 فلاش کردن اگر ظرفیت پر شده، یا (زمان گذشته باشه و بچ خالی شده باشه)
+                if (currentBatchSize >= batchSizeThreshold || (timeLimitReached && endOfBatch)) {
+                    flush();
+                }
             } catch (SQLException e) {}
         }
 
         private void flush() {
             if (currentBatchSize == 0) return;
-            try { statement.executeBatch(); currentBatchSize = 0; }
-            catch (SQLException e) { currentBatchSize = 0; }
+            try { 
+                statement.executeBatch(); 
+                currentBatchSize = 0; 
+                lastFlushTime = System.currentTimeMillis(); // 🌟 آپدیت زمان پس از فلاش موفق
+            }
+            catch (SQLException e) { 
+                currentBatchSize = 0; 
+                lastFlushTime = System.currentTimeMillis(); // 🌟 آپدیت زمان حتی در صورت خطا برای جلوگیری از لوپ بی‌نهایت ارور
+            }
         }
     }
-
     public static class BinanceProducer extends WebSocketClient {
         private final RingBuffer<TickEvent> ringBuffer;
         public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
