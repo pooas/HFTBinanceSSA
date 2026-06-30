@@ -70,12 +70,10 @@ public class HftRegimeDetection {
 
     // =========================================================================
     // 🌟 CAUSAL (ONE-SIDED) SAVITZKY-GOLAY FILTER
-    // Zero-lag polynomial smoothing with derivative preservation
-    // Precomputes least-squares coefficients for all (window, degree) pairs
     // =========================================================================
     public static class CausalSavitzkyGolay {
-        private final double[][][] valueCoeffs;  // [window][degree] → double[window]
-        private final double[][][] slopeCoeffs;  // [window][degree] → double[window]
+        private final double[][][] valueCoeffs;  
+        private final double[][][] slopeCoeffs;  
         private final int maxWindow;
 
         public CausalSavitzkyGolay(int maxWindow) {
@@ -92,15 +90,12 @@ public class HftRegimeDetection {
 
         private void computeAndStore(int N, int deg) {
             int p = deg;
-
-            // Design matrix A[i][j] = i^j  (Vandermonde)
             double[][] A = new double[N][p + 1];
             for (int i = 0; i < N; i++) {
                 double x = 1.0;
                 for (int j = 0; j <= p; j++) { A[i][j] = x; x *= i; }
             }
 
-            // A^T A  (p+1 × p+1)
             double[][] AtA = new double[p + 1][p + 1];
             for (int i = 0; i <= p; i++)
                 for (int j = 0; j <= p; j++) {
@@ -111,7 +106,6 @@ public class HftRegimeDetection {
 
             double[][] inv = invert(AtA, p + 1);
 
-            // M = (A^T A)^{-1} A^T   ((p+1) × N)
             double[][] M = new double[p + 1][N];
             for (int i = 0; i <= p; i++)
                 for (int j = 0; j < N; j++) {
@@ -120,7 +114,6 @@ public class HftRegimeDetection {
                     M[i][j] = s;
                 }
 
-            // Value coefficients: eval polynomial at rightmost point (N-1)
             double[] xp = new double[p + 1];
             double x = 1.0;
             for (int j = 0; j <= p; j++) { xp[j] = x; x *= (N - 1); }
@@ -132,7 +125,6 @@ public class HftRegimeDetection {
                 vc[i] = s;
             }
 
-            // Slope coefficients: eval derivative at (N-1)
             double[] sc = new double[N];
             for (int i = 0; i < N; i++) {
                 double s = 0;
@@ -242,24 +234,20 @@ public class HftRegimeDetection {
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
         
-        private double lastVelocity2 = 0.0; 
-        
         private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
-        private double lastTrendSlope = 0.0;
         
         private int lastV2Regime = 0;
 
-        // 🌟 DSP & State-Space fields for Regime-Aware SG-SSA
-        private final CausalSavitzkyGolay sgFilter = new CausalSavitzkyGolay(150); // Increased max window for true long-term
-        private static final int SG_BUF_SIZE = 300;
+        // 🌟 Fixed DSP buffer size for SG Filter (NO MORE DYNAMIC WINDOW JUMPS)
+        private final CausalSavitzkyGolay sgFilter = new CausalSavitzkyGolay(100);
+        private static final int SG_BUF_SIZE = 200;
         private final double[] sgPc0Buffer = new double[SG_BUF_SIZE];
         private int sgBufHead = 0;
         private int sgBufCount = 0;
-        private double smoothedSgWindow = 30.0;
+        private double smoothedSgWindow = 30.0; // Stabilized window tracker
         private double lastSgTrend = 0.0;
         private double lastSgSlope = 0.0;
-        private double lastRegimeScore = 0.0;
 
         public static class ChaosMath {
             public static int calculateAMI(double[] data, int maxTau, int bins) {
@@ -536,12 +524,6 @@ public class HftRegimeDetection {
                     emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
                 }
 
-                if (lastValue2 == 0.0) {
-                    lastValue2 = emaPc0;
-                    lastVelocity2 = 0.0;
-                    lastV2Regime = (emaTrendSlope >= 0) ? 1 : -1;
-                }
-
                 // 🌟 Feed raw SSA PC0 into the Savitzky-Golay DSP buffer
                 sgPc0Buffer[sgBufHead] = rawPc0;
                 sgBufHead = (sgBufHead + 1) % SG_BUF_SIZE;
@@ -570,240 +552,148 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
-                double alpha = 4.0; 
-                double beta = 2.0;  
-                
-                double sidewayBandWiden = 1.0 + 1.5 * emaSidewayScore;
-                double rawMultiplier = (1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor) * sidewayBandWiden;
-                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 8.0));
-
-                double rawDistance = noiseStdDev * mMultiplier; 
-                if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
-
+                event.vress = noiseStdDev;
                 event.pc0 = emaPc0;
                 event.evr = emaEvr;
-                event.bandUpper = emaPc0 + smoothedDistance;
-                event.bandLower = emaPc0 - smoothedDistance;
-                event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
-                
                 event.ssaTrendSlope = emaTrendSlope;
                 event.sidewayScore = emaSidewayScore;
                 
                 double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
                 event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
 
-                double currentLineVal;
-                double slopeThreshold = noiseStdDev * 0.1; 
-                
-                if (currentMarketRegime == 1) { 
-                    double proposedSupport = event.bandLower;
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
-                                     Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
-                    
-                    boolean bandBreach = event.price < currentLineVal;
-                    boolean strongCounterSlope = emaTrendSlope < -slopeThreshold && emaSidewayScore < 0.7;
-                    
-                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
-                        currentMarketRegime = -1; 
-                        currentLineVal = event.bandUpper; 
-                    }
-                } else { 
-                    double proposedResistance = event.bandUpper;
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
-                                     Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
-                    
-                    boolean bandBreach = event.price > currentLineVal;
-                    boolean strongCounterSlope = emaTrendSlope > slopeThreshold && emaSidewayScore < 0.7;
-                    
-                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
-                        currentMarketRegime = 1; 
-                        currentLineVal = event.bandLower; 
-                    }
-                }
-
-                lastLogicalDistanceLine = currentLineVal;
-                event.ssaTrend = currentLineVal;
-                event.regime = currentMarketRegime;
-                event.hmmRegime = currentHmmRegime;
-                event.hmmProbTrend = emaProbTrend;
-                event.hmmProbCrisis = emaProbCrisis;
-                
                 // =========================================================================
-                // 🌟 THE BRAIN: Pure SG-SSA Analysis (Decoupled from Visual Line)
+                // 🌟 THE ULTIMATE GAME CHANGER: QUANTUM MAGNETIC RATCHET (QMR)
                 // =========================================================================
-
-                // INCREASED BASE WINDOW to make the brain resistant to tick noise (True Long-Term)
-                double baseWindow = Math.max(15.0, Math.min(100.0, event.domCycle));
-                double crisisExpansion = 1.0 + 3.0 * emaProbCrisis;
-                double trendContraction = 1.0 - 0.3 * emaProbTrend;
-                double sidewayExpansion = 1.0 + 2.0 * emaSidewayScore;
-
-                double rawSgWindow = baseWindow * crisisExpansion * trendContraction * sidewayExpansion;
-                rawSgWindow = Math.max(10.0, Math.min(150.0, rawSgWindow));
-
-                smoothedSgWindow = 0.95 * smoothedSgWindow + 0.05 * rawSgWindow; // Slower window smoothing
-                int sgDegree = (emaProbCrisis > 0.4 || emaSidewayScore > 0.6) ? 1 : 2; // Flat faster in chaos
-
-                int wFloor = (int) Math.floor(smoothedSgWindow);
-                int wCeil = (int) Math.ceil(smoothedSgWindow);
-                double wFrac = smoothedSgWindow - wFloor;
-                wFloor = Math.max(sgDegree + 1, Math.min(sgBufCount, wFloor));
-                wCeil = Math.max(sgDegree + 1, Math.min(sgBufCount, wCeil));
+                
+                // --- STEP 1: FIXED-WINDOW SG-SSA (The Brain) ---
+                // We lock the SG window to a heavily smoothed cycle to absolutely 
+                // prevent the tick-by-tick polynomial explosions seen in the screenshot.
+                smoothedSgWindow = 0.999 * smoothedSgWindow + 0.001 * Math.max(10.0, event.domCycle);
+                int sgW = (int) Math.round(smoothedSgWindow);
+                sgW = Math.max(3, Math.min(100, sgW));
+                int sgDeg = 2; // Fixed quadratic for robust slope
 
                 double sgTrend, sgSlope;
-
-                if (sgBufCount >= wFloor && wFloor >= sgDegree + 1) {
-                    if (wCeil == wFloor) {
-                        double[] sgData = new double[wCeil];
-                        for (int i = 0; i < wCeil; i++) {
-                            sgData[i] = sgPc0Buffer[(sgBufHead - wCeil + i + SG_BUF_SIZE) % SG_BUF_SIZE];
-                        }
-                        sgTrend = sgFilter.filterValue(sgData, wCeil, sgDegree);
-                        sgSlope = sgFilter.filterSlope(sgData, wCeil, sgDegree);
-                    } else {
-                        double[] sgDataCeil = new double[wCeil];
-                        for (int i = 0; i < wCeil; i++) {
-                            sgDataCeil[i] = sgPc0Buffer[(sgBufHead - wCeil + i + SG_BUF_SIZE) % SG_BUF_SIZE];
-                        }
-                        double[] sgDataFloor = new double[wFloor];
-                        System.arraycopy(sgDataCeil, wCeil - wFloor, sgDataFloor, 0, wFloor);
-
-                        double tFloor = sgFilter.filterValue(sgDataFloor, wFloor, sgDegree);
-                        double sFloor = sgFilter.filterSlope(sgDataFloor, wFloor, sgDegree);
-                        double tCeil = sgFilter.filterValue(sgDataCeil, wCeil, sgDegree);
-                        double sCeil = sgFilter.filterSlope(sgDataCeil, wCeil, sgDegree);
-
-                        sgTrend = (1.0 - wFrac) * tFloor + wFrac * tCeil;
-                        sgSlope = (1.0 - wFrac) * sFloor + wFrac * sCeil;
+                if (sgBufCount >= sgW) {
+                    double[] sgData = new double[sgW];
+                    for (int i = 0; i < sgW; i++) {
+                        sgData[i] = sgPc0Buffer[(sgBufHead - sgW + i + SG_BUF_SIZE) % SG_BUF_SIZE];
                     }
+                    sgTrend = sgFilter.filterValue(sgData, sgW, sgDeg);
+                    sgSlope = sgFilter.filterSlope(sgData, sgW, sgDeg);
                 } else {
                     sgTrend = emaPc0;
                     sgSlope = emaTrendSlope;
                 }
 
-                if (Double.isNaN(sgTrend) || Double.isInfinite(sgTrend)) {
-                    sgTrend = emaPc0;
-                    sgSlope = emaTrendSlope;
+                // Extreme smoothing on the analytical output to ensure ZERO analytical jitter
+                if (lastSgTrend == 0.0) { lastSgTrend = sgTrend; lastSgSlope = sgSlope; }
+                sgTrend = 0.95 * lastSgTrend + 0.05 * sgTrend;
+                sgSlope = 0.95 * lastSgSlope + 0.05 * sgSlope;
+                lastSgTrend = sgTrend;
+                lastSgSlope = sgSlope;
+                
+                // Initialize ratchet at startup
+                if (lastValue2 == 0.0) {
+                    lastValue2 = emaPc0;
+                    lastV2Regime = (emaTrendSlope >= 0) ? 1 : -1;
                 }
 
-                if (lastSgTrend == 0.0) {
-                    lastSgTrend = sgTrend;
-                    lastSgSlope = sgSlope;
+                // --- STEP 2: MACRO-MICRO CONSENSUS REGIME ---
+                int intendedRegime = lastV2Regime;
+                double slopeThreshold = Math.max(event.vress * 0.05, 1e-6);
+                
+                if (emaSidewayScore > 0.75) {
+                    intendedRegime = 0; // Pure Sideways
+                } else if (sgSlope > slopeThreshold && projectedMacroSlope >= 0) {
+                    intendedRegime = 1; // Bullish Consensus
+                } else if (sgSlope < -slopeThreshold && projectedMacroSlope <= 0) {
+                    intendedRegime = -1; // Bearish Consensus
+                }
+
+                // --- STEP 3: QUANTUM ANCHOR TARGET ---
+                // Crucial fix: The line is anchored to the smooth 'sgTrend', NOT 'event.price'.
+                double offset = event.vress * (2.5 - event.trendStrength); 
+                double quantumStep = Math.max(event.vress * (0.8 + emaProbCrisis), 1e-5);
+                
+                double targetValue2;
+                if (intendedRegime == 1) {
+                    targetValue2 = sgTrend - offset; // Target trailing support
+                } else if (intendedRegime == -1) {
+                    targetValue2 = sgTrend + offset; // Target trailing resistance
                 } else {
-                    double continuityAlpha = 0.85 + 0.10 * emaProbTrend; // Heavier continuity
-                    lastSgTrend = continuityAlpha * sgTrend + (1.0 - continuityAlpha) * lastSgTrend;
-                    lastSgSlope = continuityAlpha * sgSlope + (1.0 - continuityAlpha) * lastSgSlope;
-                    sgTrend = lastSgTrend;
-                    sgSlope = lastSgSlope;
-                }
-
-                double microSlopeNorm = sgSlope / Math.max(event.vress, 1e-8);
-                double macroSign = (projectedMacroSlope != 0.0) ? Math.signum(projectedMacroSlope) : 0.0;
-                double microSign = Math.signum(microSlopeNorm);
-                double macroAlignment = macroSign * microSign;
-
-                double regimeScore = Math.tanh(microSlopeNorm * 1.5) * (1.0 - emaSidewayScore); // Less aggressive scaling
-                if (macroAlignment > 0) {
-                    regimeScore *= (0.8 + 0.2 * Math.abs(regimeScore)); // Stronger macro validation
-                } else if (macroAlignment < 0) {
-                    regimeScore *= 0.3; // Heavily punish counter-macro moves
-                }
-
-                regimeScore = Math.max(-1.0, Math.min(1.0, regimeScore));
-                lastRegimeScore = 0.90 * lastRegimeScore + 0.10 * regimeScore; // Smoother transitions
-                regimeScore = lastRegimeScore;
-
-                // =========================================================================
-                // 🌟 THE LINE: Macro-Anchored Hysteresis Ratchet (Game Changer)
-                // =========================================================================
-
-                // 1. SCHMITT TRIGGER (Hysteresis): Hard to enter, hard to leave. Filters whipsaws.
-                int currentLogicRegime = lastV2Regime;
-                double entryThreshold = 0.4 + (0.4 * emaSidewayScore); // Very hard to enter in sideways
-                double exitThreshold  = 0.1; // Easy to stay in trend
-
-                if (lastV2Regime == 1) { // Was in Uptrend
-                    if (regimeScore < -exitThreshold) currentLogicRegime = -1;
-                    else if (regimeScore < exitThreshold) currentLogicRegime = 0;
-                } else if (lastV2Regime == -1) { // Was in Downtrend
-                    if (regimeScore > exitThreshold) currentLogicRegime = 1;
-                    else if (regimeScore > -exitThreshold) currentLogicRegime = 0;
-                } else { // Was Sideways
-                    if (regimeScore > entryThreshold) currentLogicRegime = 1;
-                    else if (regimeScore < -entryThreshold) currentLogicRegime = -1;
+                    targetValue2 = emaPc0; // Mean baseline
                 }
 
                 boolean hardReset = false;
-                double targetValue2 = lastValue2;
+                double newValue2 = lastValue2;
 
-                // 2. MACRO-VALIDATED ANTI-CROSSING CLAMP (Filters Fakeouts)
-                double breakoutMargin = event.vress * 1.5;
-                if (emaProbCrisis < 0.6) { // Don't reset during pure chaos spikes
-                    if (currentLogicRegime == 1 && event.price < lastValue2 - breakoutMargin) {
-                        if (projectedMacroSlope < 0) { // MACRO MUST AGREE WITH BREAKOUT
-                            lastValue2 = event.price + (event.vress * 2.0);
-                            currentLogicRegime = -1;
-                            hardReset = true;
+                // --- STEP 4: FAKEOUT IMMUNITY (Breakout Validation) ---
+                // If price crashes through the yellow line, we do NOT blindly snap.
+                // We wait for the macro slope to confirm the trend has actually died.
+                if (lastV2Regime == 1 && event.price < lastValue2) {
+                    // Support broken! Is it real or a fakeout?
+                    if (intendedRegime == -1 || event.price < lastValue2 - (event.vress * 2.0)) {
+                        intendedRegime = -1;
+                        newValue2 = event.price + offset; // Validated Bearish Flip
+                        hardReset = true;
+                    }
+                } else if (lastV2Regime == -1 && event.price > lastValue2) {
+                    // Resistance broken! Is it real or a fakeout?
+                    if (intendedRegime == 1 || event.price > lastValue2 + (event.vress * 2.0)) {
+                        intendedRegime = 1;
+                        newValue2 = event.price - offset; // Validated Bullish Flip
+                        hardReset = true;
+                    }
+                }
+
+                // --- STEP 5: ONE-WAY STAIRCASE MOVEMENT ---
+                if (!hardReset) {
+                    if (intendedRegime != lastV2Regime) {
+                        // Regime elegantly changed without a crash
+                        newValue2 = targetValue2;
+                    } else {
+                        // Strict Geometric Ratcheting: 
+                        // In Uptrend, line CANNOT go down. In Downtrend, line CANNOT go up.
+                        if (intendedRegime == 1) {
+                            if (targetValue2 >= lastValue2 + quantumStep) {
+                                newValue2 = targetValue2; // Step UP
+                            } else {
+                                newValue2 = lastValue2; // Hold perfectly FLAT
+                            }
+                        } else if (intendedRegime == -1) {
+                            if (targetValue2 <= lastValue2 - quantumStep) {
+                                newValue2 = targetValue2; // Step DOWN
+                            } else {
+                                newValue2 = lastValue2; // Hold perfectly FLAT
+                            }
+                        } else {
+                            // Sideways: Extreme friction. Only bleed slowly to mean.
+                            if (Math.abs(targetValue2 - lastValue2) > quantumStep * 2.0) {
+                                newValue2 = lastValue2 + Math.signum(targetValue2 - lastValue2) * (quantumStep * 0.05);
+                            } else {
+                                newValue2 = lastValue2;
+                            }
                         }
-                    } else if (currentLogicRegime == -1 && event.price > lastValue2 + breakoutMargin) {
-                        if (projectedMacroSlope > 0) { // MACRO MUST AGREE WITH BREAKOUT
-                            lastValue2 = event.price - (event.vress * 2.0);
-                            currentLogicRegime = 1;
-                            hardReset = true;
-                        }
                     }
                 }
 
-                // 3. ANCHOR TO SSA TREND (Not Price) + Quantum Geometric Stepping
-                double dynamicMultiplier = Math.max(1.0, 2.5 - (event.trendStrength * 1.5));
-                double quantumStep = Math.max(event.vress * (1.0 + emaProbCrisis), 1e-6);
-                
-                // 🚀 GAME CHANGER: We trail the smooth SG SSA trend, NOT the noisy tick price!
-                double anchorBase = sgTrend;
-
-                if (currentLogicRegime == 1) {
-                    // Uptrend: Trailing Support (ONLY MOVES UP or flatlines)
-                    double proposedSupport = anchorBase - (event.vress * dynamicMultiplier);
-                    if (hardReset || proposedSupport - lastValue2 >= quantumStep) {
-                        targetValue2 = proposedSupport; // Step UP
-                    }
-                } else if (currentLogicRegime == -1) {
-                    // Downtrend: Trailing Resistance (ONLY MOVES DOWN or flatlines)
-                    double proposedResistance = anchorBase + (event.vress * dynamicMultiplier);
-                    if (hardReset || lastValue2 - proposedResistance >= quantumStep) {
-                        targetValue2 = proposedResistance; // Step DOWN
-                    }
-                } else {
-                    // Sideways: High Friction / Mean Bleed
-                    double diffToMean = emaPc0 - lastValue2;
-                    if (Math.abs(diffToMean) > event.vress * 3.0) {
-                        targetValue2 = lastValue2 + (diffToMean * 0.02); // Bleed very slowly towards mean
-                    }
-                }
-
-                if (Double.isNaN(targetValue2) || Double.isInfinite(targetValue2)) {
-                    targetValue2 = emaPc0;
-                }
-
-                event.value2 = targetValue2;
-                event.ssaTrend = sgTrend; // Optional: Keep SG brain visible for debug
-                event.regime = currentLogicRegime;
-                currentMarketRegime = event.regime;
+                event.value2 = newValue2;
+                event.ssaTrend = sgTrend; // Store the raw mathematical brain for debug
+                event.regime = intendedRegime;
+                currentMarketRegime = intendedRegime;
 
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
 
-                // Ratchet frozen flag: true if it formed a flat step
-                isRatchetFrozen = (targetValue2 == lastValue2 && !hardReset);
+                isRatchetFrozen = (newValue2 == lastValue2 && !hardReset);
 
-                // State carry-forward
-                lastV2Regime = currentLogicRegime;
+                // Update State
+                lastV2Regime = intendedRegime;
                 lastEmaPc0 = emaPc0;
-                lastValue2 = event.value2;
+                lastValue2 = newValue2;
                 lastTrendSlope = emaTrendSlope;
                 
                 // =========================================================================
@@ -829,8 +719,8 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | SidewayScore: %.3f | RegimeScore: %+.3f | TrendStrength: %.3f | Val2: %.2f\n", 
-                                      event.price, emaSidewayScore, regimeScore, event.trendStrength, event.value2);
+                    System.out.printf("\n[DEBUG] Price: %.2f | S-Score: %.3f | SG-Slope: %+.6f | Target: %.2f | V2: %.2f | Regime: %d\n", 
+                                      event.price, emaSidewayScore, sgSlope, targetValue2, event.value2, intendedRegime);
                 }
                 
             } else {
@@ -862,7 +752,6 @@ public class HftRegimeDetection {
 
                 lastSgTrend = 0.0;
                 lastSgSlope = 0.0;
-                lastRegimeScore = 0.0;
                 
                 event.ssaTrendSlope = 0.0;
                 event.sidewayScore = 1.0;
