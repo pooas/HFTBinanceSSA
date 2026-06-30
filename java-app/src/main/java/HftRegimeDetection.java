@@ -233,6 +233,7 @@ public class HftRegimeDetection {
 
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
+        private double lastTrendSlope = 0.0; // Added variable to fix compilation error
         
         private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
