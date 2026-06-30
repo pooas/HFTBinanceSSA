@@ -96,20 +96,25 @@ public class HftRegimeDetection {
         private int currentM = 3;
 
         private int currentMarketRegime = 1;
+        private double lastLogicalDistanceLine = 0.0;
+        private double smoothedDistance = 0.0;
 
+        private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
         private double emaGapFactor = 0.0;
+
         private double emaProbTrend = 0.0;
         private double emaProbCrisis = 0.0;
         private boolean probInitialized = false;
 
-        // 🌟 ZLEMA Wave variables (The Game Changer for smooth lines)
-        private double ema1_pc0 = 0.0;
-        private double ema2_pc0 = 0.0;
-        private double lastSmoothWave = 0.0;
-        private double lastSmoothWaveSlope = 0.0;
+        private double lastEmaPc0 = 0.0;
+        private double lastValue2 = 0.0;
         
+        private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
+        private double lastTrendSlope = 0.0;
+        
+        // 🌟 NEW: State tracking for the Kinematic Ratchet
         private int lastV2Regime = 0;
 
         public static class ChaosMath {
@@ -209,6 +214,21 @@ public class HftRegimeDetection {
             return series;
         }
         
+        private double computeTrendSlope(double[] series) {
+            int n = series.length;
+            if (n < 2) return 0.0;
+            double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+            for (int i = 0; i < n; i++) {
+                sumX += i;
+                sumY += series[i];
+                sumXY += (double) i * series[i];
+                sumX2 += (double) i * i;
+            }
+            double denom = (double) n * sumX2 - sumX * sumX;
+            if (Math.abs(denom) < 1e-12) return 0.0;
+            return ((double) n * sumXY - sumX * sumY) / denom;
+        }
+        
         private double computeSidewayScore(double[] sigmas, int numSingularValues) {
             if (numSingularValues < 4) return 0.0;
             double totalEnergy = 0.0;
@@ -237,7 +257,9 @@ public class HftRegimeDetection {
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
             priceHistory[head] = event.price;
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
+            
             event.domCycle = domCycle;
+            boolean isRatchetFrozen = false;
             
             if (!probInitialized) {
                 emaProbTrend = currentProbTrend;
@@ -248,8 +270,7 @@ public class HftRegimeDetection {
                 emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
             }
             
-            // 🌟 Use a solid window for SSA
-            int L = Math.max(8, (int) Math.round(domCycle));
+            int L = Math.max(4, (int) Math.round(domCycle / 2.0));
             int N_ssa = L * 2;
             
             if (count >= N_ssa - 1) {
@@ -273,12 +294,15 @@ public class HftRegimeDetection {
                     }
                 }
                 
-                double rawPc0, rawEvr, rawGapFactor, rawSidewayScore;
+                double rawPc0, rawEvr, rawGapFactor;
+                double rawTrendSlope = 0.0;
+                double rawSidewayScore = 0.0;
 
                 if (frobeniusSq < 1e-10) {
                     rawPc0 = mean;
                     rawEvr = 100.0; 
                     rawGapFactor = 0.0;
+                    rawTrendSlope = 0.0;
                     rawSidewayScore = 1.0; 
                 } else {
                     SimpleSVD<SimpleMatrix> svd = X.svd();
@@ -313,7 +337,13 @@ public class HftRegimeDetection {
                     for (int j = 0; j < K; j++) v0[j] = V.get(j, maxIndex);
                     
                     double[] trendSeries = hankelizeRank1(sigma0, u0, v0, L, K);
-                    rawPc0 = trendSeries[trendSeries.length - 1] + mean;
+                    
+                    for (int i = 0; i < trendSeries.length; i++) {
+                        trendSeries[i] += mean;
+                    }
+                    
+                    rawTrendSlope = computeTrendSlope(trendSeries);
+                    rawPc0 = trendSeries[trendSeries.length - 1];
                     rawSidewayScore = computeSidewayScore(sigmas, numSingularValues);
                     
                     rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
@@ -321,44 +351,48 @@ public class HftRegimeDetection {
                     rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
                 }
 
-                // Smooth Evr and Sideway metrics
                 double alphaMetrics = 0.05;  
-                emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
-                emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
-                emaSidewayScore = 0.05 * rawSidewayScore + 0.95 * emaSidewayScore;
-
-                // =========================================================================
-                // 🌟 THE GAME CHANGER: Continuous Zero-Lag Heavy Wave (ZLEMA)
-                // This produces the sweeping, buttery-smooth yellow line from your image!
-                // =========================================================================
+                double alphaSlope = 0.1;
+                double alphaSideway = 0.05;
                 
-                // Tie smoothing speed to market cycle. Longer cycle = heavier smoothing.
-                double dynamicLength = Math.max(10.0, domCycle);
-                if (emaProbCrisis > 0.4) dynamicLength *= 1.5; // Smooth heavily in crisis
-                
-                double alphaZl = 2.0 / (dynamicLength + 1.0);
-                
-                if (ema1_pc0 == 0.0) {
-                    ema1_pc0 = rawPc0;
-                    ema2_pc0 = rawPc0;
-                    lastSmoothWave = rawPc0;
+                if (emaTrendSlope == 0.0 && rawTrendSlope != 0.0) {
+                    emaTrendSlope = rawTrendSlope;
+                } else {
+                    double adaptiveSlopeAlpha = alphaSlope * (1.0 - 0.5 * emaSidewayScore);
+                    emaTrendSlope = adaptiveSlopeAlpha * rawTrendSlope + (1.0 - adaptiveSlopeAlpha) * emaTrendSlope;
                 }
                 
-                // Double Exponential smoothing of the raw SSA point
-                ema1_pc0 = alphaZl * rawPc0 + (1.0 - alphaZl) * ema1_pc0;
-                ema2_pc0 = alphaZl * ema1_pc0 + (1.0 - alphaZl) * ema2_pc0;
+                if (emaSidewayScore == 0.0) {
+                    emaSidewayScore = rawSidewayScore;
+                } else {
+                    emaSidewayScore = alphaSideway * rawSidewayScore + (1.0 - alphaSideway) * emaSidewayScore;
+                }
                 
-                // Zero-Lag formulation: Removes the lag of heavy moving averages
-                double currentSmoothWave = (2.0 * ema1_pc0) - ema2_pc0;
-                
-                // Calculate the momentum (slope) of this beautifully smooth wave
-                double currentWaveSlope = currentSmoothWave - lastSmoothWave;
-                
-                // Set the final visual output
-                event.value2 = currentSmoothWave;
-                event.pc0 = currentSmoothWave; // Let pc0 also hold the smooth line
-                
-                double currentResidual = event.price - currentSmoothWave;
+                if (emaPc0 == 0.0) {
+                    emaPc0 = rawPc0;
+                    emaEvr = rawEvr;
+                    emaGapFactor = rawGapFactor;
+                } else {
+                    emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
+                    emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
+                    
+                    double evrFactor = Math.min(emaEvr / 100.0, 1.0);
+                    double baseAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
+                    double sidewayPenalty = 1.0 - 0.7 * emaSidewayScore; 
+                    double adaptiveAlpha = baseAlpha * Math.max(0.3, sidewayPenalty);
+
+                    double rawMicroSlope = rawPc0 - lastEmaPc0;
+                    boolean isMacroBullish = projectedMacroSlope >= 0;
+                    boolean isMicroBullish = rawMicroSlope >= 0;
+
+                    if (projectedMacroSlope != 0.0 && (isMacroBullish == isMicroBullish)) {
+                        adaptiveAlpha = Math.min(1.0, adaptiveAlpha * 2.0); 
+                    }
+
+                    emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
+                }
+
+                double currentResidual = event.price - emaPc0;
                 residualHistory[residualHead] = currentResidual;
                 residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
                 if (residualHead == 0) residualFull = true;
@@ -381,51 +415,156 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                event.vress = noiseStdDev;
+                double evrFactor = Math.min(emaEvr / 100.0, 1.0); 
+                double alpha = 4.0; 
+                double beta = 2.0;  
+                
+                double sidewayBandWiden = 1.0 + 1.5 * emaSidewayScore;
+                double rawMultiplier = (1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor) * sidewayBandWiden;
+                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 8.0));
 
-                // =========================================================================
-                // 🌟 REGIME DETECTION: Purely Derivative Based
-                // Regime is decided by the slope of the smooth wave + Macro validation
-                // =========================================================================
-                
-                double slopeThreshold = noiseStdDev * 0.02; // Minimum slope to consider a trend
-                int targetRegime = lastV2Regime;
-                
-                if (currentWaveSlope > slopeThreshold) {
-                    // Smooth line is pointing UP
-                    if (projectedMacroSlope >= 0) targetRegime = 1; // Macro agrees
-                } else if (currentWaveSlope < -slopeThreshold) {
-                    // Smooth line is pointing DOWN
-                    if (projectedMacroSlope <= 0) targetRegime = -1; // Macro agrees
-                } else {
-                    // Line is flat
-                    targetRegime = 0;
-                }
-                
-                // Smooth hysteresis to avoid flickering regime changes
-                if (targetRegime != lastV2Regime) {
-                    // Require the slope to be significantly strong to switch regimes
-                    if (Math.abs(currentWaveSlope) > slopeThreshold * 2.0) {
-                        currentMarketRegime = targetRegime;
-                        lastV2Regime = targetRegime;
-                    }
-                }
-                
-                event.regime = currentMarketRegime;
+                double rawDistance = noiseStdDev * mMultiplier; 
+                if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
+                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
 
+                event.pc0 = emaPc0;
                 event.evr = emaEvr;
+                event.bandUpper = emaPc0 + smoothedDistance;
+                event.bandLower = emaPc0 - smoothedDistance;
+                event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
-                event.ssaTrendSlope = currentWaveSlope;
+                
+                event.ssaTrendSlope = emaTrendSlope;
                 event.sidewayScore = emaSidewayScore;
                 
                 double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
                 event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
 
+                double currentLineVal;
+                double slopeThreshold = noiseStdDev * 0.1; 
+                
+                if (currentMarketRegime == 1) { 
+                    double proposedSupport = event.bandLower;
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ? 
+                                     Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
+                    
+                    boolean bandBreach = event.price < currentLineVal;
+                    boolean strongCounterSlope = emaTrendSlope < -slopeThreshold && emaSidewayScore < 0.7;
+                    
+                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
+                        currentMarketRegime = -1; 
+                        currentLineVal = event.bandUpper; 
+                    }
+                } else { 
+                    double proposedResistance = event.bandUpper;
+                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ? 
+                                     Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
+                    
+                    boolean bandBreach = event.price > currentLineVal;
+                    boolean strongCounterSlope = emaTrendSlope > slopeThreshold && emaSidewayScore < 0.7;
+                    
+                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
+                        currentMarketRegime = 1; 
+                        currentLineVal = event.bandLower; 
+                    }
+                }
+
+                lastLogicalDistanceLine = currentLineVal;
+                event.ssaTrend = currentLineVal;
+                event.regime = currentMarketRegime;
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
                 
-                event.momentumSignal = event.price - currentSmoothWave;
+                // =========================================================================
+                // 🌟 STATE-SPACE KINEMATIC RATCHET: SYMMETRIC MACRO-MICRO FUSION
+                // =========================================================================
+                
+                // 1. Determine Market State via Macro-Micro Consensus
+                boolean isSideways = emaSidewayScore > 0.60;
+                double microSlopeThreshold = Math.max(event.vress * 0.5, 1e-8);
+                
+                boolean microBull = emaTrendSlope > microSlopeThreshold;
+                boolean microBear = emaTrendSlope < -microSlopeThreshold;
+                boolean macroBull = projectedMacroSlope > 0;
+                boolean macroBear = projectedMacroSlope < 0;
+                
+                int targetRegime = lastV2Regime;
+                
+                if (isSideways) {
+                    targetRegime = 0; // Sideways dominates
+                } else {
+                    if (microBull && macroBull) targetRegime = 1;
+                    else if (microBear && macroBear) targetRegime = -1;
+                    else if (microBull && projectedMacroSlope == 0.0) targetRegime = 1; // Fallback
+                    else if (microBear && projectedMacroSlope == 0.0) targetRegime = -1; // Fallback
+                    else if (macroBull && !microBear) targetRegime = 1; // Macro bull, micro neutral
+                    else if (macroBear && !microBull) targetRegime = -1; // Macro bear, micro neutral
+                    // If complete conflict (e.g., macroBull and microBear), hold last regime to prevent whipsaw
+                }
+
+                // 2. Calculate Dynamic Smoothing Alpha based on domCycle
+                double cyclicalAlpha = 2.0 / (Math.max(20.0, event.domCycle / 2.0) + 1.0);
+                double alpha_v2 = Math.max(0.02, Math.min(0.15, cyclicalAlpha));
+
+                // 3. Define Target & Strict Bounds
+                double minDistance = Math.max(event.vress * 1.5, 1e-6);
+                double quantumStep = Math.max(event.vress * 0.5, 1e-6);
+                
+                double target;
+                if (targetRegime == 1) {
+                    target = event.bandLower; // Trailing Support
+                    if (target > event.price - minDistance) target = event.price - minDistance;
+                } else if (targetRegime == -1) {
+                    target = event.bandUpper; // Trailing Resistance
+                    if (target < event.price + minDistance) target = event.price + minDistance;
+                } else {
+                    target = emaPc0; // Mean Baseline
+                }
+
+                // 4. Apply State-Space Tracking with Structural Snap & Deadband
+                if (lastValue2 == 0.0) {
+                    event.value2 = target;
+                    isRatchetFrozen = false;
+                } else if (targetRegime != lastV2Regime) {
+                    // Regime changed: Instantly snap to the correct structural side to prevent crossing
+                    if (targetRegime == 1) {
+                        event.value2 = event.price - minDistance;
+                    } else if (targetRegime == -1) {
+                        event.value2 = event.price + minDistance;
+                    } else {
+                        event.value2 = emaPc0;
+                    }
+                    isRatchetFrozen = false;
+                } else {
+                    // Same regime: smoothly trail or flatline
+                    double diff = target - lastValue2;
+                    if (Math.abs(diff) < quantumStep) {
+                        // Deadband: hold flat to form clean, stable structural steps
+                        event.value2 = lastValue2;
+                        isRatchetFrozen = true;
+                    } else {
+                        // Smoothly track the target
+                        event.value2 = lastValue2 + alpha_v2 * diff;
+                        
+                        // Enforce strict bounds during transition so it never crosses the price
+                        if (targetRegime == 1 && event.value2 > event.price - minDistance) {
+                            event.value2 = event.price - minDistance;
+                        } else if (targetRegime == -1 && event.value2 < event.price + minDistance) {
+                            event.value2 = event.price + minDistance;
+                        }
+                        isRatchetFrozen = false;
+                    }
+                }
+                
+                lastV2Regime = targetRegime;
+                lastEmaPc0 = emaPc0;
+                lastValue2 = event.value2;
+                lastTrendSlope = emaTrendSlope;
+
+                // =========================================================================
+                
+                event.momentumSignal = event.price - event.pc0;
                 double CRISIS_THRESHOLD = 0.40; 
                 event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
                 
@@ -443,20 +582,16 @@ public class HftRegimeDetection {
 
                 double MAX_POSITION = 1.0; 
                 event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
-                event.dynamicStopLoss = noiseStdDev * 3.0;
-                
-                // Carry state forward
-                lastSmoothWave = currentSmoothWave;
-                lastSmoothWaveSlope = currentWaveSlope;
+                event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | S-Score: %.3f | WaveSlope: %+.6f | Val2(Wave): %.2f | Regime: %d\n", 
-                                      event.price, emaSidewayScore, currentWaveSlope, event.value2, event.regime);
+                    System.out.printf("\n[DEBUG] Price: %.2f | SidewayScore: %.3f | TrendSlope: %+.6f | TrendStrength: %.3f | SNR: %.3f | ProjSlope: %+.4f | Val2: %.2f\n", 
+                                      event.price, emaSidewayScore, emaTrendSlope, event.trendStrength, 
+                                      trendPower, projectedMacroSlope, event.value2);
                 }
                 
             } else {
                 event.pc0 = event.price;
-                event.value2 = event.price;
                 event.evr = 0.0;
                 event.bandUpper = event.price;
                 event.bandLower = event.price;
@@ -475,17 +610,16 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = 0.0;
                 event.crisisCapActive = 0;
                 
+                event.value2 = event.price;
                 event.ssaTrendSlope = 0.0;
                 event.sidewayScore = 1.0;
                 event.trendStrength = 0.0;
-                
-                ema1_pc0 = event.price;
-                ema2_pc0 = event.price;
-                lastSmoothWave = event.price;
+                lastEmaPc0 = event.price;
+                lastValue2 = event.price;
             }
 
             // --- Lyapunov computation ---
-            ssaTrendBuffer[ssaHead] = event.value2;
+            ssaTrendBuffer[ssaHead] = event.ssaTrend;
             ssaHead = (ssaHead + 1) % LLE_WINDOW;
             if (ssaHead == 0) ssaBufferFull = true;
 
@@ -517,7 +651,7 @@ public class HftRegimeDetection {
             }
 
             event.lambda = currentLambda;
-            event.isFrozen = currentRegimeShiftAlert;
+            event.isFrozen = currentRegimeShiftAlert || isRatchetFrozen;
 
             head = (head + 1) % MAX_CAPACITY;
             if (count < MAX_CAPACITY) count++;
@@ -527,7 +661,7 @@ public class HftRegimeDetection {
     public static class ClickHouseBatchHandler implements EventHandler<TickEvent> {
         private Connection connection;
         private PreparedStatement statement;
-        private final int batchSizeThreshold = 200; 
+        private final int batchSizeThreshold = 1000;
         private int currentBatchSize = 0;
 
         public ClickHouseBatchHandler() {
