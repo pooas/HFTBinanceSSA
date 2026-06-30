@@ -19,6 +19,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import com.lmax.disruptor.YieldingWaitStrategy;
 
 public class HftRegimeDetection {
 
@@ -873,8 +874,7 @@ public class HftRegimeDetection {
         zmqMacroThread.setDaemon(true);
         zmqMacroThread.start();
 
-        Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 1024, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new BusySpinWaitStrategy());
-        disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
+        Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 65536, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new YieldingWaitStrategy());        disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
         RingBuffer<TickEvent> ringBuffer = disruptor.start();
         new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking();
         Thread.currentThread().join();
