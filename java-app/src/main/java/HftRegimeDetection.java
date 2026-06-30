@@ -220,7 +220,6 @@ public class HftRegimeDetection {
         private int currentM = 3;
 
         private int currentMarketRegime = 1;
-        private double lastLogicalDistanceLine = 0.0;
         private double smoothedDistance = 0.0;
 
         private double emaPc0 = 0.0;
@@ -233,20 +232,21 @@ public class HftRegimeDetection {
 
         private double lastEmaPc0 = 0.0;
         private double lastValue2 = 0.0;
-        private double lastTrendSlope = 0.0; // Added variable to fix compilation error
         
         private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
         
         private int lastV2Regime = 0;
 
-        // 🌟 Fixed DSP buffer size for SG Filter (NO MORE DYNAMIC WINDOW JUMPS)
-        private final CausalSavitzkyGolay sgFilter = new CausalSavitzkyGolay(100);
-        private static final int SG_BUF_SIZE = 200;
+        // 🌟 افزایش سایز بافر برای ایجاد موج بسیار سنگین و پایدار
+        private final CausalSavitzkyGolay sgFilter = new CausalSavitzkyGolay(250);
+        private static final int SG_BUF_SIZE = 400;
         private final double[] sgPc0Buffer = new double[SG_BUF_SIZE];
         private int sgBufHead = 0;
         private int sgBufCount = 0;
-        private double smoothedSgWindow = 30.0; // Stabilized window tracker
+        
+        // 🌟 به جای پنجره متغیر که نویز ایجاد می‌کرد، از پنجره ثابت و سنگین استفاده می‌کنیم
+        private final int FIXED_SG_WINDOW = 150; 
         private double lastSgTrend = 0.0;
         private double lastSgSlope = 0.0;
 
@@ -525,7 +525,7 @@ public class HftRegimeDetection {
                     emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
                 }
 
-                // 🌟 Feed raw SSA PC0 into the Savitzky-Golay DSP buffer
+                // 🌟 وارد کردن دیتا به بافر سنگین DSP
                 sgPc0Buffer[sgBufHead] = rawPc0;
                 sgBufHead = (sgBufHead + 1) % SG_BUF_SIZE;
                 if (sgBufCount < SG_BUF_SIZE) sgBufCount++;
@@ -564,19 +564,17 @@ public class HftRegimeDetection {
                 event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
 
                 // =========================================================================
-                // 🌟 THE ULTIMATE GAME CHANGER: QUANTUM MAGNETIC RATCHET (QMR)
+                // 🌟 THE ULTIMATE GAME CHANGER: MACRO-GRAVITATIONAL STAIRCASE (MGS)
+                // خط زرد دیگر از طریق Offset یا پرش‌های قیمتی نقاشی نمی‌شود. 
+                // این یک ترند مرکزی خالص است که به وسیله شیب کلان (Python) قفل می‌شود.
                 // =========================================================================
                 
-                // --- STEP 1: FIXED-WINDOW SG-SSA (The Brain) ---
-                // We lock the SG window to a heavily smoothed cycle to absolutely 
-                // prevent the tick-by-tick polynomial explosions seen in the screenshot.
-                smoothedSgWindow = 0.999 * smoothedSgWindow + 0.001 * Math.max(10.0, event.domCycle);
-                int sgW = (int) Math.round(smoothedSgWindow);
-                sgW = Math.max(3, Math.min(100, sgW));
-                int sgDeg = 2; // Fixed quadratic for robust slope
+                // --- STEP 1: HEAVY ANCHOR (تولید موج صاف مرکزی) ---
+                int sgW = Math.min(sgBufCount, FIXED_SG_WINDOW); // پنجره کاملا ثابت و بدون پرش
+                int sgDeg = 2; // درجه ثابت چندجمله‌ای
 
                 double sgTrend, sgSlope;
-                if (sgBufCount >= sgW) {
+                if (sgW >= 5) {
                     double[] sgData = new double[sgW];
                     for (int i = 0; i < sgW; i++) {
                         sgData[i] = sgPc0Buffer[(sgBufHead - sgW + i + SG_BUF_SIZE) % SG_BUF_SIZE];
@@ -588,111 +586,86 @@ public class HftRegimeDetection {
                     sgSlope = emaTrendSlope;
                 }
 
-                // Extreme smoothing on the analytical output to ensure ZERO analytical jitter
                 if (lastSgTrend == 0.0) { lastSgTrend = sgTrend; lastSgSlope = sgSlope; }
-                sgTrend = 0.95 * lastSgTrend + 0.05 * sgTrend;
-                sgSlope = 0.95 * lastSgSlope + 0.05 * sgSlope;
+                
+                // فیلتر نهایی بی‌نهایت نرم برای از بین بردن هرگونه اثر لبه‌ای (Edge Effects)
+                sgTrend = 0.90 * lastSgTrend + 0.10 * sgTrend;
+                sgSlope = 0.90 * lastSgSlope + 0.10 * sgSlope;
                 lastSgTrend = sgTrend;
                 lastSgSlope = sgSlope;
                 
-                // Initialize ratchet at startup
                 if (lastValue2 == 0.0) {
-                    lastValue2 = emaPc0;
-                    lastV2Regime = (emaTrendSlope >= 0) ? 1 : -1;
+                    lastValue2 = sgTrend;
+                    lastV2Regime = (projectedMacroSlope >= 0) ? 1 : -1;
                 }
 
-                // --- STEP 2: MACRO-MICRO CONSENSUS REGIME ---
-                int intendedRegime = lastV2Regime;
-                double slopeThreshold = Math.max(event.vress * 0.05, 1e-6);
-                
-                if (emaSidewayScore > 0.75) {
-                    intendedRegime = 0; // Pure Sideways
-                } else if (sgSlope > slopeThreshold && projectedMacroSlope >= 0) {
-                    intendedRegime = 1; // Bullish Consensus
-                } else if (sgSlope < -slopeThreshold && projectedMacroSlope <= 0) {
-                    intendedRegime = -1; // Bearish Consensus
+                // --- STEP 2: MACRO GRAVITY (جهت مجاز حرکت خط) ---
+                double macroGravity = 0.0;
+                if (Math.abs(projectedMacroSlope) > 1e-8) {
+                    macroGravity = Math.signum(projectedMacroSlope);
                 }
 
-                // --- STEP 3: QUANTUM ANCHOR TARGET ---
-                // Crucial fix: The line is anchored to the smooth 'sgTrend', NOT 'event.price'.
-                double offset = event.vress * (2.5 - event.trendStrength); 
-                double quantumStep = Math.max(event.vress * (0.8 + emaProbCrisis), 1e-5);
-                
-                double targetValue2;
-                if (intendedRegime == 1) {
-                    targetValue2 = sgTrend - offset; // Target trailing support
-                } else if (intendedRegime == -1) {
-                    targetValue2 = sgTrend + offset; // Target trailing resistance
-                } else {
-                    targetValue2 = emaPc0; // Mean baseline
-                }
-
-                boolean hardReset = false;
+                // --- STEP 3: KINEMATIC ONE-WAY RATCHET (قفل یک‌طرفه گام‌ها) ---
+                double diff = sgTrend - lastValue2;
                 double newValue2 = lastValue2;
+                
+                // سایز گام کوانتومی: خط تا زمانی که ترند به اندازه نویز جابجا نشود فریز می‌ماند
+                double quantumStep = Math.max(event.vress * (0.5 + emaProbCrisis), 1e-6);
+                
+                // مکانیزم خروج اضطراری (Emergency Snap): 
+                // فقط زمانی رخ می‌دهد که قیمت به طرز وحشتناکی (بیشتر از ۵ برابر نویز) خط را بشکند
+                double emergencyThreshold = event.vress * 5.0;
+                boolean emergencyBullBreak = (event.price > lastValue2 + emergencyThreshold) && (emaTrendSlope > event.vress * 0.1);
+                boolean emergencyBearBreak = (event.price < lastValue2 - emergencyThreshold) && (emaTrendSlope < -event.vress * 0.1);
 
-                // --- STEP 4: FAKEOUT IMMUNITY (Breakout Validation) ---
-                // If price crashes through the yellow line, we do NOT blindly snap.
-                // We wait for the macro slope to confirm the trend has actually died.
-                if (lastV2Regime == 1 && event.price < lastValue2) {
-                    // Support broken! Is it real or a fakeout?
-                    if (intendedRegime == -1 || event.price < lastValue2 - (event.vress * 2.0)) {
-                        intendedRegime = -1;
-                        newValue2 = event.price + offset; // Validated Bearish Flip
-                        hardReset = true;
-                    }
-                } else if (lastV2Regime == -1 && event.price > lastValue2) {
-                    // Resistance broken! Is it real or a fakeout?
-                    if (intendedRegime == 1 || event.price > lastValue2 + (event.vress * 2.0)) {
-                        intendedRegime = 1;
-                        newValue2 = event.price - offset; // Validated Bullish Flip
-                        hardReset = true;
-                    }
-                }
-
-                // --- STEP 5: ONE-WAY STAIRCASE MOVEMENT ---
-                if (!hardReset) {
-                    if (intendedRegime != lastV2Regime) {
-                        // Regime elegantly changed without a crash
-                        newValue2 = targetValue2;
-                    } else {
-                        // Strict Geometric Ratcheting: 
-                        // In Uptrend, line CANNOT go down. In Downtrend, line CANNOT go up.
-                        if (intendedRegime == 1) {
-                            if (targetValue2 >= lastValue2 + quantumStep) {
-                                newValue2 = targetValue2; // Step UP
-                            } else {
-                                newValue2 = lastValue2; // Hold perfectly FLAT
+                if (emergencyBullBreak) {
+                    // ریست نرم به سمت لنگر مرکزی
+                    newValue2 = sgTrend - event.vress; 
+                } else if (emergencyBearBreak) {
+                    // ریست نرم به سمت لنگر مرکزی
+                    newValue2 = sgTrend + event.vress; 
+                } else {
+                    // --- مکانیزم اصلی چرخ‌دنده (بدون پرش، فقط حرکت در جهت کلان) ---
+                    if (Math.abs(diff) >= quantumStep) {
+                        if (macroGravity > 0) {
+                            // روند کلان صعودی: خط زرد فقط اجازه دارد بالا برود (کف‌سازی)
+                            if (diff > 0) {
+                                newValue2 = lastValue2 + diff * 0.15; // دنبال کردن نرم
+                            } 
+                            // اگر diff منفی بود خط کاملا فریز می‌ماند (پله افقی می‌سازد)
+                            
+                        } else if (macroGravity < 0) {
+                            // روند کلان نزولی: خط زرد فقط اجازه دارد پایین بیاید (سقف‌سازی)
+                            if (diff < 0) {
+                                newValue2 = lastValue2 + diff * 0.15; // دنبال کردن نرم
                             }
-                        } else if (intendedRegime == -1) {
-                            if (targetValue2 <= lastValue2 - quantumStep) {
-                                newValue2 = targetValue2; // Step DOWN
-                            } else {
-                                newValue2 = lastValue2; // Hold perfectly FLAT
-                            }
+                            // اگر diff مثبت بود خط کاملا فریز می‌ماند (پله افقی می‌سازد)
+                            
                         } else {
-                            // Sideways: Extreme friction. Only bleed slowly to mean.
-                            if (Math.abs(targetValue2 - lastValue2) > quantumStep * 2.0) {
-                                newValue2 = lastValue2 + Math.signum(targetValue2 - lastValue2) * (quantumStep * 0.05);
-                            } else {
-                                newValue2 = lastValue2;
+                            // رژیم سایدوی کلان: اصطکاک شدید
+                            if (Math.abs(diff) > event.vress * 3.0) {
+                                newValue2 = lastValue2 + diff * 0.05; // نشت بسیار کند
                             }
                         }
                     }
                 }
 
+                // ثبت مقدار نهایی
                 event.value2 = newValue2;
-                event.ssaTrend = sgTrend; // Store the raw mathematical brain for debug
-                event.regime = intendedRegime;
-                currentMarketRegime = intendedRegime;
+                event.ssaTrend = sgTrend; // (دیتا صرفا جهت تحلیل در دیتابیس)
+                
+                // رژیم نهایی صرفا بر اساس شیب کلان قفل می‌شود تا پرش رنگی نداشته باشیم
+                event.regime = (macroGravity > 0) ? 1 : (macroGravity < 0 ? -1 : 0);
+                currentMarketRegime = event.regime;
 
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
                 event.hmmProbCrisis = emaProbCrisis;
 
-                isRatchetFrozen = (newValue2 == lastValue2 && !hardReset);
+                isRatchetFrozen = (newValue2 == lastValue2);
 
-                // Update State
-                lastV2Regime = intendedRegime;
+                // آپدیت حافظه برای تیک بعدی
+                lastV2Regime = event.regime;
                 lastEmaPc0 = emaPc0;
                 lastValue2 = newValue2;
                 lastTrendSlope = emaTrendSlope;
@@ -720,8 +693,8 @@ public class HftRegimeDetection {
                 event.dynamicStopLoss = event.vress * 3.0;
 
                 if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | S-Score: %.3f | SG-Slope: %+.6f | Target: %.2f | V2: %.2f | Regime: %d\n", 
-                                      event.price, emaSidewayScore, sgSlope, targetValue2, event.value2, intendedRegime);
+                    System.out.printf("\n[DEBUG] Price: %.2f | S-Score: %.3f | SG-Slope: %+.6f | V2: %.2f | Regime: %d\n", 
+                                      event.price, emaSidewayScore, sgSlope, event.value2, event.regime);
                 }
                 
             } else {
@@ -746,7 +719,6 @@ public class HftRegimeDetection {
                 
                 event.value2 = event.price;
                 
-                // 🌟 Initialize SG buffer with raw price during warmup
                 sgPc0Buffer[sgBufHead] = event.price;
                 sgBufHead = (sgBufHead + 1) % SG_BUF_SIZE;
                 if (sgBufCount < SG_BUF_SIZE) sgBufCount++;
@@ -804,7 +776,8 @@ public class HftRegimeDetection {
     public static class ClickHouseBatchHandler implements EventHandler<TickEvent> {
         private Connection connection;
         private PreparedStatement statement;
-        private final int batchSizeThreshold = 1000;
+        // 🌟 کاهش سایز بچ برای آپدیت ۵ برابر سریع‌تر گرافانا / Clickhouse
+        private final int batchSizeThreshold = 200; 
         private int currentBatchSize = 0;
 
         public ClickHouseBatchHandler() {
