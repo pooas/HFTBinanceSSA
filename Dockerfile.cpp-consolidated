@@ -20,13 +20,16 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     libzmq3-dev \
     libczmq-dev \
-    cppzmq-dev \
     libssl-dev \
     libasio-dev \
     libwebsocketpp-dev \
     nlohmann-json3-dev \
     libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# cppzmq headers (not available as apt package in Ubuntu 22.04)
+RUN wget -q https://raw.githubusercontent.com/zeromq/cppzmq/master/zmq.hpp -O /usr/local/include/zmq.hpp && \
+    wget -q https://raw.githubusercontent.com/zeromq/cppzmq/master/zmq_addon.hpp -O /usr/local/include/zmq_addon.hpp
 
 # Intel MKL (for HMM node)
 RUN wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | apt-key add - && \
