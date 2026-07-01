@@ -15,6 +15,8 @@ import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
 
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -31,6 +33,17 @@ public class HftRegimeDetection {
     public static volatile double macroL1Slope = 0.0;
     public static volatile double macroL1Accel = 0.0;
     public static volatile double projectedMacroSlope = 0.0;
+
+    // SG-DSP fields — populated by the SG ZMQ subscriber thread
+    public static volatile double sgSmoothed = 0.0;
+    public static volatile double sgSlope = 0.0;
+    public static volatile double sgAccel = 0.0;
+    public static volatile double sgSideway = 0.0;
+    public static volatile int sgAdaptiveWindow = 0;
+    public static volatile int sgPolyOrder = 0;
+    public static volatile long sgTimestampNs = 0;
+    private static final int SG_FRAME_MAGIC = 0x53474450;
+    private static final int SG_FRAME_SIZE = 52;
 
     public static class TickEvent {
         public double price;
@@ -368,6 +381,12 @@ public class HftRegimeDetection {
                     emaSidewayScore = rawSidewayScore;
                 } else {
                     emaSidewayScore = alphaSideway * rawSidewayScore + (1.0 - alphaSideway) * emaSidewayScore;
+                }
+
+                // Override slope & sideway with SG-DSP zero-lag signals when available
+                if (sgTimestampNs > 0) {
+                    emaTrendSlope = sgSlope;
+                    emaSidewayScore = sgSideway;
                 }
 
                 if (emaPc0 == 0.0) {
@@ -873,6 +892,50 @@ public class HftRegimeDetection {
         });
         zmqMacroThread.setDaemon(true);
         zmqMacroThread.start();
+
+        // SG-DSP subscriber: reads 52-byte binary frames from the C++ Adaptive SG filter
+        Thread zmqSgThread = new Thread(() -> {
+            ByteBuffer buf = ByteBuffer.allocateDirect(SG_FRAME_SIZE);
+            buf.order(ByteOrder.LITTLE_ENDIAN);
+
+            try (ZContext context = new ZContext()) {
+                ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
+                String sgHost = System.getenv("SG_ZMQ_HOST");
+                if (sgHost == null || sgHost.trim().isEmpty()) sgHost = "localhost";
+                String sgPort = System.getenv("SG_ZMQ_PORT");
+                if (sgPort == null || sgPort.trim().isEmpty()) sgPort = "5557";
+
+                String address = "tcp://" + sgHost + ":" + sgPort;
+                subscriber.connect(address);
+                subscriber.subscribe(new byte[0]);
+
+                System.out.println("[SG-SUB] SG-DSP Subscriber active on " + address);
+
+                while (!Thread.currentThread().isInterrupted()) {
+                    byte[] raw = subscriber.recv(0);
+                    if (raw == null || raw.length != SG_FRAME_SIZE) continue;
+
+                    buf.clear();
+                    buf.put(raw);
+                    buf.flip();
+
+                    int magic = buf.getInt();
+                    if (magic != SG_FRAME_MAGIC) continue;
+
+                    sgTimestampNs    = buf.getLong();
+                    sgSmoothed       = buf.getDouble();
+                    sgSlope          = buf.getDouble();
+                    sgAccel          = buf.getDouble();
+                    sgSideway        = buf.getDouble();
+                    sgAdaptiveWindow = buf.getInt();
+                    sgPolyOrder      = buf.getInt();
+                }
+            } catch (Exception e) {
+                System.err.println("[SG-SUB] Error: " + e.getMessage());
+            }
+        });
+        zmqSgThread.setDaemon(true);
+        zmqSgThread.start();
 
         Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 65536, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new YieldingWaitStrategy());        disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
         RingBuffer<TickEvent> ringBuffer = disruptor.start();

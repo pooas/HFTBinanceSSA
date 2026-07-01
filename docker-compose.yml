@@ -45,11 +45,32 @@ services:
   # 🌟 سرویس جدید C++ (مغز متفکر HMM)
   cpp-hmm:
     build:
-      context: ./Hidden-Markov-Model-MKL
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: Dockerfile.cpp-consolidated
+      target: hmm-runtime
     container_name: hft_cpp_hmm
     environment:
-      - ZMQ_PORT=5555  # پورتی که از طریق آن رژیم را به جاوا می‌فرستد
+      - ZMQ_PORT=5555
+    networks:
+      - hft-net
+
+  cpp-sg-dsp:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpp-consolidated
+      target: sg-runtime
+    container_name: hft_cpp_sg_dsp
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=hft123
+      - SG_ZMQ_PORT=5557
+      - SG_POLL_INTERVAL_MS=50
+      - SG_WARMUP_ROWS=500
+    depends_on:
+      clickhouse:
+        condition: service_healthy
     networks:
       - hft-net
 
@@ -74,13 +95,18 @@ services:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=hft123
-      # 🌟 متغیرهای جدید برای ارتباط جاوا با سوکت C++
       - ZMQ_HOST=cpp-hmm
       - ZMQ_PORT=5555
+      - MACRO_ZMQ_HOST=python-macro
+      - MACRO_ZMQ_PORT=5556
+      - SG_ZMQ_HOST=cpp-sg-dsp
+      - SG_ZMQ_PORT=5557
     depends_on:
       clickhouse:
         condition: service_healthy
       cpp-hmm:
+        condition: service_started
+      cpp-sg-dsp:
         condition: service_started
     networks:
       - hft-net
