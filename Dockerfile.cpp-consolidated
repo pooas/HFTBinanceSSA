@@ -73,14 +73,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# MKL runtime libraries only (no devel headers)
-COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_rt.so.2 /usr/lib/
-COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_core.so.2 /usr/lib/
-COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_gnu_thread.so.2 /usr/lib/
-COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_intel_lp64.so.2 /usr/lib/
-COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_intel_thread.so.2 /usr/lib/
-COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_def.so.2 /usr/lib/
-COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_avx2.so.2 /usr/lib/
+# MKL runtime libraries — copy all .so.2 to cover core, threading, VML,
+# and CPU-specific dispatch kernels (avx2, avx512, def, etc.)
+COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/*.so.2 /usr/lib/
 RUN ldconfig
 
 COPY --from=builder /build/hmm/build/hmm_engine /app/hmm_engine
