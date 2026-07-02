@@ -25,8 +25,14 @@ RUN wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCT
     apt-get update && \
     apt-get install -y intel-oneapi-mkl-devel-2024.0
 
+# 🌟 ثبت مسیر کتابخانه‌های اینتل در Linker سیستم‌عامل برای رفع خطای VML/AVX512
+RUN echo "/opt/intel/oneapi/mkl/latest/lib/intel64" > /etc/ld.so.conf.d/intel-mkl.conf && \
+    echo "/opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64_lin" >> /etc/ld.so.conf.d/intel-mkl.conf && \
+    echo "/opt/intel/oneapi/mkl/latest/lib" >> /etc/ld.so.conf.d/intel-mkl.conf && \
+    ldconfig
+
 # تنظیم متغیرهای محیطی برای MKL
-ENV LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:/opt/intel/oneapi/mkl/latest/lib:$LD_LIBRARY_PATH
 ENV MKLROOT=/opt/intel/oneapi/mkl/latest
 
 WORKDIR /app
