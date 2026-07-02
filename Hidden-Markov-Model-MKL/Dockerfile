@@ -4,10 +4,9 @@ FROM ubuntu:22.04
 # جلوگیری از درخواست‌های تعاملی در زمان نصب
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y libgomp1
-# 🌟 نصب ابزارهای پایه، پیش‌نیازهای اینتل و کتابخانه‌های شبکه
-# توجه: libboost-all-dev حذف شد و libasio-dev (نسخه مستقل و سبک) جایگزین شد
+# 🌟 ترکیب تمام نصب‌ها در یک لایه برای جلوگیری از تداخل کش داکر
 RUN apt-get update && apt-get install -y \
+    libgomp1 \
     build-essential \
     cmake \
     wget \
