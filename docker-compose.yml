@@ -74,6 +74,30 @@ services:
     networks:
       - hft-net
 
+  cpp-ssa:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpp-consolidated
+      target: ssa-runtime
+    container_name: hft_cpp_ssa
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=hft123
+      - HMM_ZMQ_HOST=cpp-hmm
+      - HMM_ZMQ_PORT=5555
+      - SSA_ZMQ_PORT=5558
+      - SSA_POLL_INTERVAL_MS=50
+      - SSA_WARMUP_ROWS=500
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      cpp-hmm:
+        condition: service_started
+    networks:
+      - hft-net
+
   # 🌟 سرویس جدید فرمانده: Python Macro Engine
   python-macro:
     build:
@@ -101,12 +125,16 @@ services:
       - MACRO_ZMQ_PORT=5556
       - SG_ZMQ_HOST=cpp-sg-dsp
       - SG_ZMQ_PORT=5557
+      - SSA_ZMQ_HOST=cpp-ssa
+      - SSA_ZMQ_PORT=5558
     depends_on:
       clickhouse:
         condition: service_healthy
       cpp-hmm:
         condition: service_started
       cpp-sg-dsp:
+        condition: service_started
+      cpp-ssa:
         condition: service_started
     networks:
       - hft-net

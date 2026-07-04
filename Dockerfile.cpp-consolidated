@@ -58,6 +58,13 @@ RUN mkdir -p build && cd build && \
     cmake -DCMAKE_BUILD_TYPE=Release .. && \
     make -j$(nproc)
 
+# --- Build SSA Engine ---
+WORKDIR /build/ssa
+COPY cpp-ssa-engine/ .
+RUN mkdir -p build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j$(nproc)
+
 # ---------------------------------------------------------------------------
 # Stage 2a: HMM Runtime — minimal image with only the HMM binary
 # ---------------------------------------------------------------------------
@@ -98,3 +105,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/sg/build/sg_engine /app/sg_engine
 WORKDIR /app
 CMD ["./sg_engine"]
+
+# ---------------------------------------------------------------------------
+# Stage 2c: SSA Runtime — minimal image with only the SSA binary
+# ---------------------------------------------------------------------------
+FROM ubuntu:22.04 AS ssa-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libzmq5 \
+    libcurl4 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/ssa/build/ssa_engine /app/ssa_engine
+WORKDIR /app
+CMD ["./ssa_engine"]
