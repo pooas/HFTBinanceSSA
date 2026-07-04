@@ -5,19 +5,33 @@ CREATE TABLE default.hft_market_data (
     sequence UInt64,
     price Float64,
     volume Float64,
-    ssa_trend Float64,
+
+    -- 🌟 ستون‌های خروجی معماری جدید SSA (برگرفته از SsaFrame)
+    ssa_smoothed Float64,         -- سیگنال ترکیب‌شده نهایی
+    ssa_slope Float64,            -- مشتق اول (شیب)
+    ssa_accel Float64,            -- مشتق دوم (شتاب)
+    ssa_sideway Float64,          -- نمره رنج بودن بازار
+    ssa_l_fast Int32,             -- طول پنجره سریع
+    ssa_l_slow Int32,             -- طول پنجره کند
+    ssa_blend_weight Float32,     -- وزن ترکیب دو پایپ‌لاین
+    ssa_evr_fast Float32,         -- واریانس توضیح‌داده‌شده سریع
+    ssa_evr_slow Float32,         -- واریانس توضیح‌داده‌شده کند
+    ssa_eigen_gap Float32,        -- فاصله مقادیر ویژه
+
+    -- ستون‌های قبلی (که در صورت نیاز سیستم‌های دیگر حفظ شده‌اند)
     lambda Float64,
     is_frozen UInt8,
     regime Int8,
     band_upper Float64,
     band_lower Float64,
     pc0 Float64,
-    evr Float64,
     vress Float64,
-    eigen_gap Float64,
+
+    -- وضعیت موتور HMM
     hmm_regime Int8,
     hmm_prob_trend Float64,
     hmm_prob_crisis Float64,
+    
     value2 Float64,
     dom_cycle Float64,
 
@@ -32,4 +46,3 @@ CREATE TABLE default.hft_market_data (
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (timestamp, sequence)
 SETTINGS index_granularity = 8192;
-
