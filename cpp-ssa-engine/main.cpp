@@ -1,13 +1,20 @@
 /**
- * SSA Engine: ClickHouse Tick Reader → HMM ZMQ Subscriber → Dual SSA Pipeline → ZMQ Binary Publisher
+ * SSA Engine: ClickHouse Tick Reader → HMM ZMQ Subscriber → Ehlers DSP Pipeline → ZMQ Binary Publisher
  *
- * Full pipeline (Phases 1-4):
+ * Full pipeline (Ehlers DSP Architecture):
  *   1. Bootstrap: fetch last N ticks from ClickHouse HTTP API to warm the circular buffer
  *   2. HMM Subscriber (background thread): ZMQ SUB on :5555 for REGIME|r,p0,p1,p2 messages
- *   3. AdaptiveL: maps regime probabilities → stable L_fast, L_slow via EMA + hysteresis
- *   4. Dual SSA Pipeline: fast + slow TrajectoryMatrix → RecursiveSVD → Hankelization
- *   5. SoftBlender: regime-adaptive tanh fusion of the two reconstructed signals
+ *   3. MEE Cycle Estimator: HighPass → SuperSmoother → block autocorrelation → Levinson-Durbin
+ *      → AR(3) power spectrum → dominant cycle extraction
+ *   4. Dual Ehlers Pipeline: UltimateSmoother(dom_cycle×0.5) fast + UltimateSmoother(dom_cycle) slow
+ *   5. SoftBlender: regime-adaptive tanh fusion of the two smoothed signals
  *   6. Publish 68-byte SsaFrame via ZMQ PUB :5558
+ *
+ * Architectural pivot from SVD-based SSA to Ehlers IIR filters:
+ *   - O(1) per tick (was O(Lr + r³))
+ *   - Guaranteed stable (poles inside unit circle for all periods)
+ *   - Zero-lag via Ultimate Smoother design
+ *   - No eigenvalue explosions, no matrix operations, no Gram-Schmidt
  *
  * Structural mirror of cpp-sg-dsp/main.cpp — same ClickHouse reader pattern,
  * same env-var configuration, same retry logic. Compiles identically in the
@@ -30,9 +37,8 @@
 #include <curl/curl.h>
 
 #include "ssa_types.hpp"
-#include "ssa_pipeline.hpp"
+#include "dsp_pipeline.hpp"
 #include "soft_blender.hpp"
-#include "adaptive_l.hpp"
 
 // ============================================================================
 // CURL response accumulator
@@ -172,8 +178,7 @@ private:
 //
 // Parses "REGIME|r,p0,p1,p2" string messages from the HMM engine.
 // Stores regime probabilities in atomics (relaxed ordering — transient
-// inconsistency between the three values is fine, smoothed by the EMA
-// in AdaptiveL).
+// inconsistency between the three values is fine, smoothed by the blender).
 // ============================================================================
 
 class HmmSubscriber {
@@ -215,7 +220,7 @@ private:
         std::string endpoint = "tcp://" + host + ":" + std::to_string(port);
         sub.connect(endpoint);
 
-        std::cout << "[SSA] HMM subscriber connected to " << endpoint << std::endl;
+        std::cout << "[DSP] HMM subscriber connected to " << endpoint << std::endl;
 
         while (running_.load(std::memory_order_acquire)) {
             zmq::message_t msg;
@@ -257,7 +262,7 @@ private:
 // ============================================================================
 
 int main() {
-    std::cout << "[SSA] C++ SSA Engine Starting..." << std::endl;
+    std::cout << "[DSP] C++ Ehlers DSP Engine Starting..." << std::endl;
 
     // --- Environment configuration ---
     auto env_or = [](const char* name, const char* def) -> std::string {
@@ -275,13 +280,13 @@ int main() {
     const int         poll_ms     = std::stoi(env_or("SSA_POLL_INTERVAL_MS", "50"));
     const int         warmup_rows = std::stoi(env_or("SSA_WARMUP_ROWS", "500"));
 
-    // --- ZeroMQ PUB socket for SSA output ---
+    // --- ZeroMQ PUB socket for DSP output ---
     zmq::context_t zmq_ctx(1);
     zmq::socket_t zmq_pub(zmq_ctx, zmq::socket_type::pub);
     zmq_pub.set(zmq::sockopt::sndhwm, 10000);
     zmq_pub.set(zmq::sockopt::linger, 0);
     zmq_pub.bind("tcp://*:" + ssa_port);
-    std::cout << "[SSA] ZMQ PUB bound on tcp://*:" << ssa_port << std::endl;
+    std::cout << "[DSP] ZMQ PUB bound on tcp://*:" << ssa_port << std::endl;
 
     // --- Start HMM subscriber (background thread) ---
     HmmSubscriber hmm_sub;
@@ -293,51 +298,41 @@ int main() {
     // --- ClickHouse reader with retry ---
     ClickHouseReader ch_reader(ch_host, ch_port, ch_user, ch_password);
 
-    std::cout << "[SSA] Waiting for ClickHouse at " << ch_host << ":" << ch_port << "..." << std::endl;
+    std::cout << "[DSP] Waiting for ClickHouse at " << ch_host << ":" << ch_port << "..." << std::endl;
     std::vector<ClickHouseReader::TickRow> history;
     history.reserve(warmup_rows);
     int retries = 30;
     while (retries > 0) {
         if (ch_reader.fetch_history(history, warmup_rows) && !history.empty()) break;
         --retries;
-        std::cerr << "[SSA] ClickHouse not ready, retries left: " << retries << std::endl;
+        std::cerr << "[DSP] ClickHouse not ready, retries left: " << retries << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
     if (history.empty()) {
-        std::cerr << "[SSA] No historical data after retries. Starting cold." << std::endl;
+        std::cerr << "[DSP] No historical data after retries. Starting cold." << std::endl;
     } else {
-        std::cout << "[SSA] Warming up with " << history.size() << " historical ticks..." << std::endl;
+        std::cout << "[DSP] Warming up with " << history.size() << " historical ticks..." << std::endl;
         for (const auto& row : history) {
             price_buffer.push(row.price);
         }
-        std::cout << "[SSA] Warm-up complete. Buffer size=" << price_buffer.size() << std::endl;
+        std::cout << "[DSP] Warm-up complete. Buffer size=" << price_buffer.size() << std::endl;
     }
     history.clear();
     history.shrink_to_fit();
 
-    // --- Initialize dual SSA pipeline ---
-    // Default window lengths (Phase 4 AdaptiveL will override these dynamically)
-    static constexpr int DEFAULT_L_SLOW = 61;
-    static constexpr int DEFAULT_L_FAST = 25;   // ~rho(0.4) * L_slow
-    static constexpr int SSA_RANK       = 2;
+    // --- Initialize Ehlers DSP pipeline ---
+    DspPipelineController pipeline;
+    pipeline.configure(&price_buffer);
 
-    PipelineController pipeline;
-    pipeline.configure(&price_buffer, DEFAULT_L_FAST, DEFAULT_L_SLOW, SSA_RANK);
-
-    // Adaptive window controller (initialized at default L_slow)
-    AdaptiveL adaptive_l(DEFAULT_L_SLOW);
-
-    if (price_buffer.size() >= 2 * DEFAULT_L_SLOW) {
-        if (pipeline.warm_up()) {
-            std::cout << "[SSA] Pipeline warm-up complete. L_fast="
-                      << pipeline.L_fast() << " L_slow=" << pipeline.L_slow() << std::endl;
-        } else {
-            std::cerr << "[SSA] Pipeline warm-up failed. Will retry on sufficient data." << std::endl;
-        }
+    if (pipeline.warm_up()) {
+        std::cout << "[DSP] Pipeline warmed up. dom_cycle=" << pipeline.dom_cycle()
+                  << " fast_period=" << pipeline.fast_period()
+                  << " slow_period=" << pipeline.slow_period() << std::endl;
     } else {
-        std::cout << "[SSA] Insufficient data for pipeline warm-up (" << price_buffer.size()
-                  << " < " << 2 * DEFAULT_L_SLOW << "). Will warm up when ready." << std::endl;
+        std::cout << "[DSP] Insufficient data for warm-up (" << price_buffer.size()
+                  << " < " << DspPipelineController::MIN_WARMUP
+                  << "). Will warm during live ticks." << std::endl;
     }
 
     // --- Pre-allocate batch vector (no reallocation in hot loop) ---
@@ -349,7 +344,7 @@ int main() {
     frame.magic = SSA_FRAME_MAGIC;
 
     // --- Main polling loop ---
-    std::cout << "[SSA] Entering live polling loop (interval=" << poll_ms << "ms)..." << std::endl;
+    std::cout << "[DSP] Entering live polling loop (interval=" << poll_ms << "ms)..." << std::endl;
     uint64_t total_ticks = 0;
     uint64_t total_published = 0;
 
@@ -364,19 +359,18 @@ int main() {
             price_buffer.push(tick.price);
             ++total_ticks;
 
-            // Attempt deferred warm-up if pipeline not yet ready
-            if (!pipeline.is_warmed()) {
-                if (price_buffer.size() >= 2 * DEFAULT_L_SLOW) {
-                    pipeline.warm_up();
-                }
-                // Publish raw price while pipeline warms up
+            // Execute Ehlers DSP pipeline (O(1) IIR filters + periodic MEE)
+            PipelineOutput pout = pipeline.step(tick.price);
+
+            if (!pout.valid) {
+                // Pipeline warming up — publish raw price
                 frame.timestamp_ns = tick.timestamp_ms * 1000000ULL;
                 frame.ssa_smoothed = tick.price;
                 frame.ssa_slope    = 0.0;
                 frame.ssa_accel    = 0.0;
                 frame.ssa_sideway  = 0.0;
-                frame.L_fast       = DEFAULT_L_FAST;
-                frame.L_slow       = DEFAULT_L_SLOW;
+                frame.L_fast       = pipeline.fast_period();
+                frame.L_slow       = pipeline.slow_period();
                 frame.blend_weight = 0.5f;
                 frame.evr_fast     = 0.0f;
                 frame.evr_slow     = 0.0f;
@@ -393,52 +387,28 @@ int main() {
             const double p_trend  = hmm_sub.p_trend();
             const double p_crisis = hmm_sub.p_crisis();
 
-            // Adaptive L(t): EMA + hysteresis → stable window lengths
-            AdaptiveLResult lr = adaptive_l.update(p_calm, p_trend, p_crisis);
-            if (lr.changed) {
-                pipeline.resize(lr.L_fast, lr.L_slow);
-            }
+            // Blend fast + slow signals with regime-aware weighting
+            BlendedOutput blended = SoftBlender::blend(
+                pout.fast, pout.slow, p_calm, p_trend, p_crisis);
 
-            // Execute dual SSA pipeline (hot path — target < 5 µs)
-            PipelineOutput pout = pipeline.step();
-
-            if (pout.valid) {
-                // Blend fast + slow signals with regime-aware weighting
-                BlendedOutput blended = SoftBlender::blend(
-                    pout.fast, pout.slow, p_calm, p_trend, p_crisis);
-
-                frame.timestamp_ns = tick.timestamp_ms * 1000000ULL;
-                frame.ssa_smoothed = blended.smoothed;
-                frame.ssa_slope    = blended.slope;
-                frame.ssa_accel    = blended.accel;
-                frame.ssa_sideway  = blended.sideway;
-                frame.L_fast       = pipeline.L_fast();
-                frame.L_slow       = pipeline.L_slow();
-                frame.blend_weight = blended.blend_weight;
-                frame.evr_fast     = blended.evr_fast;
-                frame.evr_slow     = blended.evr_slow;
-                frame.eigen_gap    = blended.eigen_gap;
-            } else {
-                // Pipeline returned invalid (should not happen after warm-up)
-                frame.timestamp_ns = tick.timestamp_ms * 1000000ULL;
-                frame.ssa_smoothed = tick.price;
-                frame.ssa_slope    = 0.0;
-                frame.ssa_accel    = 0.0;
-                frame.ssa_sideway  = 0.0;
-                frame.L_fast       = pipeline.L_fast();
-                frame.L_slow       = pipeline.L_slow();
-                frame.blend_weight = 0.5f;
-                frame.evr_fast     = 0.0f;
-                frame.evr_slow     = 0.0f;
-                frame.eigen_gap    = 0.0f;
-            }
+            frame.timestamp_ns = tick.timestamp_ms * 1000000ULL;
+            frame.ssa_smoothed = blended.smoothed;
+            frame.ssa_slope    = blended.slope;
+            frame.ssa_accel    = blended.accel;
+            frame.ssa_sideway  = blended.sideway;
+            frame.L_fast       = pipeline.fast_period();
+            frame.L_slow       = pipeline.slow_period();
+            frame.blend_weight = blended.blend_weight;
+            frame.evr_fast     = blended.evr_fast;
+            frame.evr_slow     = blended.evr_slow;
+            frame.eigen_gap    = blended.eigen_gap;
 
             zmq::message_t msg(&frame, SSA_FRAME_SIZE);
             zmq_pub.send(msg, zmq::send_flags::dontwait);
             ++total_published;
 
             if (total_published % 5000 == 0) {
-                std::cout << "[SSA] Published " << total_published
+                std::cout << "[DSP] Published " << total_published
                           << " frames | Buffer=" << price_buffer.size()
                           << " | Regime=" << hmm_sub.regime()
                           << " P(calm)=" << p_calm
@@ -448,7 +418,8 @@ int main() {
                           << " EVR_f=" << frame.evr_fast
                           << " EVR_s=" << frame.evr_slow
                           << " | Smoothed=" << frame.ssa_smoothed
-                          << " Slope=" << frame.ssa_slope << std::endl;
+                          << " Slope=" << frame.ssa_slope
+                          << " | dom_cycle=" << pipeline.dom_cycle() << std::endl;
             }
         }
     }
