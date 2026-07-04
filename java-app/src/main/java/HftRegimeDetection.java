@@ -45,6 +45,22 @@ public class HftRegimeDetection {
     private static final int SG_FRAME_MAGIC = 0x53474450;
     private static final int SG_FRAME_SIZE = 52;
 
+    // SSA fields — populated by the SSA ZMQ subscriber thread
+    public static volatile double ssaSmoothed = 0.0;
+    public static volatile double ssaSlope = 0.0;
+    public static volatile double ssaAccel = 0.0;
+    public static volatile double ssaSideway = 0.0;
+    public static volatile int ssaLFast = 0;
+    public static volatile int ssaLSlow = 0;
+    public static volatile float ssaBlendWeight = 0.0f;
+    public static volatile float ssaEvrFast = 0.0f;
+    public static volatile float ssaEvrSlow = 0.0f;
+    public static volatile float ssaEigenGap = 0.0f;
+    public static volatile long ssaTimestampNs = 0;
+    
+    private static final int SSA_FRAME_MAGIC = 0x53534150; // "SSAP"
+    private static final int SSA_FRAME_SIZE = 68;          // 68 bytes frame
+
     public static class TickEvent {
         public double price;
         public double volume;
@@ -80,6 +96,18 @@ public class HftRegimeDetection {
         public double ssaTrendSlope;
         public double sidewayScore;
         public double trendStrength;
+
+        // 🌟 New C++ SSA Engine Fields
+        public double finalSsaSmoothed;
+        public double finalSsaSlope;
+        public double finalSsaAccel;
+        public double finalSsaSideway;
+        public int ssaLFast;
+        public int ssaLSlow;
+        public float ssaBlendWeight;
+        public float ssaEvrFast;
+        public float ssaEvrSlow;
+        public float ssaEigenGapOut;
     }
 
     public static class SsaProcessingHandler implements EventHandler<TickEvent> {
@@ -499,52 +527,32 @@ public class HftRegimeDetection {
 
                 // =========================================================================
                 // 🌟 MACRO–MICRO KINEMATIC FUSION — Adaptive Staircase Ratchet (continuous)
-                //
-                // D(t)   = sgn(projectedMacroSlope) · sgn(emaTrendSlope)   ∈ [-1, +1]
-                // α(t)   = α_cycle · f(vress) · f(hmmProbCrisis) · f(sidewayScore) · g(D)
-                // value2(t) = value2(t-1) + α(t) · (target(t) - value2(t-1))
-                //          with directional inertia (counter-trend moves heavily damped)
-                //          and quantum deadband (flat staircase treads under noise/crisis)
                 // =========================================================================
 
-                // --- 1) Continuous directional coupling D(t) via tanh-smoothed sgn ---
                 double slopeScale = Math.max(event.vress * 0.5, 1e-8);
-                double macroSig = Math.tanh(projectedMacroSlope / slopeScale);   // ∈ [-1, +1]
-                double microSig = Math.tanh(emaTrendSlope       / slopeScale);   // ∈ [-1, +1]
-                double D_raw = macroSig * microSig;                              // ∈ [-1, +1]
+                double macroSig = Math.tanh(projectedMacroSlope / slopeScale);
+                double microSig = Math.tanh(emaTrendSlope       / slopeScale);
+                double D_raw = macroSig * microSig;
 
-                // Smooth D(t) so the coupling itself does not flicker tick-by-tick
                 emaDirCoupling = 0.10 * D_raw + 0.90 * emaDirCoupling;
                 double D = emaDirCoupling;
-                double agreement   = 0.5 * (D + 1.0);   // ∈ [0, 1]  — 1 = aligned, 0 = full conflict
-                double counterDamp = 1.0 - agreement;   // ∈ [0, 1]  — applied to counter-trend moves
+                double agreement   = 0.5 * (D + 1.0);
+                double counterDamp = 1.0 - agreement;
 
-                // --- 2) Adaptive staircase smoothing α(t) -------------------------------
-                //     α_base from the dominant cycle (longer cycle → smaller α)
                 double cycleN    = Math.max(8.0, event.domCycle * 0.5);
                 double alphaBase = 2.0 / (cycleN + 1.0);
 
-                //     Noise damping: vress relative to price magnitude shrinks α
                 double priceScale = Math.max(Math.abs(event.price) * 1e-4, 1e-9);
                 double noiseRatio = Math.min(1.0, event.vress / priceScale);
                 double noiseDamp  = 1.0 - 0.7 * noiseRatio;
 
-                //     Crisis damping: high HMM crisis probability flatlines the ratchet
                 double crisisDamp = 1.0 - 0.9 * emaProbCrisis;
-
-                //     Sideways damping: amplifies the staircase effect in chop
                 double sidewayDamp = 1.0 - 0.6 * emaSidewayScore;
-
-                //     Directional damping: heavily damp α when D(t) < 0, with a small floor
                 double dirDamp = Math.max(0.05, agreement);
 
                 double alpha_v2 = alphaBase * noiseDamp * crisisDamp * sidewayDamp * dirDamp;
                 alpha_v2 = Math.max(0.001, Math.min(0.20, alpha_v2));
 
-                // --- 3) Continuous target — blend support / baseline / resistance --------
-                //     macroSig = +1 → bandLower (trailing support)
-                //     macroSig =  0 → emaPc0   (mean baseline)
-                //     macroSig = -1 → bandUpper (trailing resistance)
                 double wBull = Math.max(0.0,  macroSig);
                 double wBear = Math.max(0.0, -macroSig);
                 double wFlat = 1.0 - Math.abs(macroSig);
@@ -552,7 +560,6 @@ public class HftRegimeDetection {
                               + wFlat * emaPc0
                               + wBear * event.bandUpper;
 
-                //     Enforce a structural offset from price so value2 never collides
                 double minDistance = Math.max(event.vress * 1.5, 1e-6);
                 if (macroSig > 0.0 && target > event.price - minDistance) {
                     target = event.price - minDistance;
@@ -560,14 +567,9 @@ public class HftRegimeDetection {
                     target = event.price + minDistance;
                 }
 
-                // --- 4) Ratchet step with directional inertia ----------------------------
                 double prevV2 = (lastValue2 == 0.0) ? target : lastValue2;
                 double rawStep = alpha_v2 * (target - prevV2);
 
-                //     In a bull alignment, allow upward moves freely, damp downward moves.
-                //     In a bear alignment, allow downward moves freely, damp upward moves.
-                //     When D(t) ≤ 0 (counter-trend or conflict), counterDamp → 1 and the
-                //     "wrong-direction" move is fully damped, producing a flat staircase.
                 double allowedStep;
                 if (macroSig > 0.0) {
                     allowedStep = (rawStep >= 0.0) ? rawStep : rawStep * counterDamp;
@@ -577,32 +579,27 @@ public class HftRegimeDetection {
                     allowedStep = rawStep;
                 }
 
-                // --- 5) Quantum deadband — flat staircase treads under noise / crisis ----
                 double quantumStep = event.vress * 0.5 * (1.0 + emaProbCrisis + emaSidewayScore);
                 if (Math.abs(allowedStep) < quantumStep) {
-                    event.value2 = prevV2;            // tread (flat step)
+                    event.value2 = prevV2;
                     isRatchetFrozen = true;
                 } else {
-                    event.value2 = prevV2 + allowedStep;  // riser (kinematic move)
+                    event.value2 = prevV2 + allowedStep;
                     isRatchetFrozen = false;
                 }
 
-                // --- 6) Structural guard — value2 must not cross the current price -------
                 if (macroSig > 0.0 && event.value2 > event.price - minDistance) {
                     event.value2 = event.price - minDistance;
                 } else if (macroSig < 0.0 && event.value2 < event.price + minDistance) {
                     event.value2 = event.price + minDistance;
                 }
 
-                // Soft regime label — diagnostics / downstream consumers only
                 lastV2Regime  = (macroSig >  0.33) ?  1
                               : (macroSig < -0.33) ? -1
                               :                       0;
                 lastEmaPc0     = emaPc0;
                 lastValue2     = event.value2;
                 lastTrendSlope = emaTrendSlope;
-
-                // =========================================================================
 
                 event.momentumSignal = event.price - event.pc0;
                 double CRISIS_THRESHOLD = 0.40;
@@ -692,6 +689,18 @@ public class HftRegimeDetection {
 
             event.lambda = currentLambda;
             event.isFrozen = currentRegimeShiftAlert || isRatchetFrozen;
+            
+            // 🌟 Assign global SSA Engine values (updated async by ZMQ subscriber) to the current event
+            event.finalSsaSmoothed = ssaSmoothed;
+            event.finalSsaSlope = ssaSlope;
+            event.finalSsaAccel = ssaAccel;
+            event.finalSsaSideway = ssaSideway;
+            event.ssaLFast = ssaLFast;
+            event.ssaLSlow = ssaLSlow;
+            event.ssaBlendWeight = ssaBlendWeight;
+            event.ssaEvrFast = ssaEvrFast;
+            event.ssaEvrSlow = ssaEvrSlow;
+            event.ssaEigenGapOut = ssaEigenGap;
 
             head = (head + 1) % MAX_CAPACITY;
             if (count < MAX_CAPACITY) count++;
@@ -704,9 +713,8 @@ public class HftRegimeDetection {
         private final int batchSizeThreshold = 1000;
         private int currentBatchSize = 0;
 
-        // 🌟 متغیرهای جدید برای فلاش زمانی
         private long lastFlushTime = System.currentTimeMillis();
-        private final long maxFlushDelayMs = 500; // حداکثر تاخیر مجاز (میلی‌ثانیه)
+        private final long maxFlushDelayMs = 500;
 
         public ClickHouseBatchHandler() {
             String host = System.getenv("CLICKHOUSE_HOST");
@@ -722,7 +730,8 @@ public class HftRegimeDetection {
             while (retries > 0) {
                 try {
                     this.connection = DriverManager.getConnection(url, user, password);
-                    String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_trend, lambda, is_frozen, regime, band_upper, band_lower, pc0, evr, vress, eigen_gap, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    // 🌟 Updated SQL Query matching the new 32-column init.sql structure
+                    String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_smoothed, ssa_slope, ssa_accel, ssa_sideway, ssa_l_fast, ssa_l_slow, ssa_blend_weight, ssa_evr_fast, ssa_evr_slow, ssa_eigen_gap, lambda, is_frozen, regime, band_upper, band_lower, pc0, vress, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                     this.statement = connection.prepareStatement(sql);
                     System.out.println("✅ Successfully connected to ClickHouse!");
                     break;
@@ -746,36 +755,45 @@ public class HftRegimeDetection {
                 statement.setLong(2, sequence);
                 statement.setDouble(3, event.price);
                 statement.setDouble(4, event.volume);
-                statement.setDouble(5, event.ssaTrend);
-                statement.setDouble(6, event.lambda);
-                statement.setInt(7, event.isFrozen ? 1 : 0);
-                statement.setInt(8, event.regime);
-                statement.setDouble(9, event.bandUpper);
-                statement.setDouble(10, event.bandLower);
-                statement.setDouble(11, event.pc0);
-                statement.setDouble(12, event.evr);
-                statement.setDouble(13, event.vress);
-                statement.setDouble(14, event.eigenGap);
-                statement.setInt(15, event.hmmRegime);
-                statement.setDouble(16, event.hmmProbTrend);
-                statement.setDouble(17, event.hmmProbCrisis);
-                statement.setDouble(18, event.value2);
-                statement.setDouble(19, event.domCycle);
-                statement.setDouble(20, event.momentumSignal);
-                statement.setDouble(21, event.regimeWeight);
-                statement.setDouble(22, event.gatedMomentum);
-                statement.setDouble(23, event.positionSize);
-                statement.setDouble(24, event.dynamicStopLoss);
-                statement.setInt(25, event.crisisCapActive);
+                
+                // 🌟 New SSA Engine Fields (10 fields)
+                statement.setDouble(5, event.finalSsaSmoothed);
+                statement.setDouble(6, event.finalSsaSlope);
+                statement.setDouble(7, event.finalSsaAccel);
+                statement.setDouble(8, event.finalSsaSideway);
+                statement.setInt(9, event.ssaLFast);
+                statement.setInt(10, event.ssaLSlow);
+                statement.setFloat(11, event.ssaBlendWeight);
+                statement.setFloat(12, event.ssaEvrFast);
+                statement.setFloat(13, event.ssaEvrSlow);
+                statement.setFloat(14, event.ssaEigenGapOut);
+                
+                // 🌟 Remaining Legacy & HMM Fields (18 fields)
+                statement.setDouble(15, event.lambda);
+                statement.setInt(16, event.isFrozen ? 1 : 0);
+                statement.setInt(17, event.regime);
+                statement.setDouble(18, event.bandUpper);
+                statement.setDouble(19, event.bandLower);
+                statement.setDouble(20, event.pc0);
+                statement.setDouble(21, event.vress);
+                statement.setInt(22, event.hmmRegime);
+                statement.setDouble(23, event.hmmProbTrend);
+                statement.setDouble(24, event.hmmProbCrisis);
+                statement.setDouble(25, event.value2);
+                statement.setDouble(26, event.domCycle);
+                statement.setDouble(27, event.momentumSignal);
+                statement.setDouble(28, event.regimeWeight);
+                statement.setDouble(29, event.gatedMomentum);
+                statement.setDouble(30, event.positionSize);
+                statement.setDouble(31, event.dynamicStopLoss);
+                statement.setInt(32, event.crisisCapActive);
 
                 statement.addBatch();
                 currentBatchSize++;
                 
-                // 🌟 بررسی شرط زمانی
                 long currentTime = System.currentTimeMillis();
                 boolean timeLimitReached = (currentTime - lastFlushTime) >= maxFlushDelayMs;
 
-                // 🌟 فلاش کردن اگر ظرفیت پر شده، یا (زمان گذشته باشه و بچ خالی شده باشه)
                 if (currentBatchSize >= batchSizeThreshold || (timeLimitReached && endOfBatch)) {
                     flush();
                 }
@@ -787,14 +805,15 @@ public class HftRegimeDetection {
             try { 
                 statement.executeBatch(); 
                 currentBatchSize = 0; 
-                lastFlushTime = System.currentTimeMillis(); // 🌟 آپدیت زمان پس از فلاش موفق
+                lastFlushTime = System.currentTimeMillis();
             }
             catch (SQLException e) { 
                 currentBatchSize = 0; 
-                lastFlushTime = System.currentTimeMillis(); // 🌟 آپدیت زمان حتی در صورت خطا برای جلوگیری از لوپ بی‌نهایت ارور
+                lastFlushTime = System.currentTimeMillis();
             }
         }
     }
+
     public static class BinanceProducer extends WebSocketClient {
         private final RingBuffer<TickEvent> ringBuffer;
         public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
@@ -937,7 +956,56 @@ public class HftRegimeDetection {
         zmqSgThread.setDaemon(true);
         zmqSgThread.start();
 
-        Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 65536, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new YieldingWaitStrategy());        disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
+        // 🌟 SSA-ENGINE subscriber: reads 68-byte binary frames from the C++ SSA Engine
+        Thread zmqSsaThread = new Thread(() -> {
+            ByteBuffer buf = ByteBuffer.allocateDirect(SSA_FRAME_SIZE);
+            buf.order(ByteOrder.LITTLE_ENDIAN);
+
+            try (ZContext context = new ZContext()) {
+                ZMQ.Socket subscriber = context.createSocket(SocketType.SUB);
+                String ssaHost = System.getenv("SSA_ZMQ_HOST");
+                if (ssaHost == null || ssaHost.trim().isEmpty()) ssaHost = "localhost";
+                String ssaPort = System.getenv("SSA_ZMQ_PORT");
+                if (ssaPort == null || ssaPort.trim().isEmpty()) ssaPort = "5558";
+
+                String address = "tcp://" + ssaHost + ":" + ssaPort;
+                subscriber.connect(address);
+                subscriber.subscribe(new byte[0]);
+
+                System.out.println("[SSA-SUB] SSA Engine Subscriber active on " + address);
+
+                while (!Thread.currentThread().isInterrupted()) {
+                    byte[] raw = subscriber.recv(0);
+                    if (raw == null || raw.length != SSA_FRAME_SIZE) continue;
+
+                    buf.clear();
+                    buf.put(raw);
+                    buf.flip();
+
+                    int magic = buf.getInt();
+                    if (magic != SSA_FRAME_MAGIC) continue;
+
+                    ssaTimestampNs   = buf.getLong();
+                    ssaSmoothed      = buf.getDouble();
+                    ssaSlope         = buf.getDouble();
+                    ssaAccel         = buf.getDouble();
+                    ssaSideway       = buf.getDouble();
+                    ssaLFast         = buf.getInt();
+                    ssaLSlow         = buf.getInt();
+                    ssaBlendWeight   = buf.getFloat();
+                    ssaEvrFast       = buf.getFloat();
+                    ssaEvrSlow       = buf.getFloat();
+                    ssaEigenGap      = buf.getFloat();
+                }
+            } catch (Exception e) {
+                System.err.println("[SSA-SUB] Error: " + e.getMessage());
+            }
+        });
+        zmqSsaThread.setDaemon(true);
+        zmqSsaThread.start();
+
+        Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 65536, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new YieldingWaitStrategy());
+        disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
         RingBuffer<TickEvent> ringBuffer = disruptor.start();
         new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking();
         Thread.currentThread().join();
