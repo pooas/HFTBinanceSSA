@@ -437,7 +437,7 @@ int main() {
             zmq_pub.send(msg, zmq::send_flags::dontwait);
             ++total_published;
 
-            if (total_published % 5 == 0) {
+            if (total_published % 5000 == 0) {
                 std::cout << "[SSA] Published " << total_published
                           << " frames | Buffer=" << price_buffer.size()
                           << " | Regime=" << hmm_sub.regime()
