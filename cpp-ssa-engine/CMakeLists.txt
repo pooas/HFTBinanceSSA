@@ -44,7 +44,7 @@ target_link_libraries(ssa_engine PRIVATE
 )
 
 target_compile_options(ssa_engine PRIVATE
-    -O3 -march=native -ffast-math
+    -O3 -march=native -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -fno-signed-zeros
 )
 
 # ============================================================================
@@ -64,5 +64,5 @@ target_link_libraries(ssa_benchmark PRIVATE
 )
 
 target_compile_options(ssa_benchmark PRIVATE
-    -O3 -march=native -ffast-math
+    -O3 -march=native -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -fno-signed-zeros
 )

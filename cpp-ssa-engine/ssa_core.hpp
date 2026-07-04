@@ -50,18 +50,18 @@ public:
 
     // Shift the window forward by one sample.
     // Precondition: a new price has already been pushed to the buffer.
-    // Returns pointers to the removed (old leftmost) and added (new rightmost) columns.
+    // The buffer's circular indexing shifts automatically with each push,
+    // so offset_ stays fixed. The removed column (old column 0) is at
+    // offset_-1 in post-push indexing; the added column (new last column)
+    // is at offset_+K-1.
     ShiftResult shift() {
-        // Extract the column being removed (old column 0)
-        const int rm_base = offset_;
+        // Removed column: old column 0, now at offset_-1 after buffer shift
+        const int rm_base = offset_ - 1;
         for (int i = 0; i < L_; ++i) {
             col_removed_[i] = (*buf_)[rm_base + i];
         }
 
-        // Advance the offset
-        ++offset_;
-
-        // Extract the new rightmost column (new column K-1)
+        // Added column: new rightmost column at offset_+K-1
         const int add_base = offset_ + K_ - 1;
         for (int i = 0; i < L_; ++i) {
             col_added_[i] = (*buf_)[add_base + i];
@@ -126,7 +126,7 @@ inline void diagonal_average_tail(
             }
             sum += elem;
         }
-        out[m] = sum / static_cast<double>(d_t);
+        out[m] = std::isfinite(sum) ? (sum / static_cast<double>(d_t)) : 0.0;
     }
 }
 

@@ -151,12 +151,17 @@ inline int small_svd(double* M, int n,
     }
     std::memcpy(V_out, V_sorted, n * n * sizeof(double));
 
+    // Relative threshold: discard singular values negligible vs the largest.
+    // Prevents catastrophic amplification in U = M * V * Σ^{-1}.
+    const double sigma_max = sigma_out[0];
+    const double sigma_rel_thresh = std::max(sigma_max * 1e-8, 1e-12);
+
     // Compute U = M * V * Sigma^{-1}
     std::memset(U_out, 0, n * n * sizeof(double));
     int rank = 0;
     for (int k = 0; k < n; ++k) {
-        if (sigma_out[k] < SVD_EPS) {
-            // Remaining columns of U: arbitrary orthonormal completion (not needed for rank < n)
+        if (sigma_out[k] < sigma_rel_thresh) {
+            sigma_out[k] = 0.0;
             break;
         }
         ++rank;
@@ -189,11 +194,22 @@ inline int small_svd(double* M, int n,
 class RecursiveSVD {
 public:
     RecursiveSVD()
-        : L_(0), K_(0), r_(0), update_count_(0), frobenius_sq_(0.0), initialized_(false)
+        : L_(0), K_(0), r_(0), update_count_(0), frobenius_sq_(0.0),
+          initialized_(false), needs_recompute_(false)
     {
         std::memset(U_, 0, sizeof(U_));
         std::memset(V_, 0, sizeof(V_));
         std::memset(sigma_, 0, sizeof(sigma_));
+        std::memset(p_, 0, sizeof(p_));
+        std::memset(q_, 0, sizeof(q_));
+        std::memset(a_hat_, 0, sizeof(a_hat_));
+        std::memset(b_hat_, 0, sizeof(b_hat_));
+        std::memset(M_buf_, 0, sizeof(M_buf_));
+        std::memset(M_U_, 0, sizeof(M_U_));
+        std::memset(M_V_, 0, sizeof(M_V_));
+        std::memset(M_sigma_, 0, sizeof(M_sigma_));
+        std::memset(U_new_col_, 0, sizeof(U_new_col_));
+        std::memset(V_new_col_, 0, sizeof(V_new_col_));
     }
 
     // Cold-start: compute full SVD of the trajectory matrix, extract top-r triplets.
@@ -204,6 +220,7 @@ public:
         r_ = std::min(rank_r, std::min(L_, K_));
         update_count_ = 0;
         initialized_ = true;
+        needs_recompute_ = false;
 
         compute_full_svd(X);
         compute_frobenius_sq(X);
@@ -212,30 +229,36 @@ public:
     // Incremental rank-2 update: remove one column, add one column.
     // ZERO heap allocations. O(Lr + Kr + r^3) per call.
     void update(const double* col_removed, const double* col_added) {
-        // Update Frobenius norm incrementally
         double norm_old_sq = 0.0, norm_new_sq = 0.0;
         for (int i = 0; i < L_; ++i) {
             norm_old_sq += col_removed[i] * col_removed[i];
             norm_new_sq += col_added[i] * col_added[i];
         }
         frobenius_sq_ += norm_new_sq - norm_old_sq;
-        if (frobenius_sq_ < 0.0) frobenius_sq_ = 0.0;
+        frobenius_sq_ = std::max(frobenius_sq_, 0.0);
 
-        // --- Brand update #1: subtract col_removed (downdate) ---
-        // Modeled as rank-1 update: X' = X + a * b^T where a = -col_removed, b = e_0
         brand_update_neg_col(col_removed, 0);
-
-        // --- Shift V rows left by 1 (column 0 was removed, relabel) ---
         shift_V_left();
-
-        // --- Brand update #2: add col_added ---
-        // X'' = X' + a * b^T where a = col_added, b = e_{K-1}
         brand_update_pos_col(col_added, K_ - 1);
 
-        // --- Periodic re-orthogonalization ---
         ++update_count_;
-        if (update_count_ % 100 == 0) {
+
+        // Post-update sigma validation — catch NaN/Inf/negative immediately
+        for (int k = 0; k < r_; ++k) {
+            if (!std::isfinite(sigma_[k]) || sigma_[k] < 0.0) {
+                needs_recompute_ = true;
+                return;
+            }
+        }
+
+        // Re-orthogonalize every 25 updates (prevents drift accumulation)
+        if (update_count_ % 25 == 0) {
             reorthogonalize();
+        }
+
+        // Full recompute every 200 updates to reset all accumulated error
+        if (update_count_ % 200 == 0) {
+            needs_recompute_ = true;
         }
     }
 
@@ -245,6 +268,7 @@ public:
         K_ = X.K();
         r_ = std::min(r_, std::min(L_, K_));
         update_count_ = 0;
+        needs_recompute_ = false;
 
         compute_full_svd(X);
         compute_frobenius_sq(X);
@@ -258,21 +282,22 @@ public:
     int K() const { return K_; }
     int r() const { return r_; }
     bool initialized() const { return initialized_; }
+    bool needs_recompute() const { return needs_recompute_; }
 
-    // Explained Variance Ratio: sum(sigma[0..r-1]^2) / frobenius_sq
     double evr() const {
-        if (frobenius_sq_ < 1e-30) return 1.0;
+        if (frobenius_sq_ < 1e-12) return 1.0;
         double sum_sq = 0.0;
         for (int k = 0; k < r_; ++k) {
             sum_sq += sigma_[k] * sigma_[k];
         }
-        return sum_sq / frobenius_sq_;
+        double result = sum_sq / std::max(frobenius_sq_, 1e-12);
+        return std::min(std::max(result, 0.0), 1.0);
     }
 
-    // Eigen-gap: 1 - sigma[1] / sigma[0]
     double eigen_gap() const {
-        if (r_ < 2 || sigma_[0] < 1e-30) return 1.0;
-        return 1.0 - sigma_[1] / sigma_[0];
+        if (r_ < 2 || sigma_[0] < 1e-12) return 1.0;
+        double ratio = sigma_[1] / std::max(sigma_[0], 1e-12);
+        return std::min(std::max(1.0 - ratio, 0.0), 1.0);
     }
 
 private:
@@ -283,6 +308,7 @@ private:
     int update_count_;
     double frobenius_sq_;
     bool initialized_;
+    bool needs_recompute_;
 
     // --- Singular triplets (column-major) ---
     alignas(64) double U_[SSA_MAX_R * SSA_MAX_L];   // U[i][k] = U_[k*MAX_L + i]
@@ -338,7 +364,7 @@ private:
         rho_a = std::sqrt(rho_a);
 
         // Normalize a_hat (if residual is non-negligible)
-        bool expand_U = (rho_a > 1e-12);
+        bool expand_U = (rho_a > 1e-8);
         if (expand_U) {
             double inv_rho = 1.0 / rho_a;
             for (int i = 0; i < L; ++i) {
@@ -368,7 +394,7 @@ private:
         }
         rho_b = std::sqrt(rho_b);
 
-        bool expand_V = (rho_b > 1e-12);
+        bool expand_V = (rho_b > 1e-8);
         if (expand_V) {
             double inv_rho = 1.0 / rho_b;
             for (int jj = 0; jj < K; ++jj) {
@@ -376,7 +402,6 @@ private:
             }
         }
 
-        // Construct intermediate matrix and apply SVD
         apply_brand_core(rho_a, rho_b, expand_U, expand_V);
     }
 
@@ -416,7 +441,7 @@ private:
         }
         rho_a = std::sqrt(rho_a);
 
-        bool expand_U = (rho_a > 1e-12);
+        bool expand_U = (rho_a > 1e-8);
         if (expand_U) {
             double inv_rho = 1.0 / rho_a;
             for (int i = 0; i < L; ++i) {
@@ -446,7 +471,7 @@ private:
         }
         rho_b = std::sqrt(rho_b);
 
-        bool expand_V = (rho_b > 1e-12);
+        bool expand_V = (rho_b > 1e-8);
         if (expand_V) {
             double inv_rho = 1.0 / rho_b;
             for (int jj = 0; jj < K; ++jj) {
@@ -536,9 +561,9 @@ private:
             std::memcpy(&V_[k * SSA_MAX_K], V_new_col_, K * sizeof(double));
         }
 
-        // --- Update singular values (truncated to rank r) ---
+        // --- Update singular values (truncated to rank r, clamped non-negative) ---
         for (int k = 0; k < r; ++k) {
-            sigma_[k] = M_sigma_[k];
+            sigma_[k] = std::max(M_sigma_[k], 0.0);
         }
     }
 
@@ -584,11 +609,13 @@ private:
                 norm += Uk[i] * Uk[i];
             }
             norm = std::sqrt(norm);
-            if (norm > 1e-14) {
+            if (norm > 1e-10) {
                 double inv_norm = 1.0 / norm;
                 for (int i = 0; i < L; ++i) {
                     Uk[i] *= inv_norm;
                 }
+            } else {
+                std::memset(Uk, 0, L * sizeof(double));
             }
         }
 
@@ -612,11 +639,13 @@ private:
                 norm += Vk[jj] * Vk[jj];
             }
             norm = std::sqrt(norm);
-            if (norm > 1e-14) {
+            if (norm > 1e-10) {
                 double inv_norm = 1.0 / norm;
                 for (int jj = 0; jj < K_; ++jj) {
                     Vk[jj] *= inv_norm;
                 }
+            } else {
+                std::memset(Vk, 0, K_ * sizeof(double));
             }
         }
     }
@@ -681,10 +710,11 @@ private:
         }
 
         // Compute V = X^T U Σ^{-1}
-        // V[j][k] = (1/sigma_k) * sum_i X[i][j] * U[i][k]
-        //         = (1/sigma_k) * sum_i buf[offset+j+i] * U_[k*MAX_L + i]
+        const double sigma_max_full = (r > 0) ? sigma_[0] : 1.0;
+        const double sigma_thresh_full = std::max(sigma_max_full * 1e-8, 1e-12);
         for (int k = 0; k < r; ++k) {
-            if (sigma_[k] < 1e-30) {
+            if (sigma_[k] < sigma_thresh_full) {
+                sigma_[k] = 0.0;
                 std::memset(&V_[k * SSA_MAX_K], 0, K * sizeof(double));
                 continue;
             }

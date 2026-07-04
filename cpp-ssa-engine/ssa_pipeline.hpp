@@ -33,10 +33,11 @@ public:
         if (!buf_) return false;
 
         const int avail = buf_->size();
-        const int N_needed = 2 * L_;  // K >= L for meaningful SSA
+        const int N_needed = 2 * L_;
         if (avail < N_needed) return false;
 
-        const int N = avail;
+        // Cap N below buffer capacity so shift() can read the removed column
+        const int N = std::min(avail, SSA_BUFFER_CAPACITY - 1);
         traj_.init(buf_, L_, N);
         svd_.init(traj_, r_);
         warmed_ = true;
@@ -48,25 +49,33 @@ public:
     bool step(SsaResult& out) {
         if (!warmed_) return false;
 
-        // Shift trajectory matrix (drop oldest column, append newest)
         ShiftResult sr = traj_.shift();
-
-        // Incremental SVD update
         svd_.update(sr.col_removed, sr.col_added);
 
-        // Reconstruct last 5 points via diagonal averaging
+        // Periodic full recompute to reset accumulated SVD drift
+        if (svd_.needs_recompute()) {
+            svd_.recompute(traj_);
+        }
+
         diagonal_average_tail(
             svd_.U(), svd_.V(), svd_.sigma(),
             svd_.L(), svd_.K(), svd_.r(),
             TAIL_LEN, tail_buf_);
 
-        // Finite differences for slope and acceleration
-        // tail_buf_[4] = newest, tail_buf_[0] = oldest of the 5
         out.smoothed = tail_buf_[4];
-        out.slope    = (tail_buf_[4] - tail_buf_[2]) * 0.5;         // central difference
-        out.accel    = tail_buf_[4] - 2.0 * tail_buf_[3] + tail_buf_[2]; // 2nd order backward
+        out.slope    = (tail_buf_[4] - tail_buf_[2]) * 0.5;
+        out.accel    = tail_buf_[4] - 2.0 * tail_buf_[3] + tail_buf_[2];
         out.evr      = svd_.evr();
         out.eigen_gap = svd_.eigen_gap();
+
+        // Final guard: if reconstruction is non-finite or wildly off, use raw price
+        const double raw = buf_->newest();
+        if (!std::isfinite(out.smoothed) ||
+            std::abs(out.smoothed - raw) > 10.0 * std::max(std::abs(raw), 1.0)) {
+            out.smoothed = raw;
+            out.slope    = 0.0;
+            out.accel    = 0.0;
+        }
 
         return true;
     }
@@ -79,14 +88,13 @@ public:
         const int avail = buf_->size();
         const int N_needed = 2 * new_L;
 
-        // Clamp to available data
         if (avail < N_needed) {
             new_L = avail / 2;
-            if (new_L < 15) return; // L_min guard
+            if (new_L < 15) return;
         }
 
         L_ = new_L;
-        const int N = avail;
+        const int N = std::min(avail, SSA_BUFFER_CAPACITY - 1);
         traj_.resize(new_L, N);
         svd_.recompute(traj_);
     }
