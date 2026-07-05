@@ -48,21 +48,15 @@ target_compile_options(ssa_engine PRIVATE
 )
 
 # ============================================================================
-# SSA Benchmark (standalone — no ZMQ, no curl, no network deps)
+# SSA Benchmark — retired in Phase-2
+# ----------------------------------------------------------------------------
+# The Recursive-SVD / SsaPipeline baseline benchmarked by benchmark/bench_main.cpp
+# has been superseded by the new Phase-1/Phase-2 dsp_math / FilterPipeline
+# architecture. The benchmark code is preserved on disk as code archaeology but
+# is no longer built into the consolidated Docker image — saving toolchain time
+# and eliminating CircularPriceBuffer / SsaResult dependencies that have been
+# removed from ssa_types.hpp.
+#
+# To re-enable: re-add the file list above and restore CircularPriceBuffer /
+# SsaResult into ssa_types.hpp (or carve them out into benchmark/legacy.hpp).
 # ============================================================================
-
-add_executable(ssa_benchmark benchmark/bench_main.cpp)
-
-target_include_directories(ssa_benchmark PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark
-)
-
-target_link_libraries(ssa_benchmark PRIVATE
-    pthread
-    m
-)
-
-target_compile_options(ssa_benchmark PRIVATE
-    -O3 -march=native -funsafe-math-optimizations -fno-math-errno -fno-trapping-math -fno-signed-zeros
-)

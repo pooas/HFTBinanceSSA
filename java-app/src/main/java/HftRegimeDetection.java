@@ -93,6 +93,15 @@ public class HftRegimeDetection {
         public double dynamicStopLoss;
         public int crisisCapActive;
 
+        // Phase-3 Sensor-Fusion output — the zero-lag fused trend line.
+        public double zeroLagTrend;
+        // Per-tick snapshots of async ZMQ values, captured in SsaProcessingHandler
+        // at tick ingestion time so the batch-insert path writes a temporally
+        // consistent row (HFT batch-integrity invariant).
+        public double sgSlopeAtTick;
+        public double sgAccelAtTick;
+        public double ssaMacroTrendAtTick;
+
         public double ssaTrendSlope;
         public double sidewayScore;
         public double trendStrength;
@@ -142,12 +151,24 @@ public class HftRegimeDetection {
         private double smoothedDistance = 0.0;
 
         // =========================================================================
-        // 🌟 IDEA E — Macro-Trend Hysteresis Deadband
-        // Band half-width = MACRO_BAND_K × vress (market noise volatility).
-        // Regime flops only on a clean breakout beyond the band; inside the band
-        // the previous regime is held (hysteresis) to kill fee-eating whipsaws.
+        // 🌟 PHASE 3 — Sensor Fusion: zero_lag_trend = macro_trend + K_gain · sg_slope
+        // -------------------------------------------------------------------------
+        // The C++ DSP macro_trend is an UltimateSmoother at dom_cycle × 50 — extremely
+        // smooth but with group delay ~ period/2. We cancel that lag using the
+        // zero-lag kinematic derivative (sgSlope) from the cpp-sg-dsp engine.
+        //
+        // K_gain is gated by the sideway score: in quiet regimes we trust the SG
+        // slope and project further forward; in choppy/sideway energy we damp K
+        // toward zero so noise bursts cannot whipsaw the regime line.
+        //
+        // MACRO_BAND_K scales the deadband half-width against the residual noise
+        // band std (vress). Regime flips only on clean band breakouts — a Schmitt
+        // trigger. Inside the band the previous label is held (hysteresis).
         // =========================================================================
         private static final double MACRO_BAND_K = 1.5;
+        private static final double K_GAIN_BASE = 15.0;
+        private static final double K_GAIN_FLOOR = 0.0;
+        private static final double K_GAIN_CAP = 25.0;
 
         private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
@@ -473,31 +494,61 @@ public class HftRegimeDetection {
                 }
 
                 // =========================================================================
-                // 🌟 IDEA E — Macro-Trend Hysteresis Deadband
+                // 🌟 PHASE 3 — SENSOR FUSION & HYSTERESIS DEADBAND
                 // -------------------------------------------------------------------------
-                // Centre the band on the long-horizon Ehlers macro trend delivered from
-                // the C++ DSP (ssaMacroTrend). Half-width is MACRO_BAND_K × vress so the
-                // channel auto-widens with realised market noise.
+                // (A) Sensor fusion: project the lagging IIR macro_trend forward using
+                //     the zero-lag SG slope (sgSlope) from cpp-sg-dsp on port 5557:
                 //
-                // Regime is a Schmitt trigger: only a clean breakout beyond the band
-                // edge flips it. Inside the deadband the previous label is held
-                // (hysteresis) — the fake-breakout / whipsaw behaviour that was eating
-                // broker fees on tick-level crossings is suppressed.
+                //        zero_lag_trend = ssaMacroTrend + K_gain · sgSlope
+                //
+                //     K_gain is gated by emaSidewayScore: in quiet regimes we trust
+                //     the SG slope and project out to K_GAIN_BASE×(1 − sideway); in
+                //     choppy energy we suppress K_gain aggressively so a noise burst
+                //     cannot pump the regime line around. Hard-capped at K_GAIN_CAP.
+                //
+                // (B) Hysteresis deadband: dynamic channel of half-width
+                //        MACRO_BAND_K · noiseStdDev  (= 1.5 · vress)
+                //     around zero_lag_trend. Regime is a Schmitt trigger — only a
+                //     clean breakout beyond the band edge flips the label; inside
+                //     the band the previous label is held, killing the fee-eating
+                //     whipsaws we used to get from tick-level crossings.
+                //
+                // Defensive fallback chain if the C++ DSP engine hasn't published
+                // yet: ssaMacroTrend → emaPc0 → event.price.
                 // =========================================================================
                 double macroCenter = (ssaMacroTrend != 0.0) ? ssaMacroTrend : emaPc0;
                 if (macroCenter == 0.0) macroCenter = event.price;
 
-                double halfBand = MACRO_BAND_K * noiseStdDev;
-                event.bandUpper = macroCenter + halfBand;
-                event.bandLower = macroCenter - halfBand;
+                // ----- (A) Dynamic K_gain -----
+                double K_gain = K_GAIN_BASE * (1.0 - emaSidewayScore);
+                if (K_gain < K_GAIN_FLOOR) K_gain = K_GAIN_FLOOR;
+                if (K_gain > K_GAIN_CAP)   K_gain = K_GAIN_CAP;
 
-                event.pc0 = emaPc0;
-                event.evr = emaEvr;
-                event.vress = noiseStdDev;
+                // ----- (B) Lag-compensated fused trend -----
+                double zero_lag_trend = macroCenter + K_gain * sgSlope;
+
+                // Sanity: a runaway SG slope could push the fused line far from
+                // the price — clamp it to within 5·vress of the macrocenter to
+                // keep the fused trend anchored during pathological SG bursts.
+                double fusedClip = 5.0 * Math.max(noiseStdDev, 1e-9);
+                if (zero_lag_trend > macroCenter + fusedClip) zero_lag_trend = macroCenter + fusedClip;
+                if (zero_lag_trend < macroCenter - fusedClip) zero_lag_trend = macroCenter - fusedClip;
+                if (!Double.isFinite(zero_lag_trend))         zero_lag_trend = macroCenter;
+
+                event.zeroLagTrend = zero_lag_trend;
+
+                // ----- (C) Hysteresis deadband around the fused trend -----
+                double halfBand = MACRO_BAND_K * noiseStdDev;
+                event.bandUpper = zero_lag_trend + halfBand;
+                event.bandLower = zero_lag_trend - halfBand;
+
+                event.pc0     = emaPc0;
+                event.evr     = emaEvr;
+                event.vress   = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
                 event.ssaTrendSlope = emaTrendSlope;
-                event.sidewayScore = emaSidewayScore;
+                event.sidewayScore  = emaSidewayScore;
 
                 double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
                 event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
@@ -507,10 +558,10 @@ public class HftRegimeDetection {
                 } else if (event.price < event.bandLower) {
                     currentMarketRegime = -1;
                 }
-                // else: |price - macroCenter| ≤ halfBand  → regime holds (hysteresis)
+                // else: inside deadband → regime holds (hysteresis)
 
-                lastLogicalDistanceLine = macroCenter;
-                event.ssaTrend = macroCenter;
+                lastLogicalDistanceLine = zero_lag_trend;
+                event.ssaTrend = zero_lag_trend;
                 event.regime = currentMarketRegime;
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
@@ -683,9 +734,13 @@ public class HftRegimeDetection {
             
             // 🌟 Assign global SSA Engine values (updated async by ZMQ subscriber) to the current event
             event.finalSsaSmoothed = ssaSmoothed;
-            event.finalSsaSlope = ssaSlope;
-            event.finalSsaAccel = ssaAccel;
+            event.finalSsaSlope    = ssaSlope;
+            event.finalSsaAccel    = ssaAccel;
             event.finalSsaMacroTrend = ssaMacroTrend;
+            // Phase-3 per-tick snapshots of async ZMQ streams
+            event.sgSlopeAtTick        = sgSlope;
+            event.sgAccelAtTick        = sgAccel;
+            event.ssaMacroTrendAtTick  = ssaMacroTrend;
             event.ssaLFast = ssaLFast;
             event.ssaLSlow = ssaLSlow;
             event.ssaBlendWeight = ssaBlendWeight;
@@ -747,11 +802,15 @@ public class HftRegimeDetection {
                 statement.setDouble(3, event.price);
                 statement.setDouble(4, event.volume);
                 
-                // 🌟 New SSA Engine Fields (10 fields)
-                statement.setDouble(5, event.finalSsaSmoothed);
-                statement.setDouble(6, event.finalSsaSlope);
-                statement.setDouble(7, event.finalSsaAccel);
-                statement.setDouble(8, event.finalSsaMacroTrend);
+                // 🌟 Phase-3 Sensor-Fusion Fields (mapped to legacy SSA columns for Grafana)
+                //  col 5  ssa_smoothed   ← zero_lag_trend   (the fused trend — main visual line)
+                //  col 6  ssa_slope       ← sgSlope at tick    (zero-lag slope from cpp-sg-dsp)
+                //  col 7  ssa_accel       ← sgAccel at tick    (SG 2nd derivative)
+                //  col 8  ssa_macro_trend ← ssaMacroTrend at tick (raw macro line for debugging)
+                statement.setDouble(5, event.zeroLagTrend);
+                statement.setDouble(6, event.sgSlopeAtTick);
+                statement.setDouble(7, event.sgAccelAtTick);
+                statement.setDouble(8, event.ssaMacroTrendAtTick);
                 statement.setInt(9, event.ssaLFast);
                 statement.setInt(10, event.ssaLSlow);
                 statement.setFloat(11, event.ssaBlendWeight);

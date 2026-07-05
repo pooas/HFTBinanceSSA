@@ -78,7 +78,7 @@
                         },
                         "pluginVersion": "4.18.0",
                         "queryType": "timeseries",
-                        "rawSql": "SELECT \n    timestamp AS time,\n    -- 🌟 Macro trend line (yellow): smooth long-horizon Ehlers trend\n    ssa_macro_trend,\n    -- Deadband channel around the macro trend\n    band_upper,\n    band_lower,\n    -- Price dots coloured by regime (hysteresis label)\n    CASE WHEN regime =  1 THEN price ELSE null END AS price_up,\n    CASE WHEN regime = -1 THEN price ELSE null END AS price_down\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
+                        "rawSql": "SELECT \n    timestamp AS time,\n    -- 🌟 Fused zero-lag trend (yellow): ssaMacroTrend + K_gain·sgSlope\n    ssa_smoothed AS zero_lag_trend,\n    -- Raw Ehlers macro trend for comparison (thin orange)\n    ssa_macro_trend,\n    -- Hysteresis deadband channel\n    band_upper,\n    band_lower,\n    -- Price dots coloured by Schmitt-trigger regime\n    CASE WHEN regime =  1 THEN price ELSE null END AS price_up,\n    CASE WHEN regime = -1 THEN price ELSE null END AS price_down\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
                       },
                       "version": "v0"
                     },
@@ -155,7 +155,7 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "options": "ssa_macro_trend",
+                      "options": "zero_lag_trend",
                       "scope": "series"
                     },
                     "properties": [
@@ -167,6 +167,33 @@
                         "id": "color",
                         "value": {
                           "fixedColor": "semi-dark-yellow",
+                          "mode": "fixed"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "ssa_macro_trend",
+                      "scope": "series"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.lineWidth",
+                        "value": 1
+                      },
+                      {
+                        "id": "custom.lineStyle",
+                        "value": {
+                          "dash": [3, 3],
+                          "type": "dashed"
+                        }
+                      },
+                      {
+                        "id": "color",
+                        "value": {
+                          "fixedColor": "semi-dark-orange",
                           "mode": "fixed"
                         }
                       }
