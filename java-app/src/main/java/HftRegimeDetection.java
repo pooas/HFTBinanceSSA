@@ -49,7 +49,7 @@ public class HftRegimeDetection {
     public static volatile double ssaSmoothed = 0.0;
     public static volatile double ssaSlope = 0.0;
     public static volatile double ssaAccel = 0.0;
-    public static volatile double ssaSideway = 0.0;
+    public static volatile double ssaMacroTrend = 0.0;
     public static volatile int ssaLFast = 0;
     public static volatile int ssaLSlow = 0;
     public static volatile float ssaBlendWeight = 0.0f;
@@ -101,7 +101,7 @@ public class HftRegimeDetection {
         public double finalSsaSmoothed;
         public double finalSsaSlope;
         public double finalSsaAccel;
-        public double finalSsaSideway;
+        public double finalSsaMacroTrend;
         public int ssaLFast;
         public int ssaLSlow;
         public float ssaBlendWeight;
@@ -140,6 +140,14 @@ public class HftRegimeDetection {
         private int currentMarketRegime = 1;
         private double lastLogicalDistanceLine = 0.0;
         private double smoothedDistance = 0.0;
+
+        // =========================================================================
+        // 🌟 IDEA E — Macro-Trend Hysteresis Deadband
+        // Band half-width = MACRO_BAND_K × vress (market noise volatility).
+        // Regime flops only on a clean breakout beyond the band; inside the band
+        // the previous regime is held (hysteresis) to kill fee-eating whipsaws.
+        // =========================================================================
+        private static final double MACRO_BAND_K = 1.5;
 
         private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
@@ -464,22 +472,27 @@ public class HftRegimeDetection {
                     noiseStdDev = Math.abs(residualHistory[0]);
                 }
 
-                double evrFactor = Math.min(emaEvr / 100.0, 1.0);
-                double alpha = 4.0;
-                double beta = 2.0;
+                // =========================================================================
+                // 🌟 IDEA E — Macro-Trend Hysteresis Deadband
+                // -------------------------------------------------------------------------
+                // Centre the band on the long-horizon Ehlers macro trend delivered from
+                // the C++ DSP (ssaMacroTrend). Half-width is MACRO_BAND_K × vress so the
+                // channel auto-widens with realised market noise.
+                //
+                // Regime is a Schmitt trigger: only a clean breakout beyond the band
+                // edge flips it. Inside the deadband the previous label is held
+                // (hysteresis) — the fake-breakout / whipsaw behaviour that was eating
+                // broker fees on tick-level crossings is suppressed.
+                // =========================================================================
+                double macroCenter = (ssaMacroTrend != 0.0) ? ssaMacroTrend : emaPc0;
+                if (macroCenter == 0.0) macroCenter = event.price;
 
-                double sidewayBandWiden = 1.0 + 1.5 * emaSidewayScore;
-                double rawMultiplier = (1.0 + alpha * (1.0 - evrFactor) + beta * emaGapFactor) * sidewayBandWiden;
-                double mMultiplier = Math.max(1.0, Math.min(rawMultiplier, 8.0));
-
-                double rawDistance = noiseStdDev * mMultiplier;
-                if (smoothedDistance == 0.0) smoothedDistance = rawDistance;
-                smoothedDistance = 0.05 * rawDistance + 0.95 * smoothedDistance;
+                double halfBand = MACRO_BAND_K * noiseStdDev;
+                event.bandUpper = macroCenter + halfBand;
+                event.bandLower = macroCenter - halfBand;
 
                 event.pc0 = emaPc0;
                 event.evr = emaEvr;
-                event.bandUpper = emaPc0 + smoothedDistance;
-                event.bandLower = emaPc0 - smoothedDistance;
                 event.vress = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
@@ -489,37 +502,15 @@ public class HftRegimeDetection {
                 double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
                 event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
 
-                double currentLineVal;
-                double slopeThreshold = noiseStdDev * 0.1;
-
-                if (currentMarketRegime == 1) {
-                    double proposedSupport = event.bandLower;
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine < emaPc0) ?
-                                     Math.max(proposedSupport, lastLogicalDistanceLine) : proposedSupport;
-
-                    boolean bandBreach = event.price < currentLineVal;
-                    boolean strongCounterSlope = emaTrendSlope < -slopeThreshold && emaSidewayScore < 0.7;
-
-                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
-                        currentMarketRegime = -1;
-                        currentLineVal = event.bandUpper;
-                    }
-                } else {
-                    double proposedResistance = event.bandUpper;
-                    currentLineVal = (lastLogicalDistanceLine != 0.0 && lastLogicalDistanceLine > emaPc0) ?
-                                     Math.min(proposedResistance, lastLogicalDistanceLine) : proposedResistance;
-
-                    boolean bandBreach = event.price > currentLineVal;
-                    boolean strongCounterSlope = emaTrendSlope > slopeThreshold && emaSidewayScore < 0.7;
-
-                    if (bandBreach && (emaSidewayScore > 0.7 || strongCounterSlope)) {
-                        currentMarketRegime = 1;
-                        currentLineVal = event.bandLower;
-                    }
+                if (event.price > event.bandUpper) {
+                    currentMarketRegime = 1;
+                } else if (event.price < event.bandLower) {
+                    currentMarketRegime = -1;
                 }
+                // else: |price - macroCenter| ≤ halfBand  → regime holds (hysteresis)
 
-                lastLogicalDistanceLine = currentLineVal;
-                event.ssaTrend = currentLineVal;
+                lastLogicalDistanceLine = macroCenter;
+                event.ssaTrend = macroCenter;
                 event.regime = currentMarketRegime;
                 event.hmmRegime = currentHmmRegime;
                 event.hmmProbTrend = emaProbTrend;
@@ -694,7 +685,7 @@ public class HftRegimeDetection {
             event.finalSsaSmoothed = ssaSmoothed;
             event.finalSsaSlope = ssaSlope;
             event.finalSsaAccel = ssaAccel;
-            event.finalSsaSideway = ssaSideway;
+            event.finalSsaMacroTrend = ssaMacroTrend;
             event.ssaLFast = ssaLFast;
             event.ssaLSlow = ssaLSlow;
             event.ssaBlendWeight = ssaBlendWeight;
@@ -731,7 +722,7 @@ public class HftRegimeDetection {
                 try {
                     this.connection = DriverManager.getConnection(url, user, password);
                     // 🌟 Updated SQL Query matching the new 32-column init.sql structure
-                    String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_smoothed, ssa_slope, ssa_accel, ssa_sideway, ssa_l_fast, ssa_l_slow, ssa_blend_weight, ssa_evr_fast, ssa_evr_slow, ssa_eigen_gap, lambda, is_frozen, regime, band_upper, band_lower, pc0, vress, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    String sql = "INSERT INTO hft_market_data (timestamp, sequence, price, volume, ssa_smoothed, ssa_slope, ssa_accel, ssa_macro_trend, ssa_l_fast, ssa_l_slow, ssa_blend_weight, ssa_evr_fast, ssa_evr_slow, ssa_eigen_gap, lambda, is_frozen, regime, band_upper, band_lower, pc0, vress, hmm_regime, hmm_prob_trend, hmm_prob_crisis, value2, dom_cycle, momentum_signal, regime_weight, gated_momentum, position_size, dynamic_stop_loss, crisis_cap_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                     this.statement = connection.prepareStatement(sql);
                     System.out.println("✅ Successfully connected to ClickHouse!");
                     break;
@@ -760,7 +751,7 @@ public class HftRegimeDetection {
                 statement.setDouble(5, event.finalSsaSmoothed);
                 statement.setDouble(6, event.finalSsaSlope);
                 statement.setDouble(7, event.finalSsaAccel);
-                statement.setDouble(8, event.finalSsaSideway);
+                statement.setDouble(8, event.finalSsaMacroTrend);
                 statement.setInt(9, event.ssaLFast);
                 statement.setInt(10, event.ssaLSlow);
                 statement.setFloat(11, event.ssaBlendWeight);
@@ -989,7 +980,7 @@ public class HftRegimeDetection {
                     ssaSmoothed      = buf.getDouble();
                     ssaSlope         = buf.getDouble();
                     ssaAccel         = buf.getDouble();
-                    ssaSideway       = buf.getDouble();
+                    ssaMacroTrend    = buf.getDouble();
                     ssaLFast         = buf.getInt();
                     ssaLSlow         = buf.getInt();
                     ssaBlendWeight   = buf.getFloat();

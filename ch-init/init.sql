@@ -10,7 +10,7 @@ CREATE TABLE default.hft_market_data (
     ssa_smoothed Float64,         -- سیگنال ترکیب‌شده نهایی
     ssa_slope Float64,            -- مشتق اول (شیب)
     ssa_accel Float64,            -- مشتق دوم (شتاب)
-    ssa_sideway Float64,          -- نمره رنج بودن بازار
+    ssa_macro_trend Float64,      -- روند ماکرو (فیلتر Ehlers با period = dom_cycle × 50)
     ssa_l_fast Int32,             -- طول پنجره سریع
     ssa_l_slow Int32,             -- طول پنجره کند
     ssa_blend_weight Float32,     -- وزن ترکیب دو پایپ‌لاین

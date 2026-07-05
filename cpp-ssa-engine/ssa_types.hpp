@@ -21,7 +21,7 @@ struct SsaFrame {
     double   ssa_smoothed;    // [12..19] blended composite signal S(t)
     double   ssa_slope;       // [20..27] blended 1st derivative
     double   ssa_accel;       // [28..35] blended 2nd derivative
-    double   ssa_sideway;     // [36..43] blended sideway score
+    double   ssa_macro_trend; // [36..43] macro Ehlers trend (dom_cycle × MACRO_RATIO)
     int32_t  L_fast;          // [44..47] current fast window length
     int32_t  L_slow;          // [48..51] current slow window length
     float    blend_weight;    // [52..55] w(t) for diagnostics

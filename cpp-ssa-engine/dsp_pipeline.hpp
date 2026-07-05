@@ -71,6 +71,7 @@ private:
 struct PipelineOutput {
     SsaResult fast;
     SsaResult slow;
+    SsaResult macro;
     bool      valid;
 };
 
@@ -98,15 +99,17 @@ struct PipelineOutput {
 
 class DspPipelineController {
 public:
-    static constexpr double FAST_RATIO = 0.5;
-    static constexpr double SLOW_RATIO = 1.0;
-    static constexpr int    MIN_WARMUP = 155;
+    static constexpr double FAST_RATIO  = 0.5;
+    static constexpr double SLOW_RATIO  = 1.0;
+    static constexpr double MACRO_RATIO = 50.0;
+    static constexpr int    MIN_WARMUP  = 155;
 
     DspPipelineController()
         : buf_(nullptr), warmed_(false), bar_count_(0)
     {
         fast_.set_ratio(FAST_RATIO);
         slow_.set_ratio(SLOW_RATIO);
+        macro_.set_ratio(MACRO_RATIO);
     }
 
     void configure(const CircularPriceBuffer* buf) {
@@ -118,15 +121,16 @@ public:
         const int n = buf_->size();
         if (n < MIN_WARMUP) return false;
 
-        SsaResult df, ds;
+        SsaResult df, ds, dm;
         for (int i = 0; i < n; ++i) {
             const double price = (*buf_)[i];  // 0=oldest, n-1=newest
             internal_step(price);
 
             const double dc = mee_.dom_cycle();
             const double sc = mee_.spectral_concentration();
-            fast_.step(price, dc, sc, df);
-            slow_.step(price, dc, sc, ds);
+            fast_.step(price,  dc, sc, df);
+            slow_.step(price,  dc, sc, ds);
+            macro_.step(price, dc, sc, dm);
         }
 
         warmed_ = (bar_count_ >= MIN_WARMUP);
@@ -147,11 +151,13 @@ public:
         const double dc  = mee_.dom_cycle();
         const double sc  = mee_.spectral_concentration();
 
-        fast_.step(price, dc, sc, out.fast);
-        slow_.step(price, dc, sc, out.slow);
+        fast_.step(price,  dc, sc, out.fast);
+        slow_.step(price,  dc, sc, out.slow);
+        macro_.step(price, dc, sc, out.macro);
 
-        sanity_check(out.fast, price);
-        sanity_check(out.slow, price);
+        sanity_check(out.fast,  price);
+        sanity_check(out.slow,  price);
+        sanity_check(out.macro, price);
 
         out.valid = true;
         return out;
@@ -161,12 +167,14 @@ public:
     double dom_cycle()   const { return mee_.dom_cycle(); }
     int    fast_period() const { return static_cast<int>(mee_.dom_cycle() * FAST_RATIO); }
     int    slow_period() const { return static_cast<int>(mee_.dom_cycle() * SLOW_RATIO); }
+    int    macro_period() const { return static_cast<int>(mee_.dom_cycle() * MACRO_RATIO); }
 
 private:
     const CircularPriceBuffer* buf_;
     MEECycleEstimator          mee_;
     DspPipeline                fast_;
     DspPipeline                slow_;
+    DspPipeline                macro_;
     bool                       warmed_;
     int                        bar_count_;
 

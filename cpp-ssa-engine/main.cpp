@@ -328,7 +328,8 @@ int main() {
     if (pipeline.warm_up()) {
         std::cout << "[DSP] Pipeline warmed up. dom_cycle=" << pipeline.dom_cycle()
                   << " fast_period=" << pipeline.fast_period()
-                  << " slow_period=" << pipeline.slow_period() << std::endl;
+                  << " slow_period=" << pipeline.slow_period()
+                  << " macro_period=" << pipeline.macro_period() << std::endl;
     } else {
         std::cout << "[DSP] Insufficient data for warm-up (" << price_buffer.size()
                   << " < " << DspPipelineController::MIN_WARMUP
@@ -368,7 +369,7 @@ int main() {
                 frame.ssa_smoothed = tick.price;
                 frame.ssa_slope    = 0.0;
                 frame.ssa_accel    = 0.0;
-                frame.ssa_sideway  = 0.0;
+                frame.ssa_macro_trend = tick.price;
                 frame.L_fast       = pipeline.fast_period();
                 frame.L_slow       = pipeline.slow_period();
                 frame.blend_weight = 0.5f;
@@ -395,7 +396,7 @@ int main() {
             frame.ssa_smoothed = blended.smoothed;
             frame.ssa_slope    = blended.slope;
             frame.ssa_accel    = blended.accel;
-            frame.ssa_sideway  = blended.sideway;
+            frame.ssa_macro_trend = pout.macro.smoothed;
             frame.L_fast       = pipeline.fast_period();
             frame.L_slow       = pipeline.slow_period();
             frame.blend_weight = blended.blend_weight;
@@ -419,7 +420,9 @@ int main() {
                           << " EVR_s=" << frame.evr_slow
                           << " | Smoothed=" << frame.ssa_smoothed
                           << " Slope=" << frame.ssa_slope
-                          << " | dom_cycle=" << pipeline.dom_cycle() << std::endl;
+                          << " | MacroTrend=" << frame.ssa_macro_trend
+                          << " | dom_cycle=" << pipeline.dom_cycle()
+                          << " macro_period=" << pipeline.macro_period() << std::endl;
             }
         }
     }

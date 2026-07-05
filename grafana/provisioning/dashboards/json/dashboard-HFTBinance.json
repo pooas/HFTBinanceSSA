@@ -78,7 +78,7 @@
                         },
                         "pluginVersion": "4.18.0",
                         "queryType": "timeseries",
-                        "rawSql": "SELECT \n    timestamp AS time,\n    -- خط روند اصلی (زرد)\n    ssa_trend,\n    \n    -- قیمت وقتی بالاتر از ترند است (سبز)\n    CASE WHEN price >= ssa_trend THEN price ELSE null END AS price_up,\n    \n    -- قیمت وقتی پایین‌تر از ترند است (قرمز)\n    CASE WHEN price < ssa_trend THEN price ELSE null END AS price_down\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
+                        "rawSql": "SELECT \n    timestamp AS time,\n    -- 🌟 Macro trend line (yellow): smooth long-horizon Ehlers trend\n    ssa_macro_trend,\n    -- Deadband channel around the macro trend\n    band_upper,\n    band_lower,\n    -- Price dots coloured by regime (hysteresis label)\n    CASE WHEN regime =  1 THEN price ELSE null END AS price_up,\n    CASE WHEN regime = -1 THEN price ELSE null END AS price_down\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
                       },
                       "version": "v0"
                     },
@@ -155,7 +155,27 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "options": "ssa_trend",
+                      "options": "ssa_macro_trend",
+                      "scope": "series"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.lineWidth",
+                        "value": 2
+                      },
+                      {
+                        "id": "color",
+                        "value": {
+                          "fixedColor": "semi-dark-yellow",
+                          "mode": "fixed"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "band_upper",
                       "scope": "series"
                     },
                     "properties": [
@@ -164,9 +184,59 @@
                         "value": 1
                       },
                       {
+                        "id": "custom.lineInterpolation",
+                        "value": "linear"
+                      },
+                      {
+                        "id": "custom.lineStyle",
+                        "value": {
+                          "dash": [4, 4],
+                          "type": "dashed"
+                        }
+                      },
+                      {
+                        "id": "custom.fillOpacity",
+                        "value": 5
+                      },
+                      {
                         "id": "color",
                         "value": {
-                          "fixedColor": "semi-dark-yellow",
+                          "fixedColor": "semi-dark-orange",
+                          "mode": "fixed"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "band_lower",
+                      "scope": "series"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.lineWidth",
+                        "value": 1
+                      },
+                      {
+                        "id": "custom.lineInterpolation",
+                        "value": "linear"
+                      },
+                      {
+                        "id": "custom.lineStyle",
+                        "value": {
+                          "dash": [4, 4],
+                          "type": "dashed"
+                        }
+                      },
+                      {
+                        "id": "custom.fillOpacity",
+                        "value": 5
+                      },
+                      {
+                        "id": "color",
+                        "value": {
+                          "fixedColor": "semi-dark-orange",
                           "mode": "fixed"
                         }
                       }
@@ -397,7 +467,7 @@
                         },
                         "pluginVersion": "4.18.0",
                         "queryType": "table",
-                        "rawSql": "SELECT \n    time,\n    -- سرمایه استراتژی: محاسبه سود مرکب پس از کسر کارمزدهای بایننس\n    1000 * exp(SUM(log(greatest(1 + strat_ret_net, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS strategy_equity,\n    \n    -- سرمایه هولد کردن (بدون کارمزد، فقط برای مقایسه)\n    1000 * exp(SUM(log(greatest(1 + mkt_ret_gross, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS buy_and_hold_equity\nFROM (\n    SELECT \n        time,\n        sequence,\n        mkt_ret_gross,\n        -- کسر کارمزد از سود ناخالص:\n        -- فرمول: بازدهی ناخالص منهای (تعداد تغییر پوزیشن * کارمزد تیکر بایننس 0.0004)\n        (strat_ret_gross - (abs(current_signal - coalesce(prev_signal, 0)) * 0.0004)) AS strat_ret_net\n    FROM (\n        SELECT \n            time,\n            sequence,\n            current_signal,\n            prev_signal,\n            -- بازدهی خالص خودِ بازار در این تیک\n            if(prev_price > 0, (price - prev_price) / prev_price, 0) AS mkt_ret_gross,\n            -- بازدهی ناخالص استراتژی (قبل از کسر کارمزد)\n            if(prev_price > 0, coalesce(prev_signal, 0) * ((price - prev_price) / prev_price), 0) AS strat_ret_gross\n        FROM (\n            SELECT \n                timestamp AS time,\n                sequence,\n                price,\n                -- سیگنال فعلی\n                multiIf(price >= ssa_trend, 1, -1) AS current_signal,\n                -- قیمت و سیگنال در تیک قبلی (Lag)\n                lagInFrame(price) OVER w AS prev_price,\n                lagInFrame(multiIf(price >= ssa_trend, 1, -1)) OVER w AS prev_signal\n            FROM default.hft_market_data\n            WHERE $__timeFilter(timestamp)\n            WINDOW w AS (ORDER BY timestamp ASC, sequence ASC)\n        )\n    )\n)\nORDER BY time ASC, sequence ASC"
+                        "rawSql": "SELECT \n    time,\n    -- Strategy equity: compounded returns net of Binance taker fee (0.04%)\n    1000 * exp(SUM(log(greatest(1 + strat_ret_net, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS strategy_equity,\n    -- Buy & hold benchmark\n    1000 * exp(SUM(log(greatest(1 + mkt_ret_gross, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS buy_and_hold_equity\nFROM (\n    SELECT \n        time,\n        sequence,\n        mkt_ret_gross,\n        -- Net return = gross return - fee per position flip\n        (strat_ret_gross - (abs(current_signal - coalesce(prev_signal, 0)) * 0.0004)) AS strat_ret_net\n    FROM (\n        SELECT \n            time,\n            sequence,\n            current_signal,\n            prev_signal,\n            -- Market's gross return for this tick\n            if(prev_price > 0, (price - prev_price) / prev_price, 0) AS mkt_ret_gross,\n            -- Strategy gross return (before fees)\n            if(prev_price > 0, coalesce(prev_signal, 0) * ((price - prev_price) / prev_price), 0) AS strat_ret_gross\n        FROM (\n            SELECT \n                timestamp AS time,\n                sequence,\n                price,\n                -- Long/Short signal straight from the Java-computed\n                -- Schmitt-trigger regime (1=Bull, -1=Bear,=Held)\n                regime AS current_signal,\n                lagInFrame(price) OVER w AS prev_price,\n                lagInFrame(regime)    OVER w AS prev_signal\n            FROM default.hft_market_data\n            WHERE $__timeFilter(timestamp)\n            WINDOW w AS (ORDER BY timestamp ASC, sequence ASC)\n        )\n    )\n)\nORDER BY time ASC, sequence ASC"
                       },
                       "version": "v0"
                     },
