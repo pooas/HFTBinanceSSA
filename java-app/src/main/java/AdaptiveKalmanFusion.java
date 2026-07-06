@@ -1,97 +1,92 @@
 // ============================================================================
-// AdaptiveKalmanFusion.java  —  1D Adaptive Kalman Filter for Sensor Fusion
+// AdaptiveKalmanFusion.java  —  Regime-Gated Random Walk Kalman Filter v2.0
 // ----------------------------------------------------------------------------
-// State-space formulation:
+// Architecture: zero-velocity random walk with a momentum-volatility gate.
 //
-//   State x        : the true, zero-lag macro trend (the signal we want to track)
-//   Control s_k    : sgSlope  — the zero-lag kinematic derivative from cpp-sg-dsp
+//   State x        : the true, zero-lag macro trend (the signal we track)
 //   Measurement y_k: ssaMacroTrend — the smooth, lagging Ehlers trend from
 //                    cpp-ssa-engine (the long-horizon baseline)
-//   dt             : time delta between ticks (in tick units; 1.0 = 1 tick)
+//   Gate signal g_k: sgSlope — zero-lag SG derivative from cpp-sg-dsp
 //
-// The filter projects the state forward using the zero-lag SG slope, then
-// corrects the projection using the smooth macro baseline. The result is a
-// fused trend estimate that is simultaneously smooth (Kalman-weighted against
-// the macro line) AND low-latency (driven forward by the SG slope).
+// The previous kinematic model  x_pred = x + sgSlope * dt  was toxic for
+// tick data: the derivative of a discrete random walk (bid-ask bounce) is
+// white noise, and feeding it as velocity made the Kalman state vibrate,
+// producing constant false Long/Short crossovers.
 //
-// Adaptive noise tracking (Innovation-based R, posterior-covariance-based Q)
-// lets the filter continuously re-tune to non-stationary crypto microstructure.
+// v2.0 replaces that model with a regime-gated random walk:
 //
-// Three protective guards against Kalman divergence (v1.2.0 → v1.3.0):
-//   (1) Innovation clamp — caps |e| before the R update to stop the
-//       "R-matrix death spiral" where a single SG-slope spike drives
-//       R → ∞ → K → 0 → filter goes blind to the measurement.
-//   (2) Kinematic dt scaling — x += sgSlope * dt   (not x += sgSlope alone)
-//       so the prediction scales correctly with the actual time gap
-//       between ticks (essential for non-uniform tick pacing or gap
-//       recovery after ZMQ dropouts).
-//   (3) Gravity bound — enforces a strict max-distance ceiling between
-//       the posterior state x_{k|k} and the measurement y_k. If the
-//       filter ever drifts beyond this bound (divergence), the state is
-//       clamped back into the measurement's gravity well.
+//   PREDICT (random walk, no velocity):
+//     x_{k|k-1} = x_{k-1|k-1}
+//     P_{k|k-1} = P_{k-1|k-1} + q_k * dt
 //
-// Hot-path contract: step() performs ZERO heap allocations. All state is held
-// in 4 primitive double fields plus k and initialised. NaN/Inf from corrupted
-// ZMQ ticks is absorbed without throwing.
+//   GATE (momentum-volatility threshold, function of measurement noise R):
+//     threshold = GATE_STD_MULT * sqrt(R_k)
+//     gateOpen  = |sgSlope| > threshold  &&  |innovation| > threshold
+//
+//   UPDATE (only when gate is open — dense staircase tracking):
+//     if gateOpen: full Kalman correction with agile noise adaptation
+//     else:        K_k = 0, state frozen, noise estimates held constant
+//
+// The result is an adaptive staircase: perfectly flat during noise chop,
+// then a rapid, dense step toward the macro line only when both momentum
+// and measurement disagreement statistically break out of the noise band.
+//
+// Safety guards retained from v1.3:
+//   (1) Innovation clamp — caps e² before it enters the R adaptation to
+//       prevent a single outlier from inflating R to infinity.
+//   (2) Gravity bound — clamps the posterior state to within a fixed
+//       percentage of the macro measurement to prevent runaway divergence.
+//
+// Hot-path contract: zero heap allocations, primitive doubles only, no
+// exceptions thrown on corrupted ZMQ ticks.
 // ============================================================================
 
 public class AdaptiveKalmanFusion {
 
     // ========================================================================
-    // Static bounds — tuned for crypto tick data at ~20 Hz polling cadence.
+    // Static bounds — HFT discipline: recompile to retune, no runtime drift.
     // ========================================================================
 
-    // --- Measurement noise R (ssaMacroTrend's smoothness / trust) ---
+    // --- Measurement noise R (ssaMacroTrend trust) ---
     private static final double R_MIN   = 1e-6;
     private static final double R_MAX   = 1e-2;
-    private static final double BETA_R  = 0.01;
+    private static final double BETA_R  = 0.01;      // baseline smoothing
 
-    // --- Process noise Q (sgSlope's prediction uncertainty) ---
+    // --- Process noise Q (prediction uncertainty) ---
     private static final double Q_MIN   = 1e-8;
     private static final double Q_MAX   = 1e-4;
-    private static final double BETA_Q  = 0.005;
+    private static final double BETA_Q  = 0.005;     // baseline smoothing
 
     // --- Initial state covariance ---
     private static final double P_INIT  = 1e-4;
 
-    // ========================================================================
-    // v1.3.0 Protective bounds — prevent Kalman divergence during volatility
-    // ========================================================================
-
-    // --- (1) Innovation clamp ---
-    // Caps the absolute innovation error before it is squared for the R
-    // adaptation. Without this cap, a single 5% BTC move (e ≈ $3000,
-    // e² ≈ 9e6) drives R from 0.01 to hundreds of thousands in one tick,
-    // K drops to machine-zero, and the filter permanently ignores the
-    // measurement — the "R-matrix death spiral."
-    //
-    // MAX_INNOVATION = 100.0  →  e²_capped ≤ 10 000 per tick.
-    // For BTC at $60k this represents a ~0.16% single-tick price swing —
-    // well beyond typical tick noise, yet low enough that the EMA(0.01)
-    // will have barely lifted R before the next tick arrives.
+    // --- (1) Innovation clamp (prevents R death spiral) ---
     private static final double MAX_INNOVATION = 100.0;
 
-    // --- (3) Gravity bound ---
-    // The posterior Kalman state x_{k|k} must never drift farther than
-    // GRAVITY_BOUND_PCT × |macro| from the Ehlers macro measurement.
-    // If it does, the state is clamped — the macro line IS the ground truth.
-    //
-    // 2% of $60k = $1200 — several orders of magnitude wider than normal
-    // micro-tick noise, but tight enough to prevent runaway.
-    // GRAVITY_BOUND_ABS = $50 is a safety floor for very-low-price regimes
-    // (e.g. penny stocks, alt-coins, or cold-start where macro ≈ 0).
+    // --- (3) Gravity bound (prevents state runaway) ---
     private static final double GRAVITY_BOUND_PCT = 0.02;
     private static final double GRAVITY_BOUND_ABS = 50.0;
+
+    // --- v2.0 Regime gate constants ---
+    // Gate threshold = GATE_STD_MULT * sqrt(R_k).  2.0 sigma is a conservative
+    // noise band: sgSlope must break two standard deviations of the current
+    // measurement-noise estimate before the filter is allowed to move.
+    private static final double GATE_STD_MULT = 2.0;
+
+    // When the gate opens, noise estimates adapt faster so the filter can
+    // re-tune to the breakout regime within a few ticks (dense tracking).
+    private static final double AGILE_BETA_R  = 0.05;
+    private static final double AGILE_BETA_Q  = 0.02;
 
     // ========================================================================
     // Filter state — all primitive doubles, no boxing, no auto-allocation.
     // ========================================================================
 
-    private double x;          // posterior state x_{k|k} (zero-lag trend estimate)
+    private double x;          // posterior state x_{k|k}
     private double p;          // posterior covariance P_{k|k}
     private double r;          // adaptive measurement noise R_k
     private double q;          // adaptive process noise Q_k
-    private double k;          // last Kalman gain K_k (NaN → never-stepped sentinel)
+    private double k;          // last Kalman gain K_k (NaN = never stepped)
     private boolean initialised;
 
     // ========================================================================
@@ -129,10 +124,12 @@ public class AdaptiveKalmanFusion {
     }
 
     // ========================================================================
-    // step(dt) — v1.3.0 kinematic-scaled hot-path tick update
+    // step(dt) — v2.0 hot-path tick update
     //
-    // Memory contract: zero heap allocations. Every temporary is a primitive
-    // double on the stack frame. No exceptions thrown.
+    // Zero-velocity predict.  sgSlope is NOT added to the state; it is used
+    // purely as the momentum gate signal.  The dt parameter still scales the
+    // process-noise covariance growth so uncertainty grows correctly across
+    // irregular tick spacing or ZMQ dropouts, but no velocity is ever applied.
     // ========================================================================
 
     public void step(double sgSlope, double ssaMacroTrend, double dt) {
@@ -151,98 +148,107 @@ public class AdaptiveKalmanFusion {
             return;
         }
 
-        // Normalise dt: reject NaN/neg/zero, default to 1.0 tick
         final double dt_safe = (dt > 1e-12 && Double.isFinite(dt)) ? dt : 1.0;
 
         // ============================================================
-        // STEP A — PREDICT (Time Update) — kinematic dt scaling
+        // STEP A — PREDICT (Zero-Velocity Random Walk)
         //
-        //   x_{k|k-1} = x_{k-1|k-1} + s_k · dt
-        //   P_{k|k-1} = P_{k-1|k-1} + q_k  · dt
+        //   x_{k|k-1} = x_{k-1|k-1}
+        //   P_{k|k-1} = P_{k-1|k-1} + q_k * dt
         //
-        // p_pred is saved because Step C's Q adaptation requires the
-        // prior covariance P_{k|k-1} to compute K_k²·P_{k|k-1}.
+        // The SG slope is deliberately NOT used here.  Adding the derivative
+        // of a discrete random walk injects white noise directly into the
+        // state and causes high-frequency whipsaw.
         // ============================================================
-        final double x_pred = x + sgSlope * dt_safe;
+        final double x_pred = x;
         final double p_pred = p + q * dt_safe;
 
         // ============================================================
-        // STEP B — UPDATE (Measurement Update)
+        // STEP B — REGIME GATE (Momentum-Volatility Threshold)
         //
-        //   e_k = y_k - x_{k|k-1}             (innovation — raw, for
-        //                                        state correction)
-        //   K_k = P_{k|k-1} / (P_{k|k-1} + r_k)
-        //   x_{k|k} = x_{k|k-1} + K_k · e_k
-        //   P_{k|k} = (1 - K_k) · P_{k|k-1}
+        // threshold_k = GATE_STD_MULT * sqrt(R_k)
+        //
+        // The gate opens only when BOTH the momentum signal and the
+        // measurement disagreement exceed the current noise band.  This
+        // creates the staircase: flat in chop, dense step on breakout.
         // ============================================================
         final double e = ssaMacroTrend - x_pred;
-        final double denom = p_pred + r;
-        final double k_local = (denom > 1e-18) ? (p_pred / denom) : 0.0;
-
-        // Use the raw (unclamped) innovation for the state correction.
-        // K_k naturally downweights large innovations — clamping them
-        // for the correction would defeat the filter's noise rejection.
-        double x_post = x_pred + k_local * e;
-        final double p_post = (1.0 - k_local) * p_pred;
-
-        // ============================================================
-        // STEP C — ADAPT (Online noise variance tracking)
-        //
-        //   R_k = (1-β_r)·R_{k-1} + β_r · (e²_clamped)
-        //   Q_k = (1-β_q)·Q_{k-1} + β_q · (K_k²·P_{k|k-1})
-        // ============================================================
-
-        // ---- (1) Innovation clamp for R adaptation ----
-        // Only the R update uses the clamped innovation. The raw e is
-        // used for the state correction above — that's intentional:
-        // we want the state to track large moves, but we don't want
-        // one outlier to permanently poison the R estimate.
         final double e_abs = Math.abs(e);
-        final double e_capped = Math.min(e_abs, MAX_INNOVATION);
-        final double eSq = e_capped * e_capped;
+        final double slope_abs = Math.abs(sgSlope);
 
-        double r_new = (1.0 - BETA_R) * r + BETA_R * eSq;
-        if (r_new < R_MIN) r_new = R_MIN;
-        else if (r_new > R_MAX) r_new = R_MAX;
+        final double noiseStd = Math.sqrt(Math.max(r, R_MIN));
+        final double gateThreshold = GATE_STD_MULT * noiseStd;
 
-        // ---- Q adaptation (Sage-Husa innovation statistic) ----
-        final double q_innovation = k_local * k_local * p_pred;
-        double q_new = (1.0 - BETA_Q) * q + BETA_Q * q_innovation;
-        if (q_new < Q_MIN) q_new = Q_MIN;
-        else if (q_new > Q_MAX) q_new = Q_MAX;
+        final boolean gateOpen = slope_abs > gateThreshold && e_abs > gateThreshold;
 
         // ============================================================
-        // (3) GRAVITY BOUND — max-distance clamp from measurement
+        // STEP C — UPDATE (Kalman correction only when gate is open)
         //
-        // Enforces that the posterior state never drifts beyond a fixed
-        // percentage of the macro trend. If the SG slope pushed the
-        // prediction far, the Kalman correction should have pulled it
-        // back — but if K was tiny (due to historical R inflation) the
-        // correction may have been too weak. This bound is the
-        // hard-edged safety net.
+        // Gate closed: K = 0, state frozen, R/Q held constant.  P continues
+        // to grow by q*dt so the filter is ready to snap on the next true
+        // breakout.
         //
-        // Applied AFTER the Kalman update so the filter can still
-        // partially track large moves — we clamp only extreme
-        // divergence, not moderate corrections.
+        // Gate open: full correction plus agile R/Q adaptation.
         // ============================================================
+        final double k_local;
+        final double x_post;
+        final double p_post;
+        final double r_new;
+        final double q_new;
+
+        if (gateOpen) {
+            final double denom = p_pred + r;
+            k_local = (denom > 1e-18) ? (p_pred / denom) : 0.0;
+
+            // Raw innovation drives the correction; K downweights it naturally.
+            x_post = x_pred + k_local * e;
+            p_post = (1.0 - k_local) * p_pred;
+
+            // ---- Agile R adaptation with innovation clamp ----
+            final double e_capped = Math.min(e_abs, MAX_INNOVATION);
+            final double eSq = e_capped * e_capped;
+            r_new = (1.0 - AGILE_BETA_R) * r + AGILE_BETA_R * eSq;
+
+            // ---- Agile Q adaptation (Sage-Husa statistic) ----
+            final double q_innovation = k_local * k_local * p_pred;
+            q_new = (1.0 - AGILE_BETA_Q) * q + AGILE_BETA_Q * q_innovation;
+        } else {
+            // Regime chop: freeze the staircase.
+            k_local = 0.0;
+            x_post = x_pred;
+            p_post = p_pred;
+            r_new = r;
+            q_new = q;
+        }
+
+        // ============================================================
+        // (2) GRAVITY BOUND — max-distance clamp from measurement
+        //
+        // Applied to the posterior regardless of gate state.  This is the
+        // last-resort safety net if a long closure left x far behind a
+        // drifting macro line.
+        // ============================================================
+        double x_bounded = x_post;
         if (Double.isFinite(ssaMacroTrend)) {
             final double gravDist = Math.max(
                 GRAVITY_BOUND_PCT * Math.abs(ssaMacroTrend),
                 GRAVITY_BOUND_ABS);
-            if (x_post > ssaMacroTrend + gravDist) {
-                x_post = ssaMacroTrend + gravDist;
-            } else if (x_post < ssaMacroTrend - gravDist) {
-                x_post = ssaMacroTrend - gravDist;
+            if (x_bounded > ssaMacroTrend + gravDist) {
+                x_bounded = ssaMacroTrend + gravDist;
+            } else if (x_bounded < ssaMacroTrend - gravDist) {
+                x_bounded = ssaMacroTrend - gravDist;
             }
         }
 
         // ============================================================
-        // COMMIT state + post-correct safety guards
+        // STEP D — COMMIT state + clamp noise bounds
         //
-        // State is only mutated AFTER every guard has passed — a
-        // mid-step NaN cannot leave the filter half-updated.
+        // All state mutations happen here after every guard has passed.
+        // A mid-step numerical failure leaves the previous state intact.
         // ============================================================
-        if (!Double.isFinite(x_post) || Double.isNaN(k_local) || Double.isInfinite(k_local)) {
+        if (!Double.isFinite(x_bounded) || !Double.isFinite(p_post) ||
+            !Double.isFinite(r_new) || !Double.isFinite(q_new) ||
+            Double.isNaN(k_local) || Double.isInfinite(k_local)) {
             x = ssaMacroTrend;
             p = P_INIT;
             r = R_MAX;
@@ -251,11 +257,19 @@ public class AdaptiveKalmanFusion {
             return;
         }
 
-        x = x_post;
+        x = x_bounded;
         p = p_post;
-        r = r_new;
-        q = q_new;
+        r = clamp(r_new, R_MIN, R_MAX);
+        q = clamp(q_new, Q_MIN, Q_MAX);
         k = k_local;
+    }
+
+    // ========================================================================
+    // Clamp helper — primitive only, JIT-inlined.
+    // ========================================================================
+
+    private static double clamp(double value, double min, double max) {
+        return (value < min) ? min : ((value > max) ? max : value);
     }
 
     // ========================================================================
