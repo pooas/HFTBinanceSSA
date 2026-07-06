@@ -4,20 +4,20 @@
   "metadata": {
     "name": "33a7676e-fdc3-40de-b98a-0c9c63ae6c84",
     "namespace": "default",
-    "uid": "d4b520e6-00ba-4a4e-a0d7-402f3d9ef68f",
-    "resourceVersion": "1782544060777008",
+    "uid": "f4c1dbe0-ef71-4432-94df-19cde2d8e3d9",
+    "resourceVersion": "1783359850686018",
     "generation": 1,
-    "creationTimestamp": "2026-06-27T07:07:40Z",
+    "creationTimestamp": "2026-07-06T17:44:10Z",
     "labels": {
-      "grafana.app/deprecatedInternalID": "3613765727010816"
+      "grafana.app/deprecatedInternalID": "2531837024632832"
     },
     "annotations": {
       "grafana.app/createdBy": "access-policy:service",
       "grafana.app/managedBy": "classic-file-provisioning",
       "grafana.app/managerId": "HFT Dashboards",
-      "grafana.app/sourceChecksum": "985f6a9ce6c0877dfbabd43a9a825ce0",
+      "grafana.app/sourceChecksum": "02810f7cd8edba4fee5299a8e797e9bb",
       "grafana.app/sourcePath": "/etc/grafana/provisioning/dashboards/json/dashboard-HFTBinance.json",
-      "grafana.app/sourceTimestamp": "1782544005000",
+      "grafana.app/sourceTimestamp": "1783359815000",
       "grafana.app/folder": ""
     }
   },
@@ -186,7 +186,10 @@
                       {
                         "id": "custom.lineStyle",
                         "value": {
-                          "dash": [3, 3],
+                          "dash": [
+                            3,
+                            3
+                          ],
                           "type": "dashed"
                         }
                       },
@@ -276,7 +279,7 @@
                     "hidden": false,
                     "query": {
                       "datasource": {
-                        "name": "efpeyyeztxhj4f"
+                        "name": "PDEE91DDB90597936"
                       },
                       "group": "grafana-clickhouse-datasource",
                       "kind": "DataQuery",
@@ -295,7 +298,7 @@
                         },
                         "pluginVersion": "4.18.0",
                         "queryType": "table",
-                        "rawSql": "SELECT \n    timestamp AS time,\n    lambda,\n    is_frozen\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
+                        "rawSql": "SELECT \n    toStartOfInterval(timestamp, toIntervalSecond(1)) AS time,\n    avg(value2) AS decoupled_value2,\n    any(opt_weight) AS signal_state\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nGROUP BY time\nORDER BY time ASC"
                       },
                       "version": "v0"
                     },
@@ -424,7 +427,7 @@
                         },
                         "pluginVersion": "4.18.0",
                         "queryType": "table",
-                        "rawSql": "SELECT \n    time,\n    -- Strategy equity: compounded returns net of Binance taker fee (0.04%)\n    1000 * exp(SUM(log(greatest(1 + strat_ret_net, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS strategy_equity,\n    -- Buy & hold benchmark\n    1000 * exp(SUM(log(greatest(1 + mkt_ret_gross, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS buy_and_hold_equity\nFROM (\n    SELECT \n        time,\n        sequence,\n        mkt_ret_gross,\n        -- Net return = gross return - fee per position flip\n        (strat_ret_gross - (abs(current_signal - coalesce(prev_signal, 0)) * 0.0004)) AS strat_ret_net\n    FROM (\n        SELECT \n            time,\n            sequence,\n            current_signal,\n            prev_signal,\n            -- Market's gross return for this tick\n            if(prev_price > 0, (price - prev_price) / prev_price, 0) AS mkt_ret_gross,\n            -- Strategy gross return (before fees)\n            if(prev_price > 0, coalesce(prev_signal, 0) * ((price - prev_price) / prev_price), 0) AS strat_ret_gross\n        FROM (\n            SELECT \n                timestamp AS time,\n                sequence,\n                price,\n                -- Long/Short signal straight from the Java-computed\n                -- Schmitt-trigger regime (1=Bull, -1=Bear,=Held)\n                regime AS current_signal,\n                lagInFrame(price) OVER w AS prev_price,\n                lagInFrame(regime)    OVER w AS prev_signal\n            FROM default.hft_market_data\n            WHERE $__timeFilter(timestamp)\n            WINDOW w AS (ORDER BY timestamp ASC, sequence ASC)\n        )\n    )\n)\nORDER BY time ASC, sequence ASC"
+                        "rawSql": "SELECT \n    time,\n    -- Strategy equity: compounded returns net of Binance taker fee (0.04%)\n    1000 * exp(SUM(log(greatest(1 + strat_ret_net, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS strategy_equity,\n    -- Buy & hold benchmark\n    1000 * exp(SUM(log(greatest(1 + mkt_ret_gross, 0.00001))) OVER (ORDER BY time ASC, sequence ASC)) AS buy_and_hold_equity\nFROM (\n    SELECT \n        time,\n        sequence,\n        mkt_ret_gross,\n        -- Net return = gross return - fee per position flip\n        (strat_ret_gross - (abs(current_signal - coalesce(prev_signal, 0)) * 0.00002)) AS strat_ret_net\n    FROM (\n        SELECT \n            time,\n            sequence,\n            current_signal,\n            prev_signal,\n            -- Market's gross return for this tick\n            if(prev_price > 0, (price - prev_price) / prev_price, 0) AS mkt_ret_gross,\n            -- Strategy gross return (before fees)\n            if(prev_price > 0, coalesce(prev_signal, 0) * ((price - prev_price) / prev_price), 0) AS strat_ret_gross\n        FROM (\n            SELECT \n                timestamp AS time,\n                sequence,\n                price,\n                -- Long/Short signal straight from the Java-computed\n                -- Schmitt-trigger regime (1=Bull, -1=Bear,=Held)\n                regime AS current_signal,\n                lagInFrame(price) OVER w AS prev_price,\n                lagInFrame(regime)    OVER w AS prev_signal\n            FROM default.hft_market_data\n            WHERE $__timeFilter(timestamp)\n            WINDOW w AS (ORDER BY timestamp ASC, sequence ASC)\n        )\n    )\n)\nORDER BY time ASC, sequence ASC"
                       },
                       "version": "v0"
                     },
@@ -1051,7 +1054,7 @@
                     "steps": [
                       {
                         "color": "green",
-                        "value": null
+                        "value": 0
                       }
                     ]
                   }
@@ -1167,7 +1170,9 @@
                   "multiLane": false
                 },
                 "legend": {
-                  "calcs": ["lastNotNull"],
+                  "calcs": [
+                    "lastNotNull"
+                  ],
                   "displayMode": "list",
                   "placement": "bottom",
                   "showLegend": true
@@ -1219,11 +1224,11 @@
             "spec": {
               "element": {
                 "kind": "ElementReference",
-                "name": "panel-6"
+                "name": "panel-2"
               },
-              "height": 8,
-              "width": 21,
-              "x": 2,
+              "height": 6,
+              "width": 24,
+              "x": 0,
               "y": 8
             }
           },
@@ -1237,7 +1242,20 @@
               "height": 11,
               "width": 24,
               "x": 0,
-              "y": 16
+              "y": 14
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-6"
+              },
+              "height": 8,
+              "width": 21,
+              "x": 2,
+              "y": 25
             }
           },
           {
@@ -1250,20 +1268,7 @@
               "height": 8,
               "width": 24,
               "x": 0,
-              "y": 27
-            }
-          },
-          {
-            "kind": "GridLayoutItem",
-            "spec": {
-              "element": {
-                "kind": "ElementReference",
-"name": "panel-2"
-              },
-              "height": 11,
-              "width": 24,
-              "x": 0,
-              "y": 35
+              "y": 33
             }
           },
           {
@@ -1276,7 +1281,7 @@
               "height": 10,
               "width": 24,
               "x": 0,
-              "y": 46
+              "y": 41
             }
           }
         ]
