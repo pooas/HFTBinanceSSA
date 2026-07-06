@@ -95,6 +95,11 @@ public class HftRegimeDetection {
 
         // Phase-3 Sensor-Fusion output — the zero-lag fused trend line.
         public double zeroLagTrend;
+        // v1.2.0 Kalman diagnostics — written to ClickHouse so Grafana can
+        // visualise the filter's real-time adaptation (K_k, R_k, Q_k).
+        public double kalmanGain;
+        public double kalmanR;
+        public double kalmanQ;
         // Per-tick snapshots of async ZMQ values, captured in SsaProcessingHandler
         // at tick ingestion time so the batch-insert path writes a temporally
         // consistent row (HFT batch-integrity invariant).
@@ -151,24 +156,22 @@ public class HftRegimeDetection {
         private double smoothedDistance = 0.0;
 
         // =========================================================================
-        // 🌟 PHASE 3 — Sensor Fusion: zero_lag_trend = macro_trend + K_gain · sg_slope
+        // 🌟 v1.2.0 — Adaptive Kalman Fusion (1D AKF)
         // -------------------------------------------------------------------------
-        // The C++ DSP macro_trend is an UltimateSmoother at dom_cycle × 50 — extremely
-        // smooth but with group delay ~ period/2. We cancel that lag using the
-        // zero-lag kinematic derivative (sgSlope) from the cpp-sg-dsp engine.
+        // Replaces the v1.1.0 heuristic linear fusion (K_gain · sgSlope) with a
+        // stochastic state-space filter. The Kalman state x is the true zero-lag
+        // macro trend; sgSlope is the control input (predict step); ssaMacroTrend
+        // is the measurement (update step). Sage-Husa adaptive R/Q tracking lets
+        // the filter continuously re-tune to non-stationary crypto microstructure.
         //
-        // K_gain is gated by the sideway score: in quiet regimes we trust the SG
-        // slope and project further forward; in choppy/sideway energy we damp K
-        // toward zero so noise bursts cannot whipsaw the regime line.
-        //
-        // MACRO_BAND_K scales the deadband half-width against the residual noise
-        // band std (vress). Regime flips only on clean band breakouts — a Schmitt
-        // trigger. Inside the band the previous label is held (hysteresis).
+        // The regime is then a pure crossover against the Kalman-smoothed state:
+        //   price > x  →  +1 (Long)
+        //   price < x  →  -1 (Short)
+        //   price == x →  hold (numerically rare; preserves previous label)
+        // No hysteresis deadband — the Kalman state is already stochastically
+        // smooth, so deadbands would only add lag without reducing whipsaws.
         // =========================================================================
-        private static final double MACRO_BAND_K = 1.5;
-        private static final double K_GAIN_BASE = 15.0;
-        private static final double K_GAIN_FLOOR = 0.0;
-        private static final double K_GAIN_CAP = 25.0;
+        private final AdaptiveKalmanFusion kalmanFusion = new AdaptiveKalmanFusion();
 
         private double emaPc0 = 0.0;
         private double emaEvr = 0.0;
@@ -494,57 +497,65 @@ public class HftRegimeDetection {
                 }
 
                 // =========================================================================
-                // 🌟 PHASE 3 — SENSOR FUSION & HYSTERESIS DEADBAND
+                // 🌟 v1.2.0 — ADAPTIVE KALMAN FUSION & BINARY CROSSOVER REGIME
                 // -------------------------------------------------------------------------
-                // (A) Sensor fusion: project the lagging IIR macro_trend forward using
-                //     the zero-lag SG slope (sgSlope) from cpp-sg-dsp on port 5557:
+                // (A) Initialise the filter on the first tick (or after a ZMQ drop).
+                //     We seed the Kalman state with the current price — the safest
+                //     a priori estimate before any macro trend has arrived.
                 //
-                //        zero_lag_trend = ssaMacroTrend + K_gain · sgSlope
+                // (B) Step the filter: predict via sgSlope, update via ssaMacroTrend.
+                //     The filter internally guards against NaN/Inf from corrupted
+                //     ZMQ frames and snaps back to the macro baseline if needed.
                 //
-                //     K_gain is gated by emaSidewayScore: in quiet regimes we trust
-                //     the SG slope and project out to K_GAIN_BASE×(1 − sideway); in
-                //     choppy energy we suppress K_gain aggressively so a noise burst
-                //     cannot pump the regime line around. Hard-capped at K_GAIN_CAP.
+                // (C) Binary regime: pure crossover against the Kalman state.
+                //       price > zero_lag_trend  →  +1 (Long)
+                //       price < zero_lag_trend  →  -1 (Short)
+                //       price == zero_lag_trend →  hold previous (numerically rare)
+                //     No hysteresis deadband — the Kalman state is stochastically
+                //     smooth, so bands would only re-introduce lag.
                 //
-                // (B) Hysteresis deadband: dynamic channel of half-width
-                //        MACRO_BAND_K · noiseStdDev  (= 1.5 · vress)
-                //     around zero_lag_trend. Regime is a Schmitt trigger — only a
-                //     clean breakout beyond the band edge flips the label; inside
-                //     the band the previous label is held, killing the fee-eating
-                //     whipsaws we used to get from tick-level crossings.
-                //
-                // Defensive fallback chain if the C++ DSP engine hasn't published
-                // yet: ssaMacroTrend → emaPc0 → event.price.
+                // (D) Stash Kalman diagnostics (K_k, R_k, Q_k) into the event so
+                //     the Phase-3 ClickHouse batch can persist them for Grafana.
                 // =========================================================================
-                double macroCenter = (ssaMacroTrend != 0.0) ? ssaMacroTrend : emaPc0;
-                if (macroCenter == 0.0) macroCenter = event.price;
 
-                // ----- (A) Dynamic K_gain -----
-                double K_gain = K_GAIN_BASE * (1.0 - emaSidewayScore);
-                if (K_gain < K_GAIN_FLOOR) K_gain = K_GAIN_FLOOR;
-                if (K_gain > K_GAIN_CAP)   K_gain = K_GAIN_CAP;
+                // ----- (A) Lazy initialisation -----
+                if (!kalmanFusion.isInitialised()) {
+                    kalmanFusion.reset(event.price);
+                }
 
-                // ----- (B) Lag-compensated fused trend -----
-                double zero_lag_trend = macroCenter + K_gain * sgSlope;
+                // ----- (B) Kalman predict + update + adapt -----
+                kalmanFusion.step(sgSlope, ssaMacroTrend);
+                double zero_lag_trend = kalmanFusion.getZeroLagTrend();
 
-                // Sanity: a runaway SG slope could push the fused line far from
-                // the price — clamp it to within 5·vress of the macrocenter to
-                // keep the fused trend anchored during pathological SG bursts.
-                double fusedClip = 5.0 * Math.max(noiseStdDev, 1e-9);
-                if (zero_lag_trend > macroCenter + fusedClip) zero_lag_trend = macroCenter + fusedClip;
-                if (zero_lag_trend < macroCenter - fusedClip) zero_lag_trend = macroCenter - fusedClip;
-                if (!Double.isFinite(zero_lag_trend))         zero_lag_trend = macroCenter;
+                // Defensive: if the filter has not yet produced a usable state
+                // (e.g. first tick after reset with no ZMQ data yet), fall back
+                // to emaPc0 then to price so downstream ratchet doesn't choke.
+                if (!Double.isFinite(zero_lag_trend)) {
+                    zero_lag_trend = (emaPc0 != 0.0) ? emaPc0 : event.price;
+                }
 
-                event.zeroLagTrend = zero_lag_trend;
+                event.zeroLagTrend  = zero_lag_trend;
+                event.kalmanGain     = kalmanFusion.getKalmanGain();
+                event.kalmanR        = kalmanFusion.getR();
+                event.kalmanQ        = kalmanFusion.getQ();
 
-                // ----- (C) Hysteresis deadband around the fused trend -----
-                double halfBand = MACRO_BAND_K * noiseStdDev;
-                event.bandUpper = zero_lag_trend + halfBand;
-                event.bandLower = zero_lag_trend - halfBand;
+                // ----- (C) Binary crossover regime -----
+                if (event.price > zero_lag_trend) {
+                    currentMarketRegime = 1;
+                } else if (event.price < zero_lag_trend) {
+                    currentMarketRegime = -1;
+                }
+                // else: price == zero_lag_trend (numerically rare) → hold previous.
 
-                event.pc0     = emaPc0;
-                event.evr     = emaEvr;
-                event.vress   = noiseStdDev;
+                // Legacy band fields — repurposed as a ±vress visual envelope
+                // around the Kalman trend for Grafana continuity. No longer
+                // used by the regime logic; the Kalman state is the sole authority.
+                event.bandUpper = zero_lag_trend + noiseStdDev;
+                event.bandLower = zero_lag_trend - noiseStdDev;
+
+                event.pc0      = emaPc0;
+                event.evr      = emaEvr;
+                event.vress    = noiseStdDev;
                 event.eigenGap = emaGapFactor;
 
                 event.ssaTrendSlope = emaTrendSlope;
@@ -552,13 +563,6 @@ public class HftRegimeDetection {
 
                 double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
                 event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
-
-                if (event.price > event.bandUpper) {
-                    currentMarketRegime = 1;
-                } else if (event.price < event.bandLower) {
-                    currentMarketRegime = -1;
-                }
-                // else: inside deadband → regime holds (hysteresis)
 
                 lastLogicalDistanceLine = zero_lag_trend;
                 event.ssaTrend = zero_lag_trend;
@@ -802,21 +806,30 @@ public class HftRegimeDetection {
                 statement.setDouble(3, event.price);
                 statement.setDouble(4, event.volume);
                 
-                // 🌟 Phase-3 Sensor-Fusion Fields (mapped to legacy SSA columns for Grafana)
-                //  col 5  ssa_smoothed   ← zero_lag_trend   (the fused trend — main visual line)
-                //  col 6  ssa_slope       ← sgSlope at tick    (zero-lag slope from cpp-sg-dsp)
-                //  col 7  ssa_accel       ← sgAccel at tick    (SG 2nd derivative)
-                //  col 8  ssa_macro_trend ← ssaMacroTrend at tick (raw macro line for debugging)
+                // 🌟 v1.2.0 Adaptive Kalman Fusion — ClickHouse column mapping
+                // Legacy schema columns are repurposed (no schema migration needed):
+                //
+                //  col 5  ssa_smoothed    ← zero_lag_trend       (Kalman state x_{k|k})
+                //  col 6  ssa_slope         ← sgSlope at tick       (SG zero-lag slope)
+                //  col 7  ssa_accel         ← sgAccel at tick       (SG 2nd derivative)
+                //  col 8  ssa_macro_trend  ← ssaMacroTrend at tick  (raw Ehlers baseline)
+                //  col 11 ssa_blend_weight ← kalmanGain            (K_k ∈ [0,1])
+                //  col 12 ssa_evr_fast       ← kalmanR               (adaptive measurement noise R_k)
+                //  col 14 ssa_eigen_gap     ← kalmanQ               (adaptive process noise Q_k)
+                //
+                // Float32 columns (11, 12, 14) silently downcast Java double → float
+                // in the JDBC driver. All Kalman bounds (R ∈ [1e-6, 1e-2],
+                // Q ∈ [1e-8, 1e-4], K ∈ [0, 1]) fit well within Float32 precision.
                 statement.setDouble(5, event.zeroLagTrend);
                 statement.setDouble(6, event.sgSlopeAtTick);
                 statement.setDouble(7, event.sgAccelAtTick);
                 statement.setDouble(8, event.ssaMacroTrendAtTick);
-                statement.setInt(9, event.ssaLFast);
-                statement.setInt(10, event.ssaLSlow);
-                statement.setFloat(11, event.ssaBlendWeight);
-                statement.setFloat(12, event.ssaEvrFast);
-                statement.setFloat(13, event.ssaEvrSlow);
-                statement.setFloat(14, event.ssaEigenGapOut);
+                statement.setInt(9,    event.ssaLFast);
+                statement.setInt(10,   event.ssaLSlow);
+                statement.setDouble(11, event.kalmanGain);   // was ssaBlendWeight (Float32)
+                statement.setDouble(12, event.kalmanR);      // was ssaEvrFast      (Float32)
+                statement.setFloat(13,  event.ssaEvrSlow);   // untouched diagnostic
+                statement.setDouble(14, event.kalmanQ);      // was ssaEigenGapOut   (Float32)
                 
                 // 🌟 Remaining Legacy & HMM Fields (18 fields)
                 statement.setDouble(15, event.lambda);

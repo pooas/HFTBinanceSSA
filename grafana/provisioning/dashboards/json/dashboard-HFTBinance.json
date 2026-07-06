@@ -78,7 +78,7 @@
                         },
                         "pluginVersion": "4.18.0",
                         "queryType": "timeseries",
-                        "rawSql": "SELECT \n    timestamp AS time,\n    -- 🌟 Fused zero-lag trend (yellow): ssaMacroTrend + K_gain·sgSlope\n    ssa_smoothed AS zero_lag_trend,\n    -- Raw Ehlers macro trend for comparison (thin orange)\n    ssa_macro_trend,\n    -- Hysteresis deadband channel\n    band_upper,\n    band_lower,\n    -- Price dots coloured by Schmitt-trigger regime\n    CASE WHEN regime =  1 THEN price ELSE null END AS price_up,\n    CASE WHEN regime = -1 THEN price ELSE null END AS price_down\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
+                        "rawSql": "SELECT \n    timestamp AS time,\n    -- 🌟 v1.2.0 Kalman trend (bold yellow): the fused zero-lag state x_{k|k}\n    ssa_smoothed AS zero_lag_trend,\n    -- Raw Ehlers macro baseline (thin dashed orange): the lagging measurement y_k\n    ssa_macro_trend AS macro_baseline,\n    -- Price dots, strictly coloured by binary regime (+1 Long / -1 Short)\n    CASE WHEN regime =  1 THEN price ELSE null END AS price_long,\n    CASE WHEN regime = -1 THEN price ELSE null END AS price_short\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
                       },
                       "version": "v0"
                     },
@@ -175,7 +175,7 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "options": "ssa_macro_trend",
+                      "options": "macro_baseline",
                       "scope": "series"
                     },
                     "properties": [
@@ -202,77 +202,7 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "options": "band_upper",
-                      "scope": "series"
-                    },
-                    "properties": [
-                      {
-                        "id": "custom.lineWidth",
-                        "value": 1
-                      },
-                      {
-                        "id": "custom.lineInterpolation",
-                        "value": "linear"
-                      },
-                      {
-                        "id": "custom.lineStyle",
-                        "value": {
-                          "dash": [4, 4],
-                          "type": "dashed"
-                        }
-                      },
-                      {
-                        "id": "custom.fillOpacity",
-                        "value": 5
-                      },
-                      {
-                        "id": "color",
-                        "value": {
-                          "fixedColor": "semi-dark-orange",
-                          "mode": "fixed"
-                        }
-                      }
-                    ]
-                  },
-                  {
-                    "matcher": {
-                      "id": "byName",
-                      "options": "band_lower",
-                      "scope": "series"
-                    },
-                    "properties": [
-                      {
-                        "id": "custom.lineWidth",
-                        "value": 1
-                      },
-                      {
-                        "id": "custom.lineInterpolation",
-                        "value": "linear"
-                      },
-                      {
-                        "id": "custom.lineStyle",
-                        "value": {
-                          "dash": [4, 4],
-                          "type": "dashed"
-                        }
-                      },
-                      {
-                        "id": "custom.fillOpacity",
-                        "value": 5
-                      },
-                      {
-                        "id": "color",
-                        "value": {
-                          "fixedColor": "semi-dark-orange",
-                          "mode": "fixed"
-                        }
-                      }
-                    ]
-                  },
-                  {
-                    "matcher": {
-                      "id": "byName",
-                      "options": "price_up",
+                      "options": "price_long",
                       "scope": "series"
                     },
                     "properties": [
@@ -292,7 +222,7 @@
                   {
                     "matcher": {
                       "id": "byName",
-                      "options": "price_down",
+                      "options": "price_short",
                       "scope": "series"
                     },
                     "properties": [
@@ -1024,6 +954,234 @@
             "version": "13.0.2"
           }
         }
+      },
+      "panel-7": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "PDEE91DDB90597936"
+                      },
+                      "group": "grafana-clickhouse-datasource",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorType": "sql",
+                        "format": 0,
+                        "meta": {
+                          "builderOptions": {
+                            "columns": [],
+                            "database": "",
+                            "limit": 1000,
+                            "mode": "list",
+                            "queryType": "table",
+                            "table": ""
+                          }
+                        },
+                        "pluginVersion": "4.18.0",
+                        "queryType": "timeseries",
+                        "rawSql": "SELECT \n    timestamp AS time,\n    -- 🌟 v1.2.0 Kalman Gain K_k ∈ [0,1] (left Y-axis, blue)\n    ssa_blend_weight AS kalman_gain,\n    -- Adaptive measurement noise R_k (right Y-axis, log scale, red)\n    ssa_evr_fast AS kalman_r,\n    -- Adaptive process noise Q_k (right Y-axis, log scale, purple)\n    ssa_eigen_gap AS kalman_q\n\nFROM default.hft_market_data\nWHERE $__timeFilter(timestamp)\nORDER BY time ASC, sequence ASC"
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "v1.2.0 Kalman filter internal state — Kalman gain K_k (left axis) and adaptive noise estimates R_k, Q_k (right axis, log-scaled)",
+          "id": 7,
+          "links": [],
+          "title": "Kalman Brain (K_k, R_k, Q_k)",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "barWidthFactor": 0.6,
+                    "drawStyle": "line",
+                    "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "smooth",
+                    "lineWidth": 1,
+                    "pointSize": 5,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "never",
+                    "showValues": false,
+                    "spanNulls": false,
+                    "stacking": {
+                      "group": "A",
+                      "mode": "none"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  }
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "kalman_gain",
+                      "scope": "series"
+                    },
+                    "properties": [
+                      {
+                        "id": "color",
+                        "value": {
+                          "fixedColor": "dark-blue",
+                          "mode": "fixed"
+                        }
+                      },
+                      {
+                        "id": "custom.lineWidth",
+                        "value": 2
+                      },
+                      {
+                        "id": "custom.axisPlacement",
+                        "value": "left"
+                      },
+                      {
+                        "id": "custom.axisLabel",
+                        "value": "K_k (gain)"
+                      },
+                      {
+                        "id": "custom.scaleDistribution",
+                        "value": {
+                          "type": "linear"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "kalman_r",
+                      "scope": "series"
+                    },
+                    "properties": [
+                      {
+                        "id": "color",
+                        "value": {
+                          "fixedColor": "dark-red",
+                          "mode": "fixed"
+                        }
+                      },
+                      {
+                        "id": "custom.lineWidth",
+                        "value": 1
+                      },
+                      {
+                        "id": "custom.axisPlacement",
+                        "value": "right"
+                      },
+                      {
+                        "id": "custom.axisLabel",
+                        "value": "R_k / Q_k (log)"
+                      },
+                      {
+                        "id": "custom.scaleDistribution",
+                        "value": {
+                          "type": "log"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "kalman_q",
+                      "scope": "series"
+                    },
+                    "properties": [
+                      {
+                        "id": "color",
+                        "value": {
+                          "fixedColor": "dark-purple",
+                          "mode": "fixed"
+                        }
+                      },
+                      {
+                        "id": "custom.lineWidth",
+                        "value": 1
+                      },
+                      {
+                        "id": "custom.axisPlacement",
+                        "value": "right"
+                      },
+                      {
+                        "id": "custom.axisLabel",
+                        "value": "R_k / Q_k (log)"
+                      },
+                      {
+                        "id": "custom.scaleDistribution",
+                        "value": {
+                          "type": "log"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              "options": {
+                "annotations": {
+                  "clustering": -1,
+                  "multiLane": false
+                },
+                "legend": {
+                  "calcs": ["lastNotNull"],
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "none"
+                }
+              }
+            },
+            "version": "13.0.2"
+          }
+        }
       }
     },
     "layout": {
@@ -1100,12 +1258,25 @@
             "spec": {
               "element": {
                 "kind": "ElementReference",
-                "name": "panel-2"
+"name": "panel-2"
               },
               "height": 11,
               "width": 24,
               "x": 0,
               "y": 35
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-7"
+              },
+              "height": 10,
+              "width": 24,
+              "x": 0,
+              "y": 46
             }
           }
         ]
