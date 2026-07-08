@@ -279,7 +279,8 @@ int main() {
             frame.evr_slow         = static_cast<float>(r.spectral_conc); // diagnostic
             frame.eigen_gap        = 0.0f;                 // reserved
 
-            zmq::message_t msg(&frame, SSA_FRAME_SIZE);
+            zmq::message_t msg(SSA_FRAME_SIZE);
+            std::memcpy(msg.data(), &frame, SSA_FRAME_SIZE);
             zmq_pub.send(msg, zmq::send_flags::dontwait);
             ++total_published;
 

@@ -1,6 +1,7 @@
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:latest
+    platform: linux/arm64      # <--- این خط باید اضافه شود
     container_name: hft_clickhouse
     ports:
       - "8123:8123" 
@@ -21,6 +22,7 @@ services:
 
   grafana:
     image: grafana/grafana-oss:latest
+    platform: linux/arm64      # <--- این خط باید اضافه شود
     container_name: hft_grafana
     ports:
       - "3000:3000"
@@ -104,8 +106,15 @@ services:
       context: ./python-macro
       dockerfile: Dockerfile
     container_name: hft_python_macro
+    restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
+      - DATA_MODE=${DATA_MODE:-LIVE}
+      - CSV_PATH=${CSV_PATH:-/data/ticks.csv}
+      - BINANCE_REST_URL=${BINANCE_REST_URL:-https://api.binance.com}
+      - BINANCE_KLINE_WS_URL=${BINANCE_KLINE_WS_URL:-wss://stream.binance.com:9443/ws/btcusdt@kline_1m}
+    volumes:
+      - ./tests/data/hft_tick_data_sample.csv:/data/ticks.csv:ro
     ports:
       - "5556:5556"
     networks:
@@ -115,10 +124,13 @@ services:
       context: ./java-app
       dockerfile: Dockerfile
     container_name: hft_java_producer
+    restart: unless-stopped
     environment:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=hft123
+      - DATA_MODE=${DATA_MODE:-LIVE}
+      - BINANCE_AGGTRADE_WS_URL=${BINANCE_AGGTRADE_WS_URL:-wss://stream.binance.com:9443/ws/btcusdt@aggTrade}
       - ZMQ_HOST=cpp-hmm
       - ZMQ_PORT=5555
       - MACRO_ZMQ_HOST=python-macro
@@ -136,6 +148,27 @@ services:
         condition: service_started
       cpp-ssa:
         condition: service_started
+    networks:
+      - hft-net
+
+  # ------------------------------------------------------------------
+  # Replay mock server — started only when --profile replay is used.
+  # Speaks the exact same Binance WS/REST protocols as the live upstream.
+  # ------------------------------------------------------------------
+  replay-mock:
+    build:
+      context: ./replay-mock
+      dockerfile: Dockerfile
+    container_name: hft_replay_mock
+    profiles:
+      - replay
+    volumes:
+      - ./tests/data/hft_tick_data_sample.csv:/data/ticks.csv:ro
+    environment:
+      - CSV_PATH=/data/ticks.csv
+      - MOCK_PORT=8080
+      - REPLAY_SPEED=${REPLAY_SPEED:-0}
+      - REPLAY_LOOP=${REPLAY_LOOP:-false}
     networks:
       - hft-net
 

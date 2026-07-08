@@ -1,4 +1,3 @@
-import com.lmax.disruptor.BusySpinWaitStrategy;
 import com.lmax.disruptor.EventHandler;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
@@ -8,8 +7,6 @@ import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import org.ejml.simple.SimpleMatrix;
-import org.ejml.simple.SimpleSVD;
 import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
@@ -21,6 +18,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.concurrent.TimeUnit;
 import com.lmax.disruptor.YieldingWaitStrategy;
 
 public class HftRegimeDetection {
@@ -128,13 +126,9 @@ public class HftRegimeDetection {
 
         private final QuantDSP.MesaStrategyMEE mesaStrategy = new QuantDSP.MesaStrategyMEE(8.0, 330.0, 150, 5, 3);
 
-        private final int MAX_CAPACITY = 1000;
-        private final double[] priceHistory = new double[MAX_CAPACITY];
-        private int head = 0;
-        private int count = 0;
-
         private final int LLE_WINDOW = 500;
         private final double[] ssaTrendBuffer = new double[LLE_WINDOW];
+        private final double[] lleFlatBuffer = new double[LLE_WINDOW];
         private int ssaHead = 0;
         private boolean ssaBufferFull = false;
 
@@ -153,7 +147,6 @@ public class HftRegimeDetection {
 
         private int currentMarketRegime = 1;
         private double lastLogicalDistanceLine = 0.0;
-        private double smoothedDistance = 0.0;
 
         // =========================================================================
         // 🌟 v1.2.0 — Adaptive Kalman Fusion (1D AKF)
@@ -186,7 +179,6 @@ public class HftRegimeDetection {
 
         private double emaTrendSlope = 0.0;
         private double emaSidewayScore = 0.0;
-        private double lastTrendSlope = 0.0;
 
         // 🌟 Continuous-state tracking for the Kinematic Ratchet
         private int lastV2Regime = 0;          // soft diagnostic label only
@@ -269,70 +261,20 @@ public class HftRegimeDetection {
             }
         }
 
-        private double[] hankelizeRank1(double sigma, double[] u, double[] v, int L, int K) {
-            int N = L + K - 1;
-            double[] series = new double[N];
-            for (int k = 0; k < N; k++) {
-                double sum = 0.0;
-                int cnt = 0;
-                int iMin = Math.max(0, k - K + 1);
-                int iMax = Math.min(L - 1, k);
-                for (int i = iMin; i <= iMax; i++) {
-                    int j = k - i;
-                    if (j >= 0 && j < K) {
-                        sum += sigma * u[i] * v[j];
-                        cnt++;
-                    }
-                }
-                series[k] = (cnt > 0) ? (sum / cnt) : 0.0;
-            }
-            return series;
-        }
-
-        private double computeTrendSlope(double[] series) {
-            int n = series.length;
-            if (n < 2) return 0.0;
-            double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-            for (int i = 0; i < n; i++) {
-                sumX += i;
-                sumY += series[i];
-                sumXY += (double) i * series[i];
-                sumX2 += (double) i * i;
-            }
-            double denom = (double) n * sumX2 - sumX * sumX;
-            if (Math.abs(denom) < 1e-12) return 0.0;
-            return ((double) n * sumXY - sumX * sumY) / denom;
-        }
-
-        private double computeSidewayScore(double[] sigmas, int numSingularValues) {
-            if (numSingularValues < 4) return 0.0;
-            double totalEnergy = 0.0;
-            for (int i = 0; i < numSingularValues; i++) {
-                totalEnergy += sigmas[i] * sigmas[i];
-            }
-            if (totalEnergy < 1e-12) return 1.0;
-
-            double trendEnergy = sigmas[0] * sigmas[0];
-            double oscillatoryEnergy = 0.0;
-            for (int i = 1; i + 1 < numSingularValues; i += 2) {
-                double pairRatio = Math.min(sigmas[i], sigmas[i + 1]) /
-                                   Math.max(sigmas[i], sigmas[i + 1] + 1e-12);
-                if (pairRatio > 0.85) {
-                    oscillatoryEnergy += sigmas[i] * sigmas[i] + sigmas[i + 1] * sigmas[i + 1];
-                }
-            }
-
-            double oscRatio = oscillatoryEnergy / totalEnergy;
-            double trendRatio = trendEnergy / totalEnergy;
-
-            return Math.max(0.0, Math.min(1.0, oscRatio * (1.0 - trendRatio)));
-        }
+        // -------------------------------------------------------------------------
+        // 🌟 v1.3.0 — Java handler is now a pure fusion/execution layer.
+        // -------------------------------------------------------------------------
+        // Heavy SSA/SVD math has been offloaded to cpp-ssa-engine (port 5558) and
+        // cpp-sg-dsp (port 5557).  This handler only consumes the async ZMQ fields
+        // and runs the lightweight Kalman fusion + ratchet that the Java engine
+        // is responsible for.  A small fallback path keeps the first ticks sane
+        // before the C++ engines finish warmup.  This is identical in LIVE and
+        // REPLAY modes because the C++ nodes always publish on the same ports.
+        // -------------------------------------------------------------------------
 
         @Override
         public void onEvent(TickEvent event, long sequence, boolean endOfBatch) {
-            priceHistory[head] = event.price;
             double domCycle = mesaStrategy.updateAndGetCycle(event.price);
-
             event.domCycle = domCycle;
             boolean isRatchetFrozen = false;
 
@@ -345,360 +287,241 @@ public class HftRegimeDetection {
                 emaProbCrisis = 0.05 * currentProbCrisis + 0.95 * emaProbCrisis;
             }
 
-            int L = Math.max(4, (int) Math.round(domCycle / 2.0));
-            int N_ssa = L * 2;
+            // C++ engine readiness: timestamp > 0 and the value is finite.
+            final boolean cppSsaReady = ssaTimestampNs > 0 && Double.isFinite(ssaSmoothed);
+            final boolean cppSgReady  = sgTimestampNs  > 0 && Double.isFinite(sgSlope);
 
-            if (count >= N_ssa - 1) {
-                int K = N_ssa - L + 1;
-                double[] data = new double[N_ssa];
-                for (int i = 0; i < N_ssa; i++) {
-                    data[i] = priceHistory[(head - N_ssa + 1 + i + MAX_CAPACITY) % MAX_CAPACITY];
-                }
-
-                double mean = 0.0;
-                for (int i = 0; i < N_ssa; i++) mean += data[i];
-                mean /= N_ssa;
-
-                double frobeniusSq = 0.0;
-                SimpleMatrix X = new SimpleMatrix(L, K);
-                for (int j = 0; j < K; j++) {
-                    for (int i = 0; i < L; i++) {
-                        double val = data[j + i] - mean;
-                        X.set(i, j, val);
-                        frobeniusSq += val * val;
-                    }
-                }
-
-                double rawPc0, rawEvr, rawGapFactor;
-                double rawTrendSlope = 0.0;
-                double rawSidewayScore = 0.0;
-
-                if (frobeniusSq < 1e-10) {
-                    rawPc0 = mean;
-                    rawEvr = 100.0;
-                    rawGapFactor = 0.0;
-                    rawTrendSlope = 0.0;
-                    rawSidewayScore = 1.0;
-                } else {
-                    SimpleSVD<SimpleMatrix> svd = X.svd();
-                    SimpleMatrix U = svd.getU();
-                    SimpleMatrix V = svd.getV();
-                    SimpleMatrix W = svd.getW();
-
-                    int numSingularValues = Math.min(L, K);
-                    double sigma0 = -1.0;
-                    int maxIndex = 0;
-
-                    double[] sigmas = new double[numSingularValues];
-                    for (int c = 0; c < numSingularValues; c++) {
-                        double s = Math.abs(W.get(c, c));
-                        sigmas[c] = s;
-                        if (s > sigma0) {
-                            sigma0 = s;
-                            maxIndex = c;
-                        }
-                    }
-
-                    double sigma1 = 0.0;
-                    for (int c = 0; c < numSingularValues; c++) {
-                        if (c != maxIndex && sigmas[c] > sigma1) {
-                            sigma1 = sigmas[c];
-                        }
-                    }
-
-                    double[] u0 = new double[L];
-                    double[] v0 = new double[K];
-                    for (int i = 0; i < L; i++) u0[i] = U.get(i, maxIndex);
-                    for (int j = 0; j < K; j++) v0[j] = V.get(j, maxIndex);
-
-                    double[] trendSeries = hankelizeRank1(sigma0, u0, v0, L, K);
-
-                    for (int i = 0; i < trendSeries.length; i++) {
-                        trendSeries[i] += mean;
-                    }
-
-                    rawTrendSlope = computeTrendSlope(trendSeries);
-                    rawPc0 = trendSeries[trendSeries.length - 1];
-                    rawSidewayScore = computeSidewayScore(sigmas, numSingularValues);
-
-                    rawEvr = Math.min((sigma0 * sigma0) / frobeniusSq, 1.0) * 100.0;
-                    double gapRatio = sigma0 / Math.max(sigma1, 1e-9);
-                    rawGapFactor = 1.0 / Math.max(1.0, gapRatio);
-                }
-
-                double alphaMetrics = 0.05;
-                double alphaSlope = 0.1;
-                double alphaSideway = 0.05;
-
-                if (emaTrendSlope == 0.0 && rawTrendSlope != 0.0) {
-                    emaTrendSlope = rawTrendSlope;
-                } else {
-                    double adaptiveSlopeAlpha = alphaSlope * (1.0 - 0.5 * emaSidewayScore);
-                    emaTrendSlope = adaptiveSlopeAlpha * rawTrendSlope + (1.0 - adaptiveSlopeAlpha) * emaTrendSlope;
-                }
-
-                if (emaSidewayScore == 0.0) {
-                    emaSidewayScore = rawSidewayScore;
-                } else {
-                    emaSidewayScore = alphaSideway * rawSidewayScore + (1.0 - alphaSideway) * emaSidewayScore;
-                }
-
-                // Override slope & sideway with SG-DSP zero-lag signals when available
-                if (sgTimestampNs > 0) {
-                    emaTrendSlope = sgSlope;
-                    emaSidewayScore = sgSideway;
-                }
-
-                if (emaPc0 == 0.0) {
-                    emaPc0 = rawPc0;
-                    emaEvr = rawEvr;
-                    emaGapFactor = rawGapFactor;
-                } else {
-                    emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
-                    emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
-
-                    double evrFactor = Math.min(emaEvr / 100.0, 1.0);
-                    double baseAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
-                    double sidewayPenalty = 1.0 - 0.7 * emaSidewayScore;
-                    double adaptiveAlpha = baseAlpha * Math.max(0.3, sidewayPenalty);
-
-                    double rawMicroSlope = rawPc0 - lastEmaPc0;
-                    boolean isMacroBullish = projectedMacroSlope >= 0;
-                    boolean isMicroBullish = rawMicroSlope >= 0;
-
-                    if (projectedMacroSlope != 0.0 && (isMacroBullish == isMicroBullish)) {
-                        adaptiveAlpha = Math.min(1.0, adaptiveAlpha * 2.0);
-                    }
-
-                    emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
-                }
-
-                double currentResidual = event.price - emaPc0;
-                residualHistory[residualHead] = currentResidual;
-                residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
-                if (residualHead == 0) residualFull = true;
-
-                double noiseStdDev = 0.0;
-                int activeResCount = residualFull ? RESIDUAL_WINDOW : residualHead;
-
-                if (activeResCount > 1) {
-                    double resMean = 0;
-                    for (int i = 0; i < activeResCount; i++) resMean += residualHistory[i];
-                    resMean /= activeResCount;
-
-                    double resVar = 0;
-                    for (int i = 0; i < activeResCount; i++) {
-                        double diff = residualHistory[i] - resMean;
-                        resVar += diff * diff;
-                    }
-                    noiseStdDev = Math.sqrt(resVar / (activeResCount - 1));
-                } else if (activeResCount == 1) {
-                    noiseStdDev = Math.abs(residualHistory[0]);
-                }
-
-                // =========================================================================
-                // 🌟 v1.2.0 — ADAPTIVE KALMAN FUSION & BINARY CROSSOVER REGIME
-                // -------------------------------------------------------------------------
-                // (A) Initialise the filter on the first tick (or after a ZMQ drop).
-                //     We seed the Kalman state with the current price — the safest
-                //     a priori estimate before any macro trend has arrived.
-                //
-                // (B) Step the filter: predict via sgSlope, update via ssaMacroTrend.
-                //     The filter internally guards against NaN/Inf from corrupted
-                //     ZMQ frames and snaps back to the macro baseline if needed.
-                //
-                // (C) Binary regime: pure crossover against the Kalman state.
-                //       price > zero_lag_trend  →  +1 (Long)
-                //       price < zero_lag_trend  →  -1 (Short)
-                //       price == zero_lag_trend →  hold previous (numerically rare)
-                //     No hysteresis deadband — the Kalman state is stochastically
-                //     smooth, so bands would only re-introduce lag.
-                //
-                // (D) Stash Kalman diagnostics (K_k, R_k, Q_k) into the event so
-                //     the Phase-3 ClickHouse batch can persist them for Grafana.
-                // =========================================================================
-
-                // ----- (A) Lazy initialisation -----
-                if (!kalmanFusion.isInitialised()) {
-                    kalmanFusion.reset(event.price);
-                }
-
-                // ----- (B) Kalman predict + update + adapt -----
-                kalmanFusion.step(sgSlope, ssaMacroTrend);
-                double zero_lag_trend = kalmanFusion.getZeroLagTrend();
-
-                // Defensive: if the filter has not yet produced a usable state
-                // (e.g. first tick after reset with no ZMQ data yet), fall back
-                // to emaPc0 then to price so downstream ratchet doesn't choke.
-                if (!Double.isFinite(zero_lag_trend)) {
-                    zero_lag_trend = (emaPc0 != 0.0) ? emaPc0 : event.price;
-                }
-
-                event.zeroLagTrend  = zero_lag_trend;
-                event.kalmanGain     = kalmanFusion.getKalmanGain();
-                event.kalmanR        = kalmanFusion.getR();
-                event.kalmanQ        = kalmanFusion.getQ();
-
-                // ----- (C) Binary crossover regime -----
-                if (event.price > zero_lag_trend) {
-                    currentMarketRegime = 1;
-                } else if (event.price < zero_lag_trend) {
-                    currentMarketRegime = -1;
-                }
-                // else: price == zero_lag_trend (numerically rare) → hold previous.
-
-                // Legacy band fields — repurposed as a ±vress visual envelope
-                // around the Kalman trend for Grafana continuity. No longer
-                // used by the regime logic; the Kalman state is the sole authority.
-                event.bandUpper = zero_lag_trend + noiseStdDev;
-                event.bandLower = zero_lag_trend - noiseStdDev;
-
-                event.pc0      = emaPc0;
-                event.evr      = emaEvr;
-                event.vress    = noiseStdDev;
-                event.eigenGap = emaGapFactor;
-
-                event.ssaTrendSlope = emaTrendSlope;
-                event.sidewayScore  = emaSidewayScore;
-
-                double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
-                event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
-
-                lastLogicalDistanceLine = zero_lag_trend;
-                event.ssaTrend = zero_lag_trend;
-                event.regime = currentMarketRegime;
-                event.hmmRegime = currentHmmRegime;
-                event.hmmProbTrend = emaProbTrend;
-                event.hmmProbCrisis = emaProbCrisis;
-
-                // =========================================================================
-                // 🌟 MACRO–MICRO KINEMATIC FUSION — Adaptive Staircase Ratchet (continuous)
-                // =========================================================================
-
-                double slopeScale = Math.max(event.vress * 0.5, 1e-8);
-                double macroSig = Math.tanh(projectedMacroSlope / slopeScale);
-                double microSig = Math.tanh(emaTrendSlope       / slopeScale);
-                double D_raw = macroSig * microSig;
-
-                emaDirCoupling = 0.10 * D_raw + 0.90 * emaDirCoupling;
-                double D = emaDirCoupling;
-                double agreement   = 0.5 * (D + 1.0);
-                double counterDamp = 1.0 - agreement;
-
-                double cycleN    = Math.max(8.0, event.domCycle * 0.5);
-                double alphaBase = 2.0 / (cycleN + 1.0);
-
-                double priceScale = Math.max(Math.abs(event.price) * 1e-4, 1e-9);
-                double noiseRatio = Math.min(1.0, event.vress / priceScale);
-                double noiseDamp  = 1.0 - 0.7 * noiseRatio;
-
-                double crisisDamp = 1.0 - 0.9 * emaProbCrisis;
-                double sidewayDamp = 1.0 - 0.6 * emaSidewayScore;
-                double dirDamp = Math.max(0.05, agreement);
-
-                double alpha_v2 = alphaBase * noiseDamp * crisisDamp * sidewayDamp * dirDamp;
-                alpha_v2 = Math.max(0.001, Math.min(0.20, alpha_v2));
-
-                double wBull = Math.max(0.0,  macroSig);
-                double wBear = Math.max(0.0, -macroSig);
-                double wFlat = 1.0 - Math.abs(macroSig);
-                double target = wBull * event.bandLower
-                              + wFlat * emaPc0
-                              + wBear * event.bandUpper;
-
-                double minDistance = Math.max(event.vress * 1.5, 1e-6);
-                if (macroSig > 0.0 && target > event.price - minDistance) {
-                    target = event.price - minDistance;
-                } else if (macroSig < 0.0 && target < event.price + minDistance) {
-                    target = event.price + minDistance;
-                }
-
-                double prevV2 = (lastValue2 == 0.0) ? target : lastValue2;
-                double rawStep = alpha_v2 * (target - prevV2);
-
-                double allowedStep;
-                if (macroSig > 0.0) {
-                    allowedStep = (rawStep >= 0.0) ? rawStep : rawStep * counterDamp;
-                } else if (macroSig < 0.0) {
-                    allowedStep = (rawStep <= 0.0) ? rawStep : rawStep * counterDamp;
-                } else {
-                    allowedStep = rawStep;
-                }
-
-                double quantumStep = event.vress * 0.5 * (1.0 + emaProbCrisis + emaSidewayScore);
-                if (Math.abs(allowedStep) < quantumStep) {
-                    event.value2 = prevV2;
-                    isRatchetFrozen = true;
-                } else {
-                    event.value2 = prevV2 + allowedStep;
-                    isRatchetFrozen = false;
-                }
-
-                if (macroSig > 0.0 && event.value2 > event.price - minDistance) {
-                    event.value2 = event.price - minDistance;
-                } else if (macroSig < 0.0 && event.value2 < event.price + minDistance) {
-                    event.value2 = event.price + minDistance;
-                }
-
-                lastV2Regime  = (macroSig >  0.33) ?  1
-                              : (macroSig < -0.33) ? -1
-                              :                       0;
-                lastEmaPc0     = emaPc0;
-                lastValue2     = event.value2;
-                lastTrendSlope = emaTrendSlope;
-
-                event.momentumSignal = event.price - event.pc0;
-                double CRISIS_THRESHOLD = 0.40;
-                event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
-
-                double TREND_P_STAR = 0.70 + 0.15 * emaSidewayScore;
-                double weight = 0.0;
-
-                if (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) {
-                    weight = Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR));
-                }
-
-                weight *= event.trendStrength;
-
-                event.regimeWeight = weight;
-                event.gatedMomentum = event.momentumSignal * event.regimeWeight;
-
-                double MAX_POSITION = 1.0;
-                event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
-                event.dynamicStopLoss = event.vress * 3.0;
-
-                if (sequence % 500 == 0) {
-                    System.out.printf("\n[DEBUG] Price: %.2f | Sideway: %.3f | Slope: %+.6f | TrendStr: %.3f | D: %+.3f | α_v2: %.4f | Frozen: %s | Val2: %.2f\n",
-                                      event.price, emaSidewayScore, emaTrendSlope, event.trendStrength,
-                                      D, alpha_v2, isRatchetFrozen ? "Y" : "N", event.value2);
-                }
-
+            // ----- Lightweight raw-signal fallback -----
+            final double rawPc0          = cppSsaReady ? ssaSmoothed : event.price;
+            final double rawTrendSlope   = cppSgReady  ? sgSlope
+                                          : (cppSsaReady ? ssaSlope : 0.0);
+            final double rawSidewayScore;
+            if (cppSgReady) {
+                rawSidewayScore = Math.max(0.0, Math.min(1.0, sgSideway));
+            } else if (cppSsaReady && ssaEvrSlow > 0.0f) {
+                rawSidewayScore = Math.max(0.0, Math.min(1.0, 1.0 - ssaEvrSlow));
             } else {
-                event.pc0 = event.price;
-                event.evr = 0.0;
-                event.bandUpper = event.price;
-                event.bandLower = event.price;
-                event.ssaTrend = event.price;
-                event.regime = currentMarketRegime;
-                event.vress = 0.0;
-                event.eigenGap = 0.0;
-                event.hmmRegime = currentHmmRegime;
-                event.hmmProbTrend = emaProbTrend;
-                event.hmmProbCrisis = emaProbCrisis;
+                rawSidewayScore = 1.0; // safest default before any DSP data arrives
+            }
+            final double rawEvr       = (cppSsaReady && ssaEvrSlow > 0.0f)
+                                        ? ssaEvrSlow * 100.0 : 50.0;
+            final double rawGapFactor = (cppSsaReady && ssaEvrSlow > 0.0f)
+                                        ? Math.max(0.0, Math.min(1.0, ssaEvrSlow)) : 0.5;
 
-                event.momentumSignal = 0.0;
-                event.regimeWeight = 0.0;
-                event.gatedMomentum = 0.0;
-                event.positionSize = 0.0;
-                event.dynamicStopLoss = 0.0;
-                event.crisisCapActive = 0;
+            final double alphaMetrics = 0.05;
+            final double alphaSlope   = 0.10;
+            final double alphaSideway = 0.05;
 
-                event.value2 = event.price;
-                event.ssaTrendSlope = 0.0;
-                event.sidewayScore = 1.0;
-                event.trendStrength = 0.0;
-                lastEmaPc0 = event.price;
-                lastValue2 = event.price;
+            if (emaTrendSlope == 0.0 && rawTrendSlope != 0.0) {
+                emaTrendSlope = rawTrendSlope;
+            } else {
+                double adaptiveSlopeAlpha = alphaSlope * (1.0 - 0.5 * emaSidewayScore);
+                emaTrendSlope = adaptiveSlopeAlpha * rawTrendSlope + (1.0 - adaptiveSlopeAlpha) * emaTrendSlope;
+            }
+
+            if (emaSidewayScore == 0.0) {
+                emaSidewayScore = rawSidewayScore;
+            } else {
+                emaSidewayScore = alphaSideway * rawSidewayScore + (1.0 - alphaSideway) * emaSidewayScore;
+            }
+
+            if (emaPc0 == 0.0) {
+                emaPc0 = rawPc0;
+                emaEvr = rawEvr;
+                emaGapFactor = rawGapFactor;
+            } else {
+                emaEvr = alphaMetrics * rawEvr + (1.0 - alphaMetrics) * emaEvr;
+                emaGapFactor = alphaMetrics * rawGapFactor + (1.0 - alphaMetrics) * emaGapFactor;
+
+                double evrFactor = Math.min(emaEvr / 100.0, 1.0);
+                double baseAlpha = 0.01 + 0.15 * Math.pow(evrFactor, 2);
+                double sidewayPenalty = 1.0 - 0.7 * emaSidewayScore;
+                double adaptiveAlpha = baseAlpha * Math.max(0.3, sidewayPenalty);
+
+                double rawMicroSlope = rawPc0 - lastEmaPc0;
+                boolean isMacroBullish = projectedMacroSlope >= 0;
+                boolean isMicroBullish = rawMicroSlope >= 0;
+
+                if (projectedMacroSlope != 0.0 && (isMacroBullish == isMicroBullish)) {
+                    adaptiveAlpha = Math.min(1.0, adaptiveAlpha * 2.0);
+                }
+
+                emaPc0 = adaptiveAlpha * rawPc0 + (1.0 - adaptiveAlpha) * emaPc0;
+            }
+
+            double currentResidual = event.price - emaPc0;
+            residualHistory[residualHead] = currentResidual;
+            residualHead = (residualHead + 1) % RESIDUAL_WINDOW;
+            if (residualHead == 0) residualFull = true;
+
+            double noiseStdDev = 0.0;
+            int activeResCount = residualFull ? RESIDUAL_WINDOW : residualHead;
+
+            if (activeResCount > 1) {
+                double resMean = 0.0;
+                for (int i = 0; i < activeResCount; i++) resMean += residualHistory[i];
+                resMean /= activeResCount;
+
+                double resVar = 0.0;
+                for (int i = 0; i < activeResCount; i++) {
+                    double diff = residualHistory[i] - resMean;
+                    resVar += diff * diff;
+                }
+                noiseStdDev = Math.sqrt(resVar / (activeResCount - 1));
+            } else if (activeResCount == 1) {
+                noiseStdDev = Math.abs(residualHistory[0]);
+            }
+
+            // =========================================================================
+            // 🌟 v1.2.0 — ADAPTIVE KALMAN FUSION & BINARY CROSSOVER REGIME
+            // -------------------------------------------------------------------------
+            // The Kalman filter fuses the zero-lag SG slope (gate signal) with the
+            // lagging C++ SSA macro-trend (measurement).  All heavy DSP math lives
+            // in the C++ engines; Java only runs the lightweight state update.
+            // =========================================================================
+
+            if (!kalmanFusion.isInitialised()) {
+                kalmanFusion.reset(event.price);
+            }
+
+            kalmanFusion.step(sgSlope, ssaMacroTrend);
+            double zero_lag_trend = kalmanFusion.getZeroLagTrend();
+
+            if (!Double.isFinite(zero_lag_trend)) {
+                zero_lag_trend = (emaPc0 != 0.0) ? emaPc0 : event.price;
+            }
+
+            event.zeroLagTrend = zero_lag_trend;
+            event.kalmanGain   = kalmanFusion.getKalmanGain();
+            event.kalmanR      = kalmanFusion.getR();
+            event.kalmanQ      = kalmanFusion.getQ();
+
+            if (event.price > zero_lag_trend) {
+                currentMarketRegime = 1;
+            } else if (event.price < zero_lag_trend) {
+                currentMarketRegime = -1;
+            }
+
+            event.bandUpper = zero_lag_trend + noiseStdDev;
+            event.bandLower = zero_lag_trend - noiseStdDev;
+
+            event.pc0      = emaPc0;
+            event.evr      = emaEvr;
+            event.vress    = noiseStdDev;
+            event.eigenGap = emaGapFactor;
+
+            event.ssaTrendSlope = emaTrendSlope;
+            event.sidewayScore  = emaSidewayScore;
+
+            double trendPower = (emaEvr / 100.0) * emaGapFactor * emaProbTrend * (1.0 - emaSidewayScore);
+            event.trendStrength = Math.max(0.0, Math.min(1.0, trendPower * 2.0));
+
+            lastLogicalDistanceLine = zero_lag_trend;
+            event.ssaTrend = zero_lag_trend;
+            event.regime = currentMarketRegime;
+            event.hmmRegime = currentHmmRegime;
+            event.hmmProbTrend = emaProbTrend;
+            event.hmmProbCrisis = emaProbCrisis;
+
+            // =========================================================================
+            // 🌟 MACRO–MICRO KINEMATIC FUSION — Adaptive Staircase Ratchet (continuous)
+            // =========================================================================
+
+            double slopeScale = Math.max(event.vress * 0.5, 1e-8);
+            double macroSig = Math.tanh(projectedMacroSlope / slopeScale);
+            double microSig = Math.tanh(emaTrendSlope       / slopeScale);
+            double D_raw = macroSig * microSig;
+
+            emaDirCoupling = 0.10 * D_raw + 0.90 * emaDirCoupling;
+            double D = emaDirCoupling;
+            double agreement   = 0.5 * (D + 1.0);
+            double counterDamp = 1.0 - agreement;
+
+            double cycleN    = Math.max(8.0, event.domCycle * 0.5);
+            double alphaBase = 2.0 / (cycleN + 1.0);
+
+            double priceScale = Math.max(Math.abs(event.price) * 1e-4, 1e-9);
+            double noiseRatio = Math.min(1.0, event.vress / priceScale);
+            double noiseDamp  = 1.0 - 0.7 * noiseRatio;
+
+            double crisisDamp = 1.0 - 0.9 * emaProbCrisis;
+            double sidewayDamp = 1.0 - 0.6 * emaSidewayScore;
+            double dirDamp = Math.max(0.05, agreement);
+
+            double alpha_v2 = alphaBase * noiseDamp * crisisDamp * sidewayDamp * dirDamp;
+            alpha_v2 = Math.max(0.001, Math.min(0.20, alpha_v2));
+
+            double wBull = Math.max(0.0,  macroSig);
+            double wBear = Math.max(0.0, -macroSig);
+            double wFlat = 1.0 - Math.abs(macroSig);
+            double target = wBull * event.bandLower
+                          + wFlat * emaPc0
+                          + wBear * event.bandUpper;
+
+            double minDistance = Math.max(event.vress * 1.5, 1e-6);
+            if (macroSig > 0.0 && target > event.price - minDistance) {
+                target = event.price - minDistance;
+            } else if (macroSig < 0.0 && target < event.price + minDistance) {
+                target = event.price + minDistance;
+            }
+
+            double prevV2 = (lastValue2 == 0.0) ? target : lastValue2;
+            double rawStep = alpha_v2 * (target - prevV2);
+
+            double allowedStep;
+            if (macroSig > 0.0) {
+                allowedStep = (rawStep >= 0.0) ? rawStep : rawStep * counterDamp;
+            } else if (macroSig < 0.0) {
+                allowedStep = (rawStep <= 0.0) ? rawStep : rawStep * counterDamp;
+            } else {
+                allowedStep = rawStep;
+            }
+
+            double quantumStep = event.vress * 0.5 * (1.0 + emaProbCrisis + emaSidewayScore);
+            if (Math.abs(allowedStep) < quantumStep) {
+                event.value2 = prevV2;
+                isRatchetFrozen = true;
+            } else {
+                event.value2 = prevV2 + allowedStep;
+                isRatchetFrozen = false;
+            }
+
+            if (macroSig > 0.0 && event.value2 > event.price - minDistance) {
+                event.value2 = event.price - minDistance;
+            } else if (macroSig < 0.0 && event.value2 < event.price + minDistance) {
+                event.value2 = event.price + minDistance;
+            }
+
+            lastV2Regime  = (macroSig >  0.33) ?  1
+                          : (macroSig < -0.33) ? -1
+                          :                       0;
+            lastEmaPc0     = emaPc0;
+            lastValue2     = event.value2;
+
+            event.momentumSignal = event.price - event.pc0;
+            double CRISIS_THRESHOLD = 0.40;
+            event.crisisCapActive = (emaProbCrisis > CRISIS_THRESHOLD) ? 1 : 0;
+
+            double TREND_P_STAR = 0.70 + 0.15 * emaSidewayScore;
+            double weight = 0.0;
+
+            if (event.crisisCapActive == 0 && emaProbTrend >= TREND_P_STAR) {
+                weight = Math.min(1.0, (emaProbTrend - TREND_P_STAR) / (1.0 - TREND_P_STAR));
+            }
+
+            weight *= event.trendStrength;
+
+            event.regimeWeight = weight;
+            event.gatedMomentum = event.momentumSignal * event.regimeWeight;
+
+            double MAX_POSITION = 1.0;
+            event.positionSize = (event.crisisCapActive == 1) ? 0.0 : (MAX_POSITION * event.regimeWeight);
+            event.dynamicStopLoss = event.vress * 3.0;
+
+            if (sequence % 500 == 0) {
+                System.out.printf("\n[DEBUG] Price: %.2f | Sideway: %.3f | Slope: %+.6f | TrendStr: %.3f | D: %+.3f | α_v2: %.4f | Frozen: %s | Val2: %.2f\n",
+                                  event.price, emaSidewayScore, emaTrendSlope, event.trendStrength,
+                                  D, alpha_v2, isRatchetFrozen ? "Y" : "N", event.value2);
             }
 
             // --- Lyapunov computation ---
@@ -707,17 +530,16 @@ public class HftRegimeDetection {
             if (ssaHead == 0) ssaBufferFull = true;
 
             if (ssaBufferFull) {
-                double[] flatBuffer = new double[LLE_WINDOW];
-                for (int i = 0; i < LLE_WINDOW; i++) flatBuffer[i] = ssaTrendBuffer[(ssaHead + i) % LLE_WINDOW];
+                for (int i = 0; i < LLE_WINDOW; i++) lleFlatBuffer[i] = ssaTrendBuffer[(ssaHead + i) % LLE_WINDOW];
 
                 if (sequence % 500 == 0) {
-                    currentTau = ChaosMath.calculateAMI(flatBuffer, 30, 20);
-                    currentM = ChaosMath.calculateFNN(flatBuffer, currentTau, 6, 15.0);
+                    currentTau = ChaosMath.calculateAMI(lleFlatBuffer, 30, 20);
+                    currentM = ChaosMath.calculateFNN(lleFlatBuffer, currentTau, 6, 15.0);
                 }
 
                 if (sequence % 10 == 0) {
                     currentLambda = QuantDSP.LyapunovEstimator.calculateRigorousLLE(
-                            flatBuffer, currentM, currentTau, currentTau * 2, 5
+                            lleFlatBuffer, currentM, currentTau, currentTau * 2, 5
                     );
 
                     lambdaHistory[lambdaHead] = currentLambda;
@@ -735,11 +557,11 @@ public class HftRegimeDetection {
 
             event.lambda = currentLambda;
             event.isFrozen = currentRegimeShiftAlert || isRatchetFrozen;
-            
+
             // 🌟 Assign global SSA Engine values (updated async by ZMQ subscriber) to the current event
-            event.finalSsaSmoothed = ssaSmoothed;
-            event.finalSsaSlope    = ssaSlope;
-            event.finalSsaAccel    = ssaAccel;
+            event.finalSsaSmoothed   = ssaSmoothed;
+            event.finalSsaSlope      = ssaSlope;
+            event.finalSsaAccel      = ssaAccel;
             event.finalSsaMacroTrend = ssaMacroTrend;
             // Phase-3 per-tick snapshots of async ZMQ streams
             event.sgSlopeAtTick        = sgSlope;
@@ -751,9 +573,6 @@ public class HftRegimeDetection {
             event.ssaEvrFast = ssaEvrFast;
             event.ssaEvrSlow = ssaEvrSlow;
             event.ssaEigenGapOut = ssaEigenGap;
-
-            head = (head + 1) % MAX_CAPACITY;
-            if (count < MAX_CAPACITY) count++;
         }
     }
 
@@ -857,7 +676,10 @@ public class HftRegimeDetection {
                 long currentTime = System.currentTimeMillis();
                 boolean timeLimitReached = (currentTime - lastFlushTime) >= maxFlushDelayMs;
 
-                if (currentBatchSize >= batchSizeThreshold || (timeLimitReached && endOfBatch)) {
+                // Flush on batch-size threshold OR on time-limit to prevent the
+                // Disruptor from stalling when the producer sends a slow trickle
+                // of events (low replay speed / quiet live periods).
+                if (currentBatchSize >= batchSizeThreshold || (timeLimitReached && currentBatchSize > 0)) {
                     flush();
                 }
             } catch (SQLException e) {}
@@ -1070,7 +892,31 @@ public class HftRegimeDetection {
         Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 65536, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new YieldingWaitStrategy());
         disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
         RingBuffer<TickEvent> ringBuffer = disruptor.start();
-        new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking();
+        String binanceWsUrl = System.getenv("BINANCE_AGGTRADE_WS_URL");
+        if (binanceWsUrl == null || binanceWsUrl.trim().isEmpty()) {
+            binanceWsUrl = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
+        }
+        System.out.println("[BinanceProducer] connecting to " + binanceWsUrl + " (mode=" + System.getenv().getOrDefault("DATA_MODE", "LIVE") + ")");
+        BinanceProducer producer = null;
+        int connectRetries = 30;
+        while (connectRetries > 0) {
+            try {
+                producer = new BinanceProducer(new URI(binanceWsUrl), ringBuffer);
+                if (producer.connectBlocking(5, TimeUnit.SECONDS) && producer.isOpen()) {
+                    break;
+                }
+                System.err.println("[BinanceProducer] connection attempt failed (timeout/closed).");
+            } catch (Exception e) {
+                System.err.println("[BinanceProducer] connection attempt failed: " + e.getMessage());
+            }
+            connectRetries--;
+            System.err.println("[BinanceProducer] retries left: " + connectRetries);
+            try { Thread.sleep(2000); } catch (InterruptedException ie) {}
+        }
+        if (producer == null || !producer.isOpen()) {
+            System.err.println("[BinanceProducer] unable to open WebSocket; exiting so Docker can restart.");
+            System.exit(1);
+        }
         Thread.currentThread().join();
     }
 }

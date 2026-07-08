@@ -229,7 +229,7 @@ public class AdaptiveKalmanFusion {
         // drifting macro line.
         // ============================================================
         double x_bounded = x_post;
-        if (Double.isFinite(ssaMacroTrend)) {
+        if (Double.isFinite(ssaMacroTrend) && Math.abs(ssaMacroTrend) > 1e-6) {
             final double gravDist = Math.max(
                 GRAVITY_BOUND_PCT * Math.abs(ssaMacroTrend),
                 GRAVITY_BOUND_ABS);

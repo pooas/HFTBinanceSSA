@@ -1,3 +1,5 @@
+import os
+import csv
 import pandas as pd
 import numpy as np
 import time
@@ -10,7 +12,7 @@ import asyncio
 import websockets
 import json
 import zmq
-from datetime import datetime
+from datetime import datetime, timezone
 
 warnings.filterwarnings("ignore")
 
@@ -140,33 +142,63 @@ class BinanceLiveQuantBot:
         
         self.load_historical_data()
 
+    def _get_csv_time_bounds(self, csv_path):
+        """Return (first_ms, last_ms) epoch timestamps from the replay CSV."""
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        if not rows:
+            raise ValueError(f"CSV is empty: {csv_path}")
+
+        def _parse(ts):
+            return int(datetime.strptime(ts.strip().strip('"'), "%Y-%m-%d %H:%M:%S.%f")
+                       .replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        return _parse(rows[0]["timestamp"]), _parse(rows[-1]["timestamp"])
+
     def load_historical_data(self):
-        print(f"⏳ Fetching {self.history_limit} historical candles for {self.symbol}...")
+        data_mode = os.environ.get("DATA_MODE", "LIVE").upper()
+        rest_base = os.environ.get("BINANCE_REST_URL", "https://api.binance.com")
+
+        if data_mode == "REPLAY":
+            csv_path = os.environ.get("CSV_PATH", "/data/ticks.csv")
+            if not os.path.exists(csv_path):
+                csv_path = "tests/data/hft_tick_data_sample.csv"
+            first_ms, last_ms = self._get_csv_time_bounds(csv_path)
+            print(f"📼 REPLAY mode: CSV range {pd.to_datetime(first_ms, unit='ms')} -> {pd.to_datetime(last_ms, unit='ms')}")
+            # Warmup must end strictly before the CSV's first tick.
+            end_time = first_ms - 1
+            # Use the real Binance REST API for the warmup history preceding the CSV.
+            rest_base = "https://api.binance.com"
+            print(f"⏳ Fetching {self.history_limit} warmup candles ending at {pd.to_datetime(end_time, unit='ms')} ...")
+        else:
+            end_time = int(time.time() * 1000)
+            print(f"⏳ Fetching {self.history_limit} historical candles for {self.symbol}...")
+
         all_klines = []
-        end_time = int(time.time() * 1000)
-        limit = 1000 
-        
+        limit = 1000
+
         while len(all_klines) < self.history_limit:
-            url = f"https://api.binance.com/api/v3/klines?symbol={self.symbol}&interval={self.interval}&limit={limit}&endTime={end_time}"
+            url = f"{rest_base}/api/v3/klines?symbol={self.symbol}&interval={self.interval}&limit={limit}&endTime={end_time}"
             try:
                 res = requests.get(url, timeout=10).json()
                 if not res or type(res) is dict: break
-                
+
                 all_klines = res + all_klines
                 end_time = res[0][0] - 1
                 if len(res) < limit: break
             except Exception as e:
-                print(f"❌ API Error: {e}")
-                break
+                traceback.print_exc()
+                raise e
 
         all_klines = all_klines[-self.history_limit:]
         df_list = [{'time': pd.to_datetime(k[0], unit='ms'), 'open': float(k[1]), 'high': float(k[2]),
                     'low': float(k[3]), 'close': float(k[4]), 'volume': float(k[5])} for k in all_klines]
-            
+
         with self.lock:
             self.df = pd.DataFrame(df_list)
         print(f"✅ Loaded {len(self.df)} candles. Running Warmup...")
-        
+
         for i in range(120, len(self.df)):
             self.calculate_metrics(self.df.iloc[:i+1])
         print("🚀 Warmup Complete! Macro Engine is Live.")
@@ -211,7 +243,10 @@ class BinanceLiveQuantBot:
         print(f"📡 ZMQ Sent -> L1_Value: {latest_value2:.2f} | L1_Slope: {macro_l1_slope:+.4f} | Regime: {regime}")
 
     async def run_binance_stream(self):
-        stream_url = f"wss://stream.binance.com:9443/ws/{self.symbol.lower()}@kline_{self.interval}"
+        ws_base = os.environ.get("BINANCE_KLINE_WS_URL",
+                                 f"wss://stream.binance.com:9443/ws/{self.symbol.lower()}@kline_{self.interval}")
+        stream_url = ws_base
+        print(f"🔗 Kline stream URL: {stream_url}")
         while True:
             try:
                 async with websockets.connect(stream_url) as websocket:

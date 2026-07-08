@@ -314,7 +314,8 @@ int main() {
             frame.adaptive_window = result.window;
             frame.poly_order      = result.poly_order;
 
-            zmq::message_t msg(&frame, SG_FRAME_SIZE);
+            zmq::message_t msg(SG_FRAME_SIZE);
+            std::memcpy(msg.data(), &frame, SG_FRAME_SIZE);
             zmq_pub.send(msg, zmq::send_flags::dontwait);
             ++total_published;
 

@@ -29,12 +29,14 @@ import java.util.Arrays;
  *    the binary opt_weight.
  *
  * Output fields:
- *  - value2     : frozen/decoupled Value2
- *  - optWeight  : -1.0 when value2 is frozen/flat, +1.0 otherwise
- *  - rawValue2  : pre-freeze value2_raw
+ *  - value2      : frozen/decoupled Value2
+ *  - optWeight   : -1.0 when value2 is frozen/flat, +1.0 otherwise
+ *  - rawValue2   : pre-freeze value2_raw
+ *  - tension     : (value2_frozen - price) / sigma_freeze during a freeze
+ *  - sigmaFreeze : sample standard deviation of price since freeze start
  *  - dominantCycle, power : MEE diagnostics
  *  - ssaTrend, ssaSlope : SSA diagnostics
- *  - isFrozen   : 1 when freeze logic is active, 0 otherwise
+ *  - isFrozen    : 1 when freeze logic is active, 0 otherwise
  */
 public class DecoupledValue2Engine {
 
@@ -104,6 +106,15 @@ public class DecoupledValue2Engine {
     private EngineResult lastResult;
 
     // ------------------------------------------------------------------------
+    // Elastic Potential Energy tracker — Welford one-pass variance, no arrays
+    // ------------------------------------------------------------------------
+    private long   welfordCount  = 0L;
+    private double welfordMean   = 0.0;
+    private double welfordM2     = 0.0;
+    private double freezeAnchor  = Double.NaN;
+    private boolean prevFrozen   = false;
+
+    // ------------------------------------------------------------------------
     // Constructors
     // ------------------------------------------------------------------------
     public DecoupledValue2Engine() {
@@ -154,7 +165,7 @@ public class DecoupledValue2Engine {
     public EngineResult onTick(double high, double low, double close) {
         if (!Double.isFinite(high) || !Double.isFinite(low) || !Double.isFinite(close)) {
             return lastResult != null ? lastResult
-                    : new EngineResult(0.0, 0.0, -1.0, 0.0,
+                    : new EngineResult(0.0, 0.0, -1.0, 0.0, 0.0, 0.0,
                                        currentDominantCycle, currentPower,
                                        Double.NaN, 0.0, 0);
         }
@@ -229,11 +240,41 @@ public class DecoupledValue2Engine {
         double optWeight = (v2Diff <= FREEZE_DIFF_EPS) ? -1.0 : 1.0;
         prevFinalV2 = finalV2;
 
+        // 8) Elastic Potential Energy tracker — Welford, zero allocations
+        boolean currentlyFrozen = (isFrozen == 1);
+        double sigmaFreeze;
+        double tension;
+
+        if (currentlyFrozen) {
+            if (!prevFrozen) {
+                // Freeze just started: anchor to the flat line and reset Welford
+                freezeAnchor = Double.isFinite(lastVal) ? lastVal : close;
+                welfordReset();
+            }
+            welfordUpdate(close);
+            sigmaFreeze = welfordSigma();
+            double denom = sigmaFreeze;
+            tension = (denom > 0.0 && Double.isFinite(freezeAnchor))
+                    ? (freezeAnchor - close) / denom
+                    : 0.0;
+        } else {
+            if (prevFrozen) {
+                welfordReset();
+            }
+            sigmaFreeze = 0.0;
+            tension = 0.0;
+        }
+        prevFrozen = currentlyFrozen;
+
+        if (!Double.isFinite(tension)) tension = 0.0;
+
         EngineResult res = new EngineResult(
                 close,
                 finalV2,
                 optWeight,
                 value2Raw,
+                tension,
+                sigmaFreeze,
                 dominantCycle,
                 currentPower,
                 ssaTrend,
@@ -242,6 +283,33 @@ public class DecoupledValue2Engine {
         );
         lastResult = res;
         return res;
+    }
+
+    // ------------------------------------------------------------------------
+    // Welford's online variance — strictly primitive state, zero arrays
+    // ------------------------------------------------------------------------
+
+    private void welfordUpdate(double x) {
+        if (!Double.isFinite(x)) return;
+        welfordCount++;
+        double delta = x - welfordMean;
+        welfordMean += delta / welfordCount;
+        double delta2 = x - welfordMean;
+        welfordM2 += delta * delta2;
+    }
+
+    private double welfordSigma() {
+        if (welfordCount < 2L) return 0.0;
+        double variance = welfordM2 / (welfordCount - 1L);
+        if (!Double.isFinite(variance) || variance <= 0.0) return 0.0;
+        return Math.sqrt(variance);
+    }
+
+    private void welfordReset() {
+        welfordCount = 0L;
+        welfordMean  = 0.0;
+        welfordM2    = 0.0;
+        freezeAnchor = Double.NaN;
     }
 
     // ------------------------------------------------------------------------
@@ -537,6 +605,8 @@ public class DecoupledValue2Engine {
         public final double value2;
         public final double optWeight;
         public final double rawValue2;
+        public final double tension;
+        public final double sigmaFreeze;
         public final double dominantCycle;
         public final double power;
         public final double ssaTrend;
@@ -544,12 +614,15 @@ public class DecoupledValue2Engine {
         public final int    isFrozen;
 
         public EngineResult(double close, double value2, double optWeight,
-                            double rawValue2, double dominantCycle, double power,
+                            double rawValue2, double tension, double sigmaFreeze,
+                            double dominantCycle, double power,
                             double ssaTrend, double ssaSlope, int isFrozen) {
             this.close         = close;
             this.value2        = value2;
             this.optWeight     = optWeight;
             this.rawValue2     = rawValue2;
+            this.tension       = tension;
+            this.sigmaFreeze   = sigmaFreeze;
             this.dominantCycle = dominantCycle;
             this.power         = power;
             this.ssaTrend      = ssaTrend;

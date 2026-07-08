@@ -1,6 +1,8 @@
-pandas
-numpy
-requests
+
 cvxpy
-websockets
+ecos
+requests
+numpy
+pandas
 pyzmq
+websockets
