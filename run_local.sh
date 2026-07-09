@@ -109,9 +109,10 @@ case "$choice" in
     ;;
   2|REPLAY|replay)
     export DATA_MODE=REPLAY
-    export BINANCE_AGGTRADE_WS_URL="ws://replay-mock:8080/ws/btcusdt@aggTrade"
-    export BINANCE_KLINE_WS_URL="ws://replay-mock:8080/ws/btcusdt@kline_1m"
-    export BINANCE_REST_URL="http://replay-mock:8080"
+    # اصلاح آدرس‌ها برای هماهنگی با network_mode: host (استفاده از 127.0.0.1 به جای اسم کانتینر)
+    export BINANCE_AGGTRADE_WS_URL="ws://127.0.0.1:8080/ws/btcusdt@aggTrade"
+    export BINANCE_KLINE_WS_URL="ws://127.0.0.1:8080/ws/btcusdt@kline_1m"
+    export BINANCE_REST_URL="http://127.0.0.1:8080"
     export COMPOSE_PROFILES="replay"
     export REPLAY_LOOP=${REPLAY_LOOP:-true}
     echo "📼 REPLAY mode selected"
