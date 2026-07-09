@@ -6,8 +6,7 @@ datasources:
     access: proxy
     isDefault: true
     jsonData:
-      # تنظیمات دقیق و استاندارد پلاگین رسمی
-      host: hft_clickhouse
+      host: 127.0.0.1
       port: 8123
       protocol: http
       defaultDatabase: default

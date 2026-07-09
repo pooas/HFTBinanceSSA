@@ -1,38 +1,32 @@
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:latest
-    platform: linux/arm64      # <--- این خط باید اضافه شود
     container_name: hft_clickhouse
-    ports:
-      - "8123:8123" 
-      - "9000:9000"
+    network_mode: "host"
     environment:
       - CLICKHOUSE_PASSWORD=hft123
     volumes:
-      # این ولوم‌ها باید اینجا (زیر کلیک‌هاوس) باشند، نه گرافانا!
       - ./ch-init/init.sql:/docker-entrypoint-initdb.d/init.sql
       - clickhouse_data:/var/lib/clickhouse
-    networks:
-      - hft-net
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   grafana:
     image: grafana/grafana-oss:latest
-    platform: linux/arm64      # <--- این خط باید اضافه شود
     container_name: hft_grafana
-    ports:
-      - "3000:3000"
-      # پورت 8123 از اینجا حذف شد تا با کلیک‌هاوس تداخل نکند
+    network_mode: "host"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
-      - grafana_data:/var/lib/grafana  # اضافه شدن ولوم برای ذخیره تنظیمات خود گرافانا
+      - ./grafana/plugins:/var/lib/grafana/plugins
+      - grafana_data:/var/lib/grafana
     environment:
-      # از آنجایی که سرور آلمان/ژاپن است، تحریم نیستید و پلاگین راحت و خودکار دانلود می‌شود
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      - GF_SERVER_HTTP_ADDR=0.0.0.0
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_PLUGINS_ALLOW_UNSIGNED_PLUGINS=grafana-clickhouse-datasource
@@ -41,29 +35,28 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
-    networks:
-      - hft-net
 
-  # 🌟 سرویس جدید C++ (مغز متفکر HMM)
   cpp-hmm:
     build:
       context: .
+      network: host
       dockerfile: Dockerfile.cpp-consolidated
       target: hmm-runtime
     container_name: hft_cpp_hmm
+    network_mode: "host"
     environment:
       - ZMQ_PORT=5555
-    networks:
-      - hft-net
 
   cpp-sg-dsp:
     build:
       context: .
+      network: host
       dockerfile: Dockerfile.cpp-consolidated
       target: sg-runtime
     container_name: hft_cpp_sg_dsp
+    network_mode: "host"
     environment:
-      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_HOST=127.0.0.1
       - CLICKHOUSE_PORT=8123
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=hft123
@@ -73,21 +66,21 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
-    networks:
-      - hft-net
 
   cpp-ssa:
     build:
       context: .
+      network: host
       dockerfile: Dockerfile.cpp-consolidated
       target: ssa-runtime
     container_name: hft_cpp_ssa
+    network_mode: "host"
     environment:
-      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_HOST=127.0.0.1
       - CLICKHOUSE_PORT=8123
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=hft123
-      - HMM_ZMQ_HOST=cpp-hmm
+      - HMM_ZMQ_HOST=127.0.0.1
       - HMM_ZMQ_PORT=5555
       - SSA_ZMQ_PORT=5558
       - SSA_POLL_INTERVAL_MS=50
@@ -97,15 +90,14 @@ services:
         condition: service_healthy
       cpp-hmm:
         condition: service_started
-    networks:
-      - hft-net
 
-  # 🌟 سرویس جدید فرمانده: Python Macro Engine
   python-macro:
     build:
       context: ./python-macro
+      network: host
       dockerfile: Dockerfile
     container_name: hft_python_macro
+    network_mode: "host"
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
@@ -115,29 +107,28 @@ services:
       - BINANCE_KLINE_WS_URL=${BINANCE_KLINE_WS_URL:-wss://stream.binance.com:9443/ws/btcusdt@kline_1m}
     volumes:
       - ./tests/data/hft_tick_data_sample.csv:/data/ticks.csv:ro
-    ports:
-      - "5556:5556"
-    networks:
-      - hft-net
+
   java-app:
     build:
       context: ./java-app
+      network: host
       dockerfile: Dockerfile
     container_name: hft_java_producer
+    network_mode: "host"
     restart: unless-stopped
     environment:
-      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_HOST=127.0.0.1
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=hft123
       - DATA_MODE=${DATA_MODE:-LIVE}
       - BINANCE_AGGTRADE_WS_URL=${BINANCE_AGGTRADE_WS_URL:-wss://stream.binance.com:9443/ws/btcusdt@aggTrade}
-      - ZMQ_HOST=cpp-hmm
+      - ZMQ_HOST=127.0.0.1
       - ZMQ_PORT=5555
-      - MACRO_ZMQ_HOST=python-macro
+      - MACRO_ZMQ_HOST=127.0.0.1
       - MACRO_ZMQ_PORT=5556
-      - SG_ZMQ_HOST=cpp-sg-dsp
+      - SG_ZMQ_HOST=127.0.0.1
       - SG_ZMQ_PORT=5557
-      - SSA_ZMQ_HOST=cpp-ssa
+      - SSA_ZMQ_HOST=127.0.0.1
       - SSA_ZMQ_PORT=5558
     depends_on:
       clickhouse:
@@ -148,18 +139,14 @@ services:
         condition: service_started
       cpp-ssa:
         condition: service_started
-    networks:
-      - hft-net
 
-  # ------------------------------------------------------------------
-  # Replay mock server — started only when --profile replay is used.
-  # Speaks the exact same Binance WS/REST protocols as the live upstream.
-  # ------------------------------------------------------------------
   replay-mock:
     build:
       context: ./replay-mock
+      network: host
       dockerfile: Dockerfile
     container_name: hft_replay_mock
+    network_mode: "host"
     profiles:
       - replay
     volumes:
@@ -169,14 +156,7 @@ services:
       - MOCK_PORT=8080
       - REPLAY_SPEED=${REPLAY_SPEED:-0}
       - REPLAY_LOOP=${REPLAY_LOOP:-false}
-    networks:
-      - hft-net
 
-networks:
-  hft-net:
-    driver: bridge
-
-# تعریف نام ولوم‌ها در انتهای فایل الزامی است
 volumes:
   clickhouse_data:
   grafana_data:
