@@ -41,8 +41,9 @@ import clickhouse_connect
 # Configuration
 # -----------------------------------------------------------------------------
 MAIN_WALLET: str = "0xA01Ad76F975bbc31ac2Ad9a0a0Dda8c91D06b07D"
-AGENT_ADDRESS: str = "0x660D2D066cbE772F8e523D83d22d4C45b83185a1"
 AGENT_SECRET_KEY: str = "0x9d22f7b52a16de417553f0dff9c0d6e50292634b47da9a25db434a3f4b25953d"
+# The agent address is derived from AGENT_SECRET_KEY below; it must be approved
+# by MAIN_WALLET on Hyperliquid before this script can trade.
 
 COIN: str = "BTC"
 LEVERAGE: int = 10
@@ -220,14 +221,11 @@ def print_latency(t_start: float, t_db_done: float, t_api_start: float, t_api_do
 def main() -> None:
     print("[INIT] Deriving agent account from provided secret key...")
     agent_account: LocalAccount = eth_account.Account.from_key(AGENT_SECRET_KEY)
-    if agent_account.address.lower() != AGENT_ADDRESS.lower():
-        raise ValueError(
-            f"Agent secret key maps to {agent_account.address}, "
-            f"but AGENT_ADDRESS is {AGENT_ADDRESS}"
-        )
+    agent_address = agent_account.address
 
     print(f"[INIT] Main wallet:  {MAIN_WALLET}")
-    print(f"[INIT] Agent wallet: {agent_account.address}")
+    print(f"[INIT] Agent wallet: {agent_address}")
+    print("[INIT] Ensure the agent address above is approved by the main wallet on Hyperliquid.")
     print(f"[INIT] Hyperliquid API: {constants.TESTNET_API_URL}")
 
     info = Info(constants.TESTNET_API_URL, skip_ws=True)
