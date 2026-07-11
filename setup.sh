@@ -65,6 +65,30 @@ if ! docker compose version &> /dev/null; then
 fi
 
 # ==========================================
+# 3b. Fix Docker DNS (bypass systemd-resolved stub on Ubuntu)
+# ==========================================
+echo "🔧 Configuring Docker daemon DNS to use public resolvers..."
+$SUDO mkdir -p /etc/docker
+if [ -f /etc/docker/daemon.json ]; then
+    $SUDO cp /etc/docker/daemon.json "/etc/docker/daemon.json.bak.$(date +%s)"
+fi
+$SUDO tee /etc/docker/daemon.json > /dev/null <<'EOF'
+{
+  "dns": ["8.8.8.8", "1.1.1.1", "8.8.4.4"]
+}
+EOF
+
+# Restart Docker only if it is already running; otherwise start it.
+if $SUDO systemctl is-active --quiet docker 2>/dev/null || $SUDO service docker status 2>/dev/null | grep -q running; then
+    echo "🔄 Restarting Docker to apply DNS configuration..."
+    $SUDO systemctl restart docker || $SUDO service docker restart || true
+else
+    echo "🚀 Starting Docker..."
+    $SUDO systemctl start docker || $SUDO service docker start || true
+fi
+$SUDO systemctl enable docker 2>/dev/null || true
+
+# ==========================================
 # 4. Clone / Update Repository (Hyperliquid Branch)
 # ==========================================
 echo "➡️ Stopping and cleaning up previous containers..."
@@ -101,11 +125,6 @@ $SUDO chown -R 472:472 ./grafana 2>/dev/null || true
 # 6. HFT Stack Execution Logic
 # ==========================================
 export DOCKER_DEFAULT_PLATFORM=linux/amd64
-
-# Work around Docker BuildKit DNS resolution issues on some Ubuntu hosts.
-# Forces build containers (e.g. Maven, apt, pip) to use the host network stack.
-export DOCKER_BUILDKIT=1
-export BUILDKIT_NETWORK=host
 
 echo ""
 echo "====================================="

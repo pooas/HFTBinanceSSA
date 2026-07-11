@@ -6,7 +6,9 @@ COPY pom.xml .
 # RUN mvn dependency:go-offline -B
 
 COPY src ./src
-RUN mvn clean package -DskipTests
+RUN (echo "nameserver 8.8.8.8" > /etc/resolv.conf 2>/dev/null || true) && \
+    (echo "nameserver 1.1.1.1" >> /etc/resolv.conf 2>/dev/null || true) && \
+    mvn clean package -DskipTests
 
 # Stage 2: Run the application
 FROM eclipse-temurin:17-jre
