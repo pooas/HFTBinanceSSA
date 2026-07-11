@@ -3,12 +3,12 @@ FROM maven:3.9-eclipse-temurin-17 AS builder
 WORKDIR /app
 
 COPY pom.xml .
-# RUN mvn dependency:go-offline -B
+# دانلود وابستگی‌ها در یک لایه مجزا برای کش شدن و افزایش سرعت بیلد
+RUN mvn dependency:go-offline -B
 
 COPY src ./src
-RUN (echo "nameserver 8.8.8.8" > /etc/resolv.conf 2>/dev/null || true) && \
-    (echo "nameserver 1.1.1.1" >> /etc/resolv.conf 2>/dev/null || true) && \
-    mvn clean package -DskipTests
+# بیلد استاندارد بدون دستکاری فایل‌های سیستم‌عامل
+RUN mvn clean package -DskipTests
 
 # Stage 2: Run the application
 FROM eclipse-temurin:17-jre
