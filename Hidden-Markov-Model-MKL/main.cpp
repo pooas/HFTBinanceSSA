@@ -1,5 +1,5 @@
 /**
- * HFT Live Engine: Binance REST (History) + WSS (Klines) -> Realized Variance -> HMM -> ZeroMQ
+ * HFT Live Engine: Hyperliquid REST (History) + WSS (Candles) -> Realized Variance -> HMM -> ZeroMQ
  * Upgraded to Professional K-Line Architecture with Zero Cold-Start Time
  */
 
@@ -45,8 +45,18 @@
  HMMResult current_model;
  
  // =========================================================
- // 🌟 توابع کمکی برای دانلود و پارس کردن کندل‌های تاریخی
+ // 🌟 Hyperliquid JSON parsing helpers (string-or-number safe)
  // =========================================================
+ static double parse_hl_price(const json& j) {
+     if (j.is_string()) return std::stod(j.get<std::string>());
+     return j.get<double>();
+ }
+ 
+ static long parse_hl_time(const json& j) {
+     if (j.is_string()) return std::stol(j.get<std::string>());
+     return j.get<long>();
+ }
+ 
  std::string exec_cmd(const char* cmd) {
      std::array<char, 128> buffer;
      std::string result;
@@ -60,7 +70,7 @@
      return result;
  }
  
- std::string get_binance_interval(long seconds) {
+ std::string get_interval(long seconds) {
      if (seconds == 60) return "1m";
      if (seconds == 300) return "5m";
      if (seconds == 900) return "15m";
@@ -69,18 +79,32 @@
  }
  
  void fetch_historical_klines(long timeframe_seconds) {
-     std::string interval = get_binance_interval(timeframe_seconds);
-     std::string cmd = "wget -qO- \"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=" + interval + "&limit=500\"";
-     std::cout << "[INIT] Fetching 500 historical candles (" << interval << ") from Binance REST API..." << std::endl;
+     std::string interval = get_interval(timeframe_seconds);
+ 
+     long long end_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+     long long start_ms = end_ms - static_cast<long long>(500) * timeframe_seconds * 1000LL;
+ 
+     std::string body = "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"BTC\",\"interval\":\""
+                        + interval + "\",\"startTime\":" + std::to_string(start_ms)
+                        + ",\"endTime\":" + std::to_string(end_ms) + "}}";
+     std::string cmd = "wget -qO- --header='Content-Type: application/json' --post-data='"
+                       + body + "' 'https://api.hyperliquid-testnet.xyz/info'";
+     std::cout << "[INIT] Fetching 500 historical candles (" << interval << ") from Hyperliquid REST API..." << std::endl;
      
      try {
          std::string json_str = exec_cmd(cmd.c_str());
          auto j = json::parse(json_str);
          
+         if (!j.is_array()) {
+             std::cerr << "[ERROR] Hyperliquid candleSnapshot returned non-array response" << std::endl;
+             return;
+         }
+ 
          double prev_close = -1.0;
          
          for (const auto& item : j) {
-             double close_price = std::stod(item[4].get<std::string>());
+             double close_price = parse_hl_price(item["c"]);
              if (prev_close > 0.0) {
                  // محاسبه Squared Return (معادل LogRV در تایم فریم کندلی)
                  double log_ret = std::log(close_price / prev_close);
@@ -215,7 +239,7 @@
      if (const char* env_tf = std::getenv("TIMEFRAME_SEC")) {
          timeframe_seconds = std::stol(env_tf);
      }
-     std::cout << "[INIT] HMM Timeframe set to: " << timeframe_seconds << " seconds (" << get_binance_interval(timeframe_seconds) << ")." << std::endl;
+     std::cout << "[INIT] HMM Timeframe set to: " << timeframe_seconds << " seconds (" << get_interval(timeframe_seconds) << ")." << std::endl;
  
      // 🌟 دانلود تاریخچه 500 کندل قبلی
      fetch_historical_klines(timeframe_seconds);
@@ -240,56 +264,82 @@
      });
  
      long tick_count = 0;
+     long current_candle_t = 0;
+     double current_candle_close = 0.0;
+ 
+     std::string stream_interval = get_interval(timeframe_seconds);
+ 
+     c.set_open_handler([&](websocketpp::connection_hdl hdl) {
+         std::string sub = "{\"method\":\"subscribe\",\"subscription\":{\"type\":\"candle\",\"coin\":\"BTC\",\"interval\":\""
+                           + stream_interval + "\"}}";
+         websocketpp::lib::error_code ec;
+         c.send(hdl, sub, websocketpp::frame::opcode::text, ec);
+         if (!ec) {
+             std::cout << "🌐 Subscribed to Hyperliquid candle stream (" << stream_interval << ")" << std::endl;
+         } else {
+             std::cerr << "🔴 Subscription send failed: " << ec.message() << std::endl;
+         }
+     });
  
      c.set_message_handler([&](websocketpp::connection_hdl hdl, wss_client::message_ptr msg) {
          try {
              auto j = json::parse(msg->get_payload());
-             if (!j.contains("e") || j["e"] != "kline") return;
+             if (!j.contains("channel") || j["channel"] != "candle") return;
  
-             auto k = j["k"];
-             double current_close = std::stod(k["c"].get<std::string>());
-             bool is_kline_closed = k["x"].get<bool>();
-             
-             double ref_price = live_last_close.load();
+             auto k = j["data"];
+             long t = parse_hl_time(k["t"]);
+             double current_close = parse_hl_price(k["c"]);
  
-             if (ref_price > 0.0) {
-                 // محاسبه واریانس کندل (باز یا بسته)
-                 double log_ret = std::log(current_close / ref_price);
-                 double log_rv = std::log(log_ret * log_ret + 1e-12);
- 
-                 // 🌟 رفع مشکل نوسان فیک: محاسبات بیز و ارسال ZMQ فقط در لحظه بسته شدن کندل انجام می‌شود
-                 if (is_kline_closed) {
-                     decode_current_regime(log_rv);
-                     int active_regime = current_hmm_regime.load();
- 
-                     // ارسال قطعی یک سیگنال معتبر و ثابت برای کل تایم‌فریم بعدی
-                     std::string payload_str = "REGIME|" + std::to_string(active_regime) + "," +
-                                               std::to_string(prob_state[0].load()) + "," +
-                                               std::to_string(prob_state[1].load()) + "," +
-                                               std::to_string(prob_state[2].load());
- 
-                     zmq::message_t payload(payload_str.data(), payload_str.size());
-                     zmq_pub.send(payload, zmq::send_flags::none);
- 
-                     // آپدیت تاریخچه مدل برای آموزش‌های بعدی
-                     {
-                         std::lock_guard<std::mutex> lock(rv_mutex);
-                         rv_history.push_back(log_rv);
-                         if (rv_history.size() > 14400) rv_history.erase(rv_history.begin());
+             if (t == current_candle_t) {
+                 // Hyperliquid streams partial candle updates; keep the latest close but do not
+                 // finalize the HMM signal until the next candle starts.
+                 current_candle_close = current_close;
+                 tick_count++;
+                 if (tick_count % 50 == 0) {
+                     double ref_price = live_last_close.load();
+                     double temp_log_rv = 0.0;
+                     if (ref_price > 0.0) {
+                         double log_ret = std::log(current_candle_close / ref_price);
+                         temp_log_rv = std::log(log_ret * log_ret + 1e-12);
                      }
-                     live_last_close.store(current_close);
-                     
-                     std::cout << "[LIVE|CLOSED] Candle Finalized. LogRV: " << log_rv 
-                               << " | Regime: " << active_regime 
-                               << " | TrendProb: " << (prob_state[1].load() * 100.0) << "%" << std::endl;
-                 } else {
-                     // در زمان باز بودن کندل فقط پرینت می‌کنیم و سیگنال آشفته تولید نمی‌کنیم
-                     tick_count++;
-                     if (tick_count % 50 == 0) {
-                         std::cout << "[LIVE|OPEN] Price: " << current_close << " | Temp LogRV: " << log_rv 
-                                   << " | Waiting for candle close..." << std::endl;
+                     std::cout << "[LIVE|OPEN] Price: " << current_candle_close << " | Temp LogRV: " << temp_log_rv
+                               << " | Waiting for candle close..." << std::endl;
+                 }
+             } else if (t > current_candle_t) {
+                 // New candle open means the previous candle is finalized.
+                 if (current_candle_t != 0) {
+                     double ref_price = live_last_close.load();
+                     if (ref_price > 0.0) {
+                         double log_ret = std::log(current_candle_close / ref_price);
+                         double log_rv = std::log(log_ret * log_ret + 1e-12);
+ 
+                         decode_current_regime(log_rv);
+                         int active_regime = current_hmm_regime.load();
+ 
+                         // ارسال قطعی یک سیگنال معتبر و ثابت برای کل تایم‌فریم بعدی
+                         std::string payload_str = "REGIME|" + std::to_string(active_regime) + "," +
+                                                   std::to_string(prob_state[0].load()) + "," +
+                                                   std::to_string(prob_state[1].load()) + "," +
+                                                   std::to_string(prob_state[2].load());
+ 
+                         zmq::message_t payload(payload_str.data(), payload_str.size());
+                         zmq_pub.send(payload, zmq::send_flags::none);
+ 
+                         // آپدیت تاریخچه مدل برای آموزش‌های بعدی
+                         {
+                             std::lock_guard<std::mutex> lock(rv_mutex);
+                             rv_history.push_back(log_rv);
+                             if (rv_history.size() > 14400) rv_history.erase(rv_history.begin());
+                         }
+                         live_last_close.store(current_candle_close);
+                         
+                         std::cout << "[LIVE|CLOSED] Candle Finalized. LogRV: " << log_rv 
+                                   << " | Regime: " << active_regime 
+                                   << " | TrendProb: " << (prob_state[1].load() * 100.0) << "%" << std::endl;
                      }
                  }
+                 current_candle_t = t;
+                 current_candle_close = current_close;
              }
          } catch (...) {}
      });
@@ -298,14 +348,13 @@
          std::cout << "🔴 WebSocket Closed!" << std::endl;
      });
  
-     // 🌟 اتصال به استریم کندل (به جای تیک دیتا)
-     std::string stream_interval = get_binance_interval(timeframe_seconds);
-     std::string uri = "wss://stream.binance.com:9443/ws/btcusdt@kline_" + stream_interval;
+     // 🌟 اتصال به استریم کندل هایپرلی کوید
+     std::string uri = "wss://api.hyperliquid-testnet.xyz/ws";
      
      websocketpp::lib::error_code ec;
      wss_client::connection_ptr con = c.get_connection(uri, ec);
      c.connect(con);
-     std::cout << "🌐 Connecting to Binance Kline Stream (" << stream_interval << ")..." << std::endl;
+     std::cout << "🌐 Connecting to Hyperliquid Candle Stream (" << stream_interval << ")..." << std::endl;
      c.run(); 
  
      return 0;

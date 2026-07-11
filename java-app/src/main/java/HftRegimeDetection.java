@@ -6,6 +6,7 @@ import com.lmax.disruptor.dsl.ProducerType;
 import com.lmax.disruptor.util.DaemonThreadFactory;
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.ejml.simple.SimpleMatrix;
@@ -877,26 +878,41 @@ public class HftRegimeDetection {
         }
     }
 
-    public static class BinanceProducer extends WebSocketClient {
+    public static class HyperliquidTickProducer extends WebSocketClient {
         private final RingBuffer<TickEvent> ringBuffer;
-        public BinanceProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
+        private static final String TRADES_SUB =
+            "{\"method\":\"subscribe\",\"subscription\":{\"type\":\"trades\",\"coin\":\"BTC\"}}";
+
+        public HyperliquidTickProducer(URI serverUri, RingBuffer<TickEvent> ringBuffer) {
             super(serverUri);
             this.ringBuffer = ringBuffer;
             this.setConnectionLostTimeout(0);
         }
-        @Override public void onOpen(ServerHandshake handshakedata) {}
+        @Override public void onOpen(ServerHandshake handshakedata) {
+            send(TRADES_SUB);
+        }
         @Override public void onMessage(String message) {
             try {
                 JsonObject json = JsonParser.parseString(message).getAsJsonObject();
-                if (!json.has("p")) return;
-                long sequence = ringBuffer.next();
-                try {
-                    TickEvent event = ringBuffer.get(sequence);
-                    event.price = json.get("p").getAsDouble();
-                    event.volume = json.get("q").getAsDouble();
-                    event.timestamp = json.get("T").getAsLong();
-                    event.ingressNanoTime = System.nanoTime();
-                } finally { ringBuffer.publish(sequence); }
+                if (!json.has("channel") || !"trades".equals(json.get("channel").getAsString())) {
+                    return;
+                }
+                JsonArray trades = json.getAsJsonArray("data");
+                if (trades == null) return;
+
+                for (int i = 0; i < trades.size(); i++) {
+                    JsonObject trade = trades.get(i).getAsJsonObject();
+                    if (!trade.has("px") || !trade.has("sz") || !trade.has("time")) continue;
+
+                    long sequence = ringBuffer.next();
+                    try {
+                        TickEvent event = ringBuffer.get(sequence);
+                        event.price = trade.get("px").getAsDouble();
+                        event.volume = trade.get("sz").getAsDouble();
+                        event.timestamp = trade.get("time").getAsLong();
+                        event.ingressNanoTime = System.nanoTime();
+                    } finally { ringBuffer.publish(sequence); }
+                }
             } catch (Throwable e) {}
         }
         @Override public void onClose(int code, String reason, boolean remote) {
@@ -1070,7 +1086,7 @@ public class HftRegimeDetection {
         Disruptor<TickEvent> disruptor = new Disruptor<>(TickEvent::new, 65536, DaemonThreadFactory.INSTANCE, ProducerType.SINGLE, new YieldingWaitStrategy());
         disruptor.handleEventsWith(new SsaProcessingHandler()).then(new ClickHouseBatchHandler());
         RingBuffer<TickEvent> ringBuffer = disruptor.start();
-        new BinanceProducer(new URI("wss://stream.binance.com:9443/ws/btcusdt@aggTrade"), ringBuffer).connectBlocking();
+        new HyperliquidTickProducer(new URI("wss://api.hyperliquid-testnet.xyz/ws"), ringBuffer).connectBlocking();
         Thread.currentThread().join();
     }
 }

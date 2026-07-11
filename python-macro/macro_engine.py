@@ -124,8 +124,8 @@ class CausalSpectralDispatcher:
         trend_out[self.L - 1:] = raw_trend
         return trend_out
 
-class BinanceLiveQuantBot:
-    def __init__(self, symbol="BTCUSDT", interval="15m", history_limit=3000):
+class HyperliquidQuantBot:
+    def __init__(self, symbol="BTC", interval="15m", history_limit=3000):
         self.symbol = symbol.upper()
         self.interval = interval
         self.history_limit = history_limit
@@ -142,31 +142,40 @@ class BinanceLiveQuantBot:
 
     def load_historical_data(self):
         print(f"⏳ Fetching {self.history_limit} historical candles for {self.symbol}...")
-        all_klines = []
         end_time = int(time.time() * 1000)
-        limit = 1000 
-        
-        while len(all_klines) < self.history_limit:
-            url = f"https://api.binance.com/api/v3/klines?symbol={self.symbol}&interval={self.interval}&limit={limit}&endTime={end_time}"
-            try:
-                res = requests.get(url, timeout=10).json()
-                if not res or type(res) is dict: break
-                
-                all_klines = res + all_klines
-                end_time = res[0][0] - 1
-                if len(res) < limit: break
-            except Exception as e:
-                print(f"❌ API Error: {e}")
-                break
+        start_time = end_time - self.history_limit * 60 * 1000
 
+        body = {
+            "type": "candleSnapshot",
+            "req": {
+                "coin": self.symbol,
+                "interval": self.interval,
+                "startTime": start_time,
+                "endTime": end_time
+            }
+        }
+
+        try:
+            res = requests.post(
+                "https://api.hyperliquid-testnet.xyz/info",
+                json=body,
+                timeout=10
+            ).json()
+            if not res or isinstance(res, dict):
+                raise ValueError("Hyperliquid candleSnapshot returned non-array response")
+        except Exception as e:
+            print(f"❌ API Error: {e}")
+            res = []
+
+        all_klines = sorted(res, key=lambda k: k['t'])
         all_klines = all_klines[-self.history_limit:]
-        df_list = [{'time': pd.to_datetime(k[0], unit='ms'), 'open': float(k[1]), 'high': float(k[2]),
-                    'low': float(k[3]), 'close': float(k[4]), 'volume': float(k[5])} for k in all_klines]
-            
+        df_list = [{'time': pd.to_datetime(k['t'], unit='ms'), 'open': float(k['o']), 'high': float(k['h']),
+                    'low': float(k['l']), 'close': float(k['c']), 'volume': float(k['v'])} for k in all_klines]
+
         with self.lock:
             self.df = pd.DataFrame(df_list)
         print(f"✅ Loaded {len(self.df)} candles. Running Warmup...")
-        
+
         for i in range(120, len(self.df)):
             self.calculate_metrics(self.df.iloc[:i+1])
         print("🚀 Warmup Complete! Macro Engine is Live.")
@@ -210,33 +219,54 @@ class BinanceLiveQuantBot:
         zmq_socket.send_string(msg)
         print(f"📡 ZMQ Sent -> L1_Value: {latest_value2:.2f} | L1_Slope: {macro_l1_slope:+.4f} | Regime: {regime}")
 
-    async def run_binance_stream(self):
-        stream_url = f"wss://stream.binance.com:9443/ws/{self.symbol.lower()}@kline_{self.interval}"
+    async def run_hyperliquid_stream(self):
+        ws_url = "wss://api.hyperliquid-testnet.xyz/ws"
         while True:
             try:
-                async with websockets.connect(stream_url) as websocket:
-                    print(f"🟢 WS Connected. Listening to {self.interval} klines...")
+                async with websockets.connect(ws_url) as websocket:
+                    print(f"🟢 WS Connected. Listening to {self.interval} Hyperliquid candles...")
+                    sub = {
+                        "method": "subscribe",
+                        "subscription": {"type": "candle", "coin": self.symbol, "interval": self.interval}
+                    }
+                    await websocket.send(json.dumps(sub))
+                    current_candle = None
                     while True:
                         msg = await websocket.recv()
                         data = json.loads(msg)
-                        k = data['k']
-                        is_closed = k['x']
-                        
-                        if is_closed:
-                            t = pd.to_datetime(k['t'], unit='ms')
-                            c = float(k['c'])
+                        if data.get('channel') != 'candle':
+                            continue
+                        k = data['data']
+                        t = k['t']
+                        if current_candle is None:
+                            current_candle = k
+                            continue
+                        if t == current_candle['t']:
+                            current_candle = k
+                            continue
+                        if t > current_candle['t']:
+                            c = float(current_candle['c'])
+                            new_time = pd.to_datetime(current_candle['t'], unit='ms')
                             with self.lock:
-                                new_row = pd.DataFrame([{'time': t, 'open': float(k['o']), 'high': float(k['h']), 'low': float(k['l']), 'close': c, 'volume': float(k['v'])}])
+                                new_row = pd.DataFrame([{
+                                    'time': new_time,
+                                    'open': float(current_candle['o']),
+                                    'high': float(current_candle['h']),
+                                    'low': float(current_candle['l']),
+                                    'close': c,
+                                    'volume': float(current_candle['v'])
+                                }])
                                 self.df = pd.concat([self.df, new_row], ignore_index=True)
-                                if len(self.df) > 2000: self.df = self.df.iloc[-2000:].reset_index(drop=True)
-                            
+                                if len(self.df) > 2000:
+                                    self.df = self.df.iloc[-2000:].reset_index(drop=True)
                             self.calculate_metrics(self.df)
+                            current_candle = k
             except Exception as e:
                 print(f"🔴 Stream Error: {e}. Reconnecting...")
                 await asyncio.sleep(3)
 
 if __name__ == "__main__":
-    bot = BinanceLiveQuantBot(symbol="BTCUSDT", interval="1m", history_limit=3000)
+    bot = HyperliquidQuantBot(symbol="BTC", interval="1m", history_limit=3000)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot.run_binance_stream())
+    loop.run_until_complete(bot.run_hyperliquid_stream())
