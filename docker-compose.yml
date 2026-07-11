@@ -114,6 +114,7 @@ services:
     build:
       context: ./java-app
       dockerfile: Dockerfile
+      network: host      # 🌟 این خط حیاتی است
     container_name: hft_java_producer
     environment:
       - CLICKHOUSE_HOST=clickhouse
