@@ -4,7 +4,7 @@ git add .
 git commit -m "Add offline clickhouse plugin and update docker-compose"
 git push
 token:
-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
+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
 
 
 git fetch --all
